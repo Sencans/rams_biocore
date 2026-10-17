@@ -1,0 +1,28 @@
+# Secretos
+.env
+.env.*
+!.env.example
+ctl_token
+*.key
+*.pem
+# Datos de ejecución (memoria, perfil, tokens, logs, caché FlyWire)
+data/
+*.db
+*.db-wal
+*.db-shm
+perfil_conductual.json
+vts_token.txt
+chats/
+*.npz
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+*.egg-info/
+# Editor / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

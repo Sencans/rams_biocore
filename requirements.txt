@@ -1,0 +1,19 @@
+# R.A.M.S. BIO-CORE — dependencias de ejecución
+# Python >= 3.11 (recomendado 3.12+). En Arch Linux usa un entorno virtual (PEP 668):
+#   python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+numpy>=1.26,<3                       # conectoma LIF y RMS del lip-sync (nunca audioop: no existe en Python 3.13+)
+opencv-python-headless>=4.10,<5      # visión activa sin Qt/GUI (no choca con los plugins Qt de Wayland); incluye Haar
+httpx>=0.27,<1.0                     # Gemini, ElevenLabs, Telegram y Brave (la 1.0 puede romper la API)
+python-dotenv>=1.0                   # carga de .env (si falta, config.py usa su parser mínimo)
+edge-tts>=7.0                        # voz de respaldo gratuita (MP3 24 kHz)
+websockets>=14.0                     # VTube Studio, HUD y colaboración Nexus (API websockets.asyncio)
+psutil>=6.0                          # telemetría, procesos de Nexus, detección de hypridle
+ddgs>=9.0                            # DuckDuckGo: sucesor de duckduckgo-search (renombrado en 2025)
+tzdata>=2024.1                       # base de zonas horarias para zoneinfo (Windows y Linux mínimos/contenedores)
+prompt_toolkit>=3.0.43               # consola: Amadeus imprime sin borrar lo que estás escribiendo
+sounddevice>=0.5 ; sys_platform == "win32"   # reproducción PCM en Windows (modo degradado)
+
+# --- Opcionales (descomenta según tu caso; NUNCA instales dos variantes de OpenCV a la vez) ---
+# opencv-contrib-python-headless>=4.10,<5   # EN LUGAR de opencv-python-headless si quieres los módulos contrib
+# duckduckgo-search>=8.1,<9                 # solo si no puedes instalar ddgs (paquete congelado en 8.1.1)
+# sounddevice>=0.5                          # en Linux, si prefieres PortAudio a pw-play (sudo pacman -S portaudio)

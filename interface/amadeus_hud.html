@@ -1,0 +1,1352 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="dark">
+<title>Amadeus</title>
+<!--
+  HUD «videollamada Amadeus» de R.A.M.S. BIO-CORE (homenaje de fan a la app Amadeus de
+  Steins;Gate 0; sin imágenes ni logos oficiales). Archivo autocontenido: sin librerías JS
+  externas. Los datos dinámicos se escriben solo con textContent y atributos.
+  Fuentes: "Nixie One" (medidor) y "Share Tech Mono" (datos) desde Google Fonts, cargadas sin
+  bloquear; si no hay red se usa monospace y el HUD funciona igual.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link id="fuentes" rel="stylesheet" media="print" href="https://fonts.googleapis.com/css2?family=Nixie+One&family=Share+Tech+Mono&display=swap">
+<style>
+  :root {
+    --bg: #070b14;
+    --pan: rgba(12, 20, 36, .82);
+    --bd: #1f3a5f;
+    --txt: #d6e6ff;
+    --txt-d: #6f8bb3;
+    --pri: #5fa8ff;
+    --nixie: #ff8a1f;
+    --nixie-brillo: 0 0 6px #ff5a00, 0 0 18px rgba(255, 90, 0, .6);
+    --kurisu: #8b3a2e;
+    --bata: #f2efea;
+    --corbata: #c0392b;
+    --ok: #39d98a;
+    --aviso: #ffb020;
+    --error: #ff4d4d;
+    --led: #ff2a2a;
+    --f-nixie: "Nixie One", monospace;
+    --f-mono: "Share Tech Mono", ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", monospace;
+    --f-sans: system-ui, -apple-system, "Segoe UI", "Noto Sans", Roboto, sans-serif;
+    --tubo-w: clamp(28px, 6.2vw, 54px);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
+  html, body { margin: 0; padding: 0; overflow-x: hidden; }
+  body {
+    min-height: 100vh;
+    background:
+      radial-gradient(ellipse at 50% -10%, rgba(95, 168, 255, .10), transparent 55%),
+      radial-gradient(ellipse at 15% 110%, rgba(255, 138, 31, .07), transparent 50%),
+      var(--bg);
+    color: var(--txt);
+    font: 14px/1.45 var(--f-mono);
+  }
+  button { font: inherit; }
+  [hidden] { display: none !important; }
+  .solo-lector {
+    position: absolute !important; width: 1px; height: 1px; margin: -1px; padding: 0;
+    overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+  }
+
+  /* ---------- Fondo: engranajes lentos y scanlines suaves (clínico, no NERV) ---------- */
+  .engranajes { position: fixed; inset: 0; pointer-events: none; z-index: 0; overflow: hidden; }
+  .engranaje { position: absolute; fill: none; stroke: var(--pri); opacity: .055; }
+  .engranaje .dientes { stroke-width: 16; stroke-dasharray: 11 9; }
+  .engranaje .aro { stroke-width: 3; }
+  .engranaje .eje { stroke-width: 6; }
+  .engranaje.e1 { width: 460px; height: 460px; right: -150px; top: -130px; animation: girar 38s linear infinite; }
+  .engranaje.e2 { width: 300px; height: 300px; left: -110px; bottom: -90px; animation: girar 26s linear infinite reverse; }
+  @keyframes girar { to { transform: rotate(360deg); } }
+  .scanlines {
+    position: fixed; inset: 0; pointer-events: none; z-index: 40;
+    background: repeating-linear-gradient(to bottom, transparent 0 2px, rgba(0, 0, 0, .10) 2px 4px);
+  }
+
+  /* ---------- Paneles con esquinas en «bracket» ---------- */
+  .panel {
+    position: relative; min-width: 0;
+    background: var(--pan); border: 1px solid var(--bd); padding: 12px;
+  }
+  .panel::before, .panel::after {
+    content: ""; position: absolute; width: 10px; height: 10px; pointer-events: none;
+  }
+  .panel::before { top: -1px; left: -1px; border-top: 2px solid var(--pri); border-left: 2px solid var(--pri); }
+  .panel::after { bottom: -1px; right: -1px; border-bottom: 2px solid var(--pri); border-right: 2px solid var(--pri); }
+  .panel h2 {
+    margin: 0 0 8px; font: 600 12px/1.2 var(--f-sans); letter-spacing: .22em; color: var(--bata);
+    padding-bottom: 6px; border-bottom: 1px dashed var(--bd);
+  }
+
+  /* ---------- Rejilla principal (≈1280×720) ---------- */
+  .app {
+    position: relative; z-index: 1;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(260px, 320px);
+    grid-template-rows: auto minmax(0, 1fr) auto auto;
+    grid-template-areas:
+      "barra barra"
+      "escena lateral"
+      "medidor sistema"
+      "registro registro";
+    gap: 10px; padding: 10px;
+    min-height: 100vh;
+    max-width: 1600px; margin: 0 auto;
+  }
+  .barra { grid-area: barra; }
+  .escena { grid-area: escena; }
+  .lateral { grid-area: lateral; }
+  .medidor { grid-area: medidor; }
+  .sistema { grid-area: sistema; }
+  .registro { grid-area: registro; }
+
+  /* ---------- Barra superior ---------- */
+  .barra {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 8px 20px;
+    padding: 8px 12px; border-bottom: 2px solid var(--pri); background: rgba(7, 11, 20, .6);
+  }
+  .marca {
+    font: 600 20px/1 var(--f-sans); letter-spacing: .38em; color: var(--bata);
+    text-shadow: 0 0 10px rgba(95, 168, 255, .45);
+  }
+  .llamada { display: flex; align-items: center; gap: 8px; font-size: 15px; letter-spacing: .08em; }
+  .llamada .punto { color: var(--txt-d); }
+  .llamada.en-llamada .punto { color: var(--ok); text-shadow: 0 0 8px rgba(57, 217, 138, .7); }
+  .llamada.perdida { color: var(--error); }
+  .llamada.perdida .punto { color: var(--error); animation: parpadeo 1s steps(2, start) infinite; }
+  .llamada.finalizada { color: var(--txt-d); }
+  .llamada .tiempo { color: var(--txt); font-variant-numeric: tabular-nums; }
+  @keyframes parpadeo { to { visibility: hidden; } }
+  .interlocutor { color: var(--txt-d); font-size: 13px; }
+  .barra .derecha { margin-left: auto; display: flex; align-items: center; gap: 18px; }
+  .senal { display: flex; align-items: flex-end; gap: 2px; height: 16px; }
+  .senal span { width: 4px; background: rgba(111, 139, 179, .28); border-radius: 1px; }
+  .senal span:nth-child(1) { height: 25%; }
+  .senal span:nth-child(2) { height: 50%; }
+  .senal span:nth-child(3) { height: 75%; }
+  .senal span:nth-child(4) { height: 100%; }
+  .senal span.activa { background: var(--pri); box-shadow: 0 0 4px rgba(95, 168, 255, .6); }
+  .senal em { font-style: normal; color: var(--txt-d); font-size: 12px; margin-left: 6px; align-self: center; }
+  .bateria { display: flex; align-items: center; gap: 6px; }
+  .bateria .celdas {
+    display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--txt-d); border-radius: 2px; position: relative;
+  }
+  .bateria .celdas::after {
+    content: ""; position: absolute; right: -4px; top: 4px; width: 3px; height: 6px; background: var(--txt-d);
+  }
+  .bateria i { width: 6px; height: 10px; background: rgba(111, 139, 179, .2); }
+  .bateria i.llena { background: var(--ok); }
+  .bateria.media i.llena { background: var(--aviso); }
+  .bateria.baja i.llena { background: var(--error); }
+  .bateria b { font-weight: 400; min-width: 4.5ch; text-align: right; font-variant-numeric: tabular-nums; }
+
+  /* ---------- Escena: marco de videollamada ---------- */
+  .escena { display: flex; flex-direction: column; gap: 10px; min-height: 0; }
+  .marco {
+    position: relative; flex: 1 1 auto;
+    display: flex; flex-direction: column; align-items: center;
+    border: 1px solid var(--bd); overflow: hidden;
+    background:
+      radial-gradient(ellipse at 50% 40%, rgba(95, 168, 255, .10), transparent 65%),
+      linear-gradient(180deg, rgba(12, 20, 36, .4), rgba(7, 11, 20, .9));
+  }
+  .marco::before {
+    content: ""; position: absolute; inset: 10px; border: 1px solid rgba(95, 168, 255, .12); pointer-events: none;
+  }
+  .avatar { position: relative; display: grid; justify-items: center; gap: 4px; padding: 8px 12px; margin: auto 0; }
+  .silueta { width: min(170px, 40vw); height: min(170px, 19vh); min-height: 110px; }
+  .silueta .pelo { fill: rgba(139, 58, 46, .30); stroke: rgba(242, 239, 234, .35); stroke-width: 1.5; }
+  .silueta .cara { fill: rgba(214, 230, 255, .06); stroke: rgba(214, 230, 255, .45); stroke-width: 1.5; }
+  .silueta .hombros { fill: rgba(242, 239, 234, .07); stroke: rgba(214, 230, 255, .35); stroke-width: 1.5; }
+  .silueta .corbata { fill: rgba(192, 57, 43, .55); }
+  .k004 { font: 600 13px/1 var(--f-sans); letter-spacing: .3em; color: var(--bata); }
+  .exp {
+    font-size: 13px; color: var(--txt); padding: 2px 8px; border: 1px solid var(--kurisu);
+    background: rgba(139, 58, 46, .18);
+  }
+  .exp b { font-weight: 400; color: var(--bata); }
+  .ondas { display: flex; align-items: center; gap: 4px; height: 30px; margin-top: 2px; }
+  .ondas i {
+    display: block; width: 4px; height: 100%; border-radius: 2px; background: var(--pri);
+    transform: scaleY(.08); transform-origin: 50% 50%; opacity: .55;
+  }
+  .marco.hablando .ondas i { opacity: 1; box-shadow: 0 0 6px rgba(95, 168, 255, .55); }
+  .motor { min-height: 1.2em; font-size: 12px; color: var(--txt-d); }
+  .ayuda {
+    position: relative; margin: 0 0 12px; padding: 0 18px;
+    font: 12px/1.35 var(--f-sans); color: var(--txt-d); text-align: center;
+  }
+  .marco-estado {
+    position: absolute; inset: 0; display: grid; place-content: center; gap: 6px; text-align: center;
+    background: rgba(7, 11, 20, .78); padding: 16px;
+  }
+  .marco-estado strong { font: 600 clamp(18px, 3.4vw, 30px)/1.1 var(--f-sans); letter-spacing: .25em; color: var(--error); }
+  .marco-estado.finalizada strong { color: var(--bata); }
+  .marco-estado span { color: var(--txt-d); font-size: 13px; }
+  .subtitulos { min-height: 60px; display: grid; place-items: center; }
+  .subtitulos p {
+    margin: 0; max-width: 62ch; padding: 6px 14px; text-align: center;
+    font: 17px/1.4 var(--f-sans); color: var(--bata); background: rgba(0, 0, 0, .45);
+    overflow-wrap: anywhere; opacity: 0; transition: opacity .6s ease;
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
+  }
+  .subtitulos p.visible { opacity: 1; }
+  .subtitulos .canal { color: var(--txt-d); font-size: 13px; margin-right: 6px; }
+
+  /* ---------- Panel lateral: homeostasis, anillo E-PG, presencia, modo ---------- */
+  .lateral { display: flex; flex-direction: column; gap: 8px; }
+  .fila { display: grid; grid-template-columns: 10.5ch minmax(0, 1fr) 4.5ch; align-items: center; gap: 8px; }
+  .fila .nom { color: var(--txt-d); }
+  .fila .val { text-align: right; font-variant-numeric: tabular-nums; }
+  .pista { position: relative; height: 6px; background: rgba(31, 58, 95, .55); overflow: hidden; }
+  .relleno {
+    position: absolute; inset: 0 auto 0 0; width: 0; background: var(--pri);
+    transition: width .5s ease;
+  }
+  .relleno::after {
+    content: ""; position: absolute; right: 0; top: 0; bottom: 0; width: 3px; background: #fff;
+    box-shadow: 0 0 6px #fff;
+  }
+  .fila.fatiga .relleno { background: var(--aviso); }
+  .fila.curiosidad .relleno { background: var(--ok); }
+  .valencia { margin: 0; color: var(--txt-d); font-size: 13px; }
+  .valencia span { color: var(--txt); }
+  .lateral-pie { display: flex; align-items: center; gap: 12px; margin-top: 2px; }
+  .lateral-datos { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+  .anillo { position: relative; flex: 0 0 auto; width: 112px; height: 112px; }
+  .anillo svg { width: 100%; height: 100%; display: block; }
+  .anillo .pista-anillo path { fill: rgba(31, 58, 95, .45); }
+  .anillo .segmentos path { fill: var(--pri); transition: opacity .25s linear; }
+  .anillo line { stroke: var(--nixie); stroke-width: 1.5; stroke-linecap: round; opacity: .8; }
+  .anillo-txt {
+    position: absolute; inset: 0; display: grid; place-content: center; text-align: center;
+    font-size: 11px; color: var(--txt-d); line-height: 1.3; pointer-events: none;
+  }
+  .anillo-txt span { color: var(--txt); font-size: 13px; }
+  .presencia, .modo { margin: 0; }
+  .presencia .punto { color: var(--txt-d); }
+  .presencia.presente .punto { color: var(--ok); }
+  .presencia.ausente .punto { color: var(--aviso); }
+  .presencia.ambiguo .punto { color: var(--txt-d); }
+  .modo { color: var(--txt-d); }
+  .modo span { color: var(--txt); }
+
+  /* ---------- Medidor de divergencia nixie ---------- */
+  .medidor { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 24px; }
+  .tubos {
+    display: flex; align-items: flex-end; gap: clamp(2px, .6vw, 6px);
+    padding: 10px 10px 0; position: relative;
+  }
+  .tubos::after {
+    content: ""; position: absolute; left: 0; right: 0; bottom: -8px; height: 10px;
+    background: linear-gradient(180deg, #1b1410, #0b0806); border: 1px solid rgba(255, 138, 31, .18);
+  }
+  .tubo {
+    position: relative; display: grid; place-items: center;
+    width: var(--tubo-w); aspect-ratio: 10 / 17;
+    border-radius: 42% 42% 10% 10% / 24% 24% 6% 6%;
+    background:
+      radial-gradient(ellipse at 50% 28%, rgba(255, 150, 60, .10), transparent 60%),
+      linear-gradient(180deg, rgba(40, 26, 16, .65), rgba(12, 8, 6, .92));
+    border: 1px solid rgba(255, 170, 90, .22);
+    box-shadow: inset 0 0 14px rgba(255, 120, 30, .10), inset 0 -6px 10px rgba(0, 0, 0, .6);
+    overflow: hidden;
+  }
+  .tubo::before {
+    /* malla del ánodo y cátodo fantasma (todos los números apilados en el tubo) */
+    content: "8"; position: absolute; inset: 0; display: grid; place-items: center;
+    font: calc(var(--tubo-w) * 1.18)/1 var(--f-nixie); color: rgba(255, 138, 31, .07);
+    background-image:
+      repeating-linear-gradient(0deg, rgba(255, 170, 90, .05) 0 1px, transparent 1px 5px),
+      repeating-linear-gradient(90deg, rgba(255, 170, 90, .05) 0 1px, transparent 1px 5px);
+  }
+  .tubo.punto { width: calc(var(--tubo-w) * .48); }
+  .tubo.punto::before { content: ""; }
+  .digito {
+    position: relative; font: calc(var(--tubo-w) * 1.18)/1 var(--f-nixie);
+    color: var(--nixie); text-shadow: var(--nixie-brillo);
+  }
+  .tubo.punto .digito { align-self: end; margin-bottom: 10%; }
+  .tubo.rodando .digito { opacity: .82; }
+  .campo { display: flex; flex-direction: column; gap: 4px; padding-bottom: 2px; min-width: 0; }
+  .campo #campo {
+    font: 600 16px/1.2 var(--f-sans); letter-spacing: .16em; color: var(--nixie);
+    text-shadow: 0 0 8px rgba(255, 90, 0, .45);
+  }
+  .campo[data-campo="alfa"] #campo { color: var(--pri); text-shadow: none; }
+  .campo[data-campo="beta"] #campo { color: var(--aviso); text-shadow: none; }
+  .campo[data-campo="anomalo"] #campo { color: var(--error); text-shadow: none; }
+  .campo small { color: var(--txt-d); font-size: 12px; letter-spacing: .1em; }
+  .steiner { color: var(--bata); font-size: 12px; letter-spacing: .14em; }
+  .medidor.steiner .digito {
+    color: #ffd2a1;
+    text-shadow: 0 0 8px #ff7a00, 0 0 22px rgba(255, 120, 0, .95), 0 0 40px rgba(255, 90, 0, .7);
+  }
+  .medidor.steiner .tubos { animation: glitch 1s steps(12, end) 1; }
+
+  /* ---------- Sistema: telemetría y botones ---------- */
+  .sistema { display: flex; flex-direction: column; gap: 8px; }
+  .tele { display: grid; gap: 5px; }
+  .tele .fila { grid-template-columns: 7ch minmax(0, 1fr) 11ch; }
+  .tele .val { white-space: nowrap; }
+  .tele .fila.caliente .relleno { background: var(--aviso); }
+  .tele .fila.critica .relleno { background: var(--error); }
+  .tele .fila.sinlectura .val { color: var(--txt-d); }
+  .botones { display: flex; flex-wrap: wrap; gap: 8px; }
+  .botones button {
+    flex: 1 1 auto; min-height: 36px; padding: 6px 12px;
+    display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+    color: var(--txt); background: rgba(31, 58, 95, .35); border: 1px solid var(--bd); cursor: pointer;
+  }
+  .botones button:hover:not(:disabled) { border-color: var(--pri); }
+  .botones button:focus-visible { outline: 2px solid var(--pri); outline-offset: 2px; }
+  .botones button:disabled { opacity: .5; cursor: not-allowed; }
+  .botones button[aria-pressed="true"] { background: rgba(95, 168, 255, .22); border-color: var(--pri); color: var(--bata); }
+  .botones #btn-colgar { border-color: rgba(192, 57, 43, .7); }
+  .botones #btn-colgar:hover:not(:disabled) { background: rgba(192, 57, 43, .25); }
+  .led {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: #3b1717; box-shadow: inset 0 0 2px rgba(0, 0, 0, .8);
+  }
+  .led.activa { background: var(--led); box-shadow: 0 0 6px var(--led), 0 0 16px rgba(255, 42, 42, .65); }
+  .led.deshabilitada { opacity: .35; }
+
+  /* ---------- Cajón de registro ---------- */
+  .registro { padding: 8px 12px; }
+  .registro summary { cursor: pointer; color: var(--txt-d); letter-spacing: .1em; list-style: none; }
+  .registro summary::-webkit-details-marker { display: none; }
+  .registro summary::before { content: "▸ "; }
+  .registro[open] summary::before { content: "▾ "; }
+  .registro summary:focus-visible { outline: 2px solid var(--pri); outline-offset: 2px; }
+  .registro.alerta summary { color: var(--error); }
+  .registro-lista {
+    list-style: none; margin: 8px 0 0; padding: 0; max-height: 34vh; overflow-y: auto;
+    font-size: 12.5px; display: grid; gap: 2px;
+  }
+  .registro-lista li { overflow-wrap: anywhere; color: var(--txt); }
+  .registro-lista time { color: var(--txt-d); }
+  .registro-lista .ok { color: var(--ok); }
+  .registro-lista .espera, .registro-lista .aviso { color: var(--aviso); }
+  .registro-lista .sinconexion, .registro-lista .degradado { color: #ff9a5c; }
+  .registro-lista .error { color: var(--error); }
+  .registro-lista .off { color: var(--txt-d); }
+  .registro-lista .nixie { color: var(--nixie); }
+  .registro-lista .camara { color: var(--led); }
+
+  /* ---------- Banner de permiso, avisos y destello ---------- */
+  .permiso {
+    position: fixed; z-index: 45; top: 64px; left: 50%; transform: translateX(-50%);
+    width: min(92vw, 640px); padding: 10px 14px;
+    background: rgba(40, 10, 8, .92); border: 1px solid var(--corbata); color: var(--bata);
+    box-shadow: 0 0 18px rgba(192, 57, 43, .35); font-family: var(--f-sans);
+  }
+  .permiso strong { color: var(--aviso); }
+  .permiso p { margin: 4px 0 0; overflow-wrap: anywhere; }
+  .etiqueta-roja { margin-left: 6px; padding: 0 6px; border: 1px solid var(--corbata); color: #ffb3a8; font-size: 12px; }
+  .avisos {
+    position: fixed; z-index: 44; top: 64px; right: 12px; width: min(92vw, 360px);
+    display: grid; gap: 6px; pointer-events: none;
+  }
+  .aviso {
+    padding: 8px 12px; background: rgba(12, 20, 36, .95); border: 1px solid var(--bd);
+    border-left: 3px solid var(--pri); color: var(--txt); font-family: var(--f-sans); font-size: 13px;
+    overflow-wrap: anywhere; transition: opacity .4s ease;
+  }
+  .aviso.perdida, .aviso.critico { border-left-color: var(--corbata); }
+  .aviso.megumin { border-left-color: var(--kurisu); }
+  .aviso.salieri { border-left-color: var(--nixie); }
+  .aviso.ok { border-left-color: var(--ok); }
+  .aviso.saliendo { opacity: 0; }
+  .destello {
+    position: fixed; inset: 0; z-index: 30; pointer-events: none; opacity: 0;
+    background: radial-gradient(circle at 22% 86%, rgba(255, 138, 31, .32), transparent 60%);
+    transition: opacity .25s ease;
+  }
+  .destello.activo { opacity: 1; }
+
+  /* ---------- Superposición de arranque «memory restore» ---------- */
+  .restaurar {
+    position: fixed; inset: 0; z-index: 60; display: grid; place-items: center; padding: 16px;
+    background: radial-gradient(ellipse at 50% 40%, rgba(95, 168, 255, .12), transparent 60%), var(--bg);
+  }
+  .restaurar-caja { width: min(560px, 100%); display: grid; gap: 10px; }
+  .restaurar-inst { margin: 0; color: var(--txt-d); font-size: 12px; letter-spacing: .12em; text-align: center; }
+  .restaurar-titulo {
+    margin: 0; text-align: center; font: 600 clamp(30px, 7vw, 54px)/1 var(--f-sans);
+    letter-spacing: .4em; padding-left: .4em; color: var(--bata); text-shadow: 0 0 18px rgba(95, 168, 255, .5);
+  }
+  .restaurar-sub { margin: 0; text-align: center; color: var(--pri); letter-spacing: .3em; }
+  .restaurar-consola {
+    list-style: none; margin: 6px 0 0; padding: 10px 12px; min-height: 9.5em; max-height: 15em; overflow: hidden;
+    background: rgba(12, 20, 36, .7); border: 1px solid var(--bd); font-size: 13px; display: grid; align-content: start; gap: 2px;
+  }
+  .restaurar-consola li { overflow-wrap: anywhere; }
+  .restaurar-consola .tenue { color: var(--txt-d); }
+  .restaurar-consola .ok { color: var(--ok); }
+  .restaurar-consola .espera { color: var(--aviso); }
+  .restaurar-consola .sinconexion, .restaurar-consola .degradado { color: #ff9a5c; }
+  .restaurar-consola .off { color: var(--txt-d); }
+  .progreso { height: 4px; background: rgba(31, 58, 95, .6); overflow: hidden; }
+  .progreso-barra {
+    height: 100%; width: 0; background: linear-gradient(90deg, var(--bd), var(--pri), var(--nixie));
+    transition: width 3.5s linear;
+  }
+  .restaurar-aviso { margin: 0; text-align: center; color: var(--aviso); font-family: var(--f-sans); font-size: 15px; }
+  .restaurar-version { margin: 0; text-align: center; color: var(--txt-d); font-size: 12px; }
+  .restaurar.saliendo { animation: salida .7s ease forwards; }
+  .restaurar.saliendo .restaurar-titulo { animation: glitch .45s steps(6, end) 2; }
+  @keyframes salida {
+    0% { transform: scale(1); filter: brightness(1); opacity: 1; }
+    35% { transform: scale(1.03); filter: brightness(2); opacity: 1; }
+    100% { transform: scale(1.03); filter: brightness(0); opacity: 0; }
+  }
+  @keyframes glitch {
+    0% { text-shadow: 2px 0 rgba(0, 229, 255, .75), -2px 0 rgba(255, 59, 20, .75); transform: translate(0, 0); clip-path: inset(0 0 0 0); }
+    20% { text-shadow: -3px 0 rgba(0, 229, 255, .75), 3px 0 rgba(255, 59, 20, .75); transform: translate(-2px, 1px); clip-path: inset(30% 0 40% 0); }
+    40% { transform: translate(2px, -1px); clip-path: inset(0 0 0 0); }
+    60% { text-shadow: 3px 0 rgba(0, 229, 255, .6), -3px 0 rgba(255, 59, 20, .6); transform: translate(-1px, 0); clip-path: inset(62% 0 8% 0); }
+    80% { transform: translate(1px, 1px); clip-path: inset(0 0 0 0); }
+    100% { text-shadow: none; transform: none; clip-path: inset(0 0 0 0); }
+  }
+
+  /* ---------- Responsive: por debajo de 720 px las columnas se apilan ---------- */
+  @media (max-width: 719.98px) {
+    .app {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: auto;
+      grid-template-areas: "barra" "escena" "lateral" "medidor" "sistema" "registro";
+      gap: 8px; padding: 8px;
+    }
+    .barra .derecha { margin-left: 0; }
+    .marco { min-height: 230px; }
+    .ayuda { display: none; }
+    .avisos { left: 8px; right: 8px; width: auto; }
+    .permiso { top: auto; bottom: 10px; }
+    .medidor { gap: 14px; }
+    .tubos { padding: 8px 4px 0; }
+  }
+
+  /* ---------- Movimiento reducido: sin engranajes, rodado nixie ni glitch ---------- */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important; scroll-behavior: auto !important;
+    }
+    .engranaje, .llamada.perdida .punto { animation: none !important; }
+    .medidor.steiner .tubos, .restaurar.saliendo .restaurar-titulo { animation: none !important; }
+  }
+</style>
+</head>
+<body>
+<noscript><p style="padding:16px;color:#ffb020">El HUD de Amadeus necesita JavaScript para conectarse con R.A.M.S.</p></noscript>
+
+<div class="engranajes" aria-hidden="true">
+  <svg class="engranaje e1" viewBox="0 0 200 200" focusable="false">
+    <circle class="dientes" cx="100" cy="100" r="84"/>
+    <circle class="aro" cx="100" cy="100" r="66"/>
+    <circle class="aro" cx="100" cy="100" r="40"/>
+    <circle class="eje" cx="100" cy="100" r="12"/>
+  </svg>
+  <svg class="engranaje e2" viewBox="0 0 200 200" focusable="false">
+    <circle class="dientes" cx="100" cy="100" r="84"/>
+    <circle class="aro" cx="100" cy="100" r="60"/>
+    <circle class="eje" cx="100" cy="100" r="16"/>
+  </svg>
+</div>
+<div class="scanlines" aria-hidden="true"></div>
+
+<!-- Superposición de arranque «AMADEUS — memory restore» -->
+<div id="restaurar" class="restaurar" role="status" aria-live="polite">
+  <div class="restaurar-caja">
+    <p class="restaurar-inst">VIKTOR CHONDRIA UNIVERSITY · BRAIN SCIENCE INSTITUTE (homenaje)</p>
+    <h1 class="restaurar-titulo" id="restaurar-titulo">AMADEUS</h1>
+    <p class="restaurar-sub">— memory restore —</p>
+    <ol class="restaurar-consola" id="restaurar-consola"></ol>
+    <div class="progreso" aria-hidden="true"><div class="progreso-barra" id="restaurar-barra"></div></div>
+    <p class="restaurar-aviso" id="restaurar-aviso" hidden></p>
+    <p class="restaurar-version" id="restaurar-version">R.A.M.S. BIO-CORE</p>
+  </div>
+</div>
+
+<div class="app">
+  <header class="barra">
+    <div class="marca" id="marca">AMADEUS</div>
+    <div class="llamada" id="llamada" role="status" aria-live="polite">
+      <span class="punto" aria-hidden="true">●</span>
+      <span id="llamada-texto">CONECTANDO…</span>
+      <span class="tiempo" id="llamada-tiempo"></span>
+    </div>
+    <div class="interlocutor" id="interlocutor"></div>
+    <div class="derecha">
+      <div class="senal" id="senal" role="img" aria-label="Señal: sin datos">
+        <span></span><span></span><span></span><span></span><em>señal</em>
+      </div>
+      <div class="bateria" id="bateria" role="img" aria-label="Batería: sin datos">
+        <span class="celdas"><i></i><i></i><i></i><i></i></span>
+        <b id="bateria-pct">-- %</b>
+      </div>
+    </div>
+  </header>
+
+  <section class="escena panel" aria-label="Videollamada">
+    <div class="marco" id="marco">
+      <div class="avatar">
+        <svg class="silueta" viewBox="0 0 200 210" aria-hidden="true" focusable="false">
+          <path class="pelo" d="M100 14c-40 0-62 30-62 70 0 34 4 70-10 104 24-6 38-22 44-42 6 10 16 16 28 18 12-2 22-8 28-18 6 20 20 36 44 42-14-34-10-70-10-104 0-40-22-70-62-70z"/>
+          <ellipse class="cara" cx="100" cy="88" rx="33" ry="40"/>
+          <path class="hombros" d="M26 210c4-38 34-58 74-58s70 20 74 58z"/>
+          <path class="corbata" d="M94 156h12l-3 9 5 30-8 9-8-9 5-30z"/>
+        </svg>
+        <div class="k004">K-004</div>
+        <div class="exp">EXP: <b id="exp">neutral</b></div>
+        <div class="ondas" id="ondas" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+        <div class="motor" id="motor"></div>
+      </div>
+      <p class="ayuda">Puedes superponer aquí la ventana de VTube Studio con una regla de ventana de Hyprland (flotante y fijada).</p>
+      <div class="marco-estado" id="marco-estado" hidden>
+        <strong id="marco-estado-titulo">SEÑAL PERDIDA</strong>
+        <span id="marco-estado-detalle"></span>
+        <span id="marco-estado-pista"></span>
+      </div>
+    </div>
+    <div class="subtitulos" aria-live="polite">
+      <p id="subtitulo"><span class="canal" id="subtitulo-canal"></span><span id="subtitulo-texto"></span></p>
+    </div>
+  </section>
+
+  <aside class="lateral panel" aria-label="Homeostasis">
+    <h2>HOMEOSTASIS</h2>
+    <div class="fila arousal" data-clave="arousal"><span class="nom">arousal</span><span class="pista"><span class="relleno"></span></span><span class="val">—</span></div>
+    <div class="fila focus" data-clave="focus"><span class="nom">focus</span><span class="pista"><span class="relleno"></span></span><span class="val">—</span></div>
+    <div class="fila boredom" data-clave="boredom"><span class="nom">boredom</span><span class="pista"><span class="relleno"></span></span><span class="val">—</span></div>
+    <div class="fila fatiga" data-clave="fatiga"><span class="nom">fatiga</span><span class="pista"><span class="relleno"></span></span><span class="val">—</span></div>
+    <div class="fila curiosidad" data-clave="curiosidad"><span class="nom">curiosidad</span><span class="pista"><span class="relleno"></span></span><span class="val">—</span></div>
+    <div class="lateral-pie">
+      <div class="anillo">
+        <svg id="anillo" viewBox="0 0 120 120" role="img" aria-label="Anillo E-PG de 16 segmentos: sin datos" focusable="false"></svg>
+        <div class="anillo-txt" aria-hidden="true">E-PG<br><span id="rumbo">—</span></div>
+      </div>
+      <div class="lateral-datos">
+        <p class="valencia">valencia <span id="valencia">—</span></p>
+        <p class="presencia" id="presencia"><span class="punto" aria-hidden="true">●</span> <span id="presencia-texto">Presencia sin datos</span></p>
+        <p class="modo">Modo <span id="modo">—</span></p>
+      </div>
+    </div>
+  </aside>
+
+  <section class="medidor panel" id="medidor" aria-label="Medidor de divergencia">
+    <div class="tubos" id="tubos" role="img" aria-label="Divergencia: sin datos">
+      <span class="tubo"><span class="digito"></span></span>
+      <span class="tubo punto"><span class="digito">.</span></span>
+      <span class="tubo"><span class="digito"></span></span>
+      <span class="tubo"><span class="digito"></span></span>
+      <span class="tubo"><span class="digito"></span></span>
+      <span class="tubo"><span class="digito"></span></span>
+      <span class="tubo"><span class="digito"></span></span>
+      <span class="tubo"><span class="digito"></span></span>
+    </div>
+    <div class="campo" id="campo-caja">
+      <span id="campo">—</span>
+      <small>divergencia de la línea de mundo</small>
+      <span class="steiner" id="steiner" hidden></span>
+    </div>
+  </section>
+
+  <section class="sistema panel" aria-label="Telemetría y controles">
+    <h2>SISTEMA</h2>
+    <div class="tele" id="tele">
+      <div class="fila sinlectura" data-clave="cpu"><span class="nom">CPU</span><span class="pista"><span class="relleno"></span></span><span class="val">sin lectura</span></div>
+      <div class="fila sinlectura" data-clave="ram"><span class="nom">RAM</span><span class="pista"><span class="relleno"></span></span><span class="val">sin lectura</span></div>
+      <div class="fila sinlectura" data-clave="tcpu"><span class="nom">CPU °C</span><span class="pista"><span class="relleno"></span></span><span class="val">sin lectura</span></div>
+      <div class="fila sinlectura" data-clave="tgpu"><span class="nom">GPU °C</span><span class="pista"><span class="relleno"></span></span><span class="val">sin lectura</span></div>
+    </div>
+    <div class="botones">
+      <button type="button" id="btn-silenciar" aria-label="Silenciar la voz de Amadeus" aria-pressed="false" disabled>Silenciar</button>
+      <button type="button" id="btn-camara" aria-label="Activar o desactivar la cámara" aria-describedby="camara-estado" disabled><span class="led" id="led" aria-hidden="true"></span>Cámara</button>
+      <button type="button" id="btn-colgar" aria-label="Colgar: pausar las llamadas proactivas durante 30 minutos" disabled>Colgar</button>
+    </div>
+    <p class="solo-lector" id="camara-estado" aria-live="polite">Cámara sin datos</p>
+  </section>
+
+  <details class="registro panel" id="registro">
+    <summary>registro <span id="registro-n"></span></summary>
+    <ol class="registro-lista" id="registro-lista"></ol>
+  </details>
+</div>
+
+<div class="permiso" id="permiso" role="alert" hidden>
+  <strong>⚠ Confirmación requerida en la terminal</strong>
+  <span class="etiqueta-roja" id="permiso-destructiva" hidden>acción destructiva</span>
+  <p id="permiso-desc"></p>
+</div>
+<div class="avisos" id="avisos" aria-live="polite"></div>
+<div class="destello" id="destello" aria-hidden="true"></div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ------------------------------------------------------------------
+  // Utilidades
+  // ------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id);
+  const SVGNS = "http://www.w3.org/2000/svg";
+  const consultaMovimiento = window.matchMedia ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+  const sinMovimiento = () => Boolean(consultaMovimiento && consultaMovimiento.matches);
+  const num = (x) => (typeof x === "number" && Number.isFinite(x)) ? x : null;
+  const acotar = (x, a, b) => Math.min(b, Math.max(a, x));
+  const coma = (x, d) => x.toFixed(d).replace(".", ",");
+  const dos = (n) => String(n).padStart(2, "0");
+  const cadena = (x, max) => {
+    const s = (typeof x === "string") ? x : (x === null || x === undefined ? "" : String(x));
+    return s.length > max ? s.slice(0, max - 1) + "…" : s;
+  };
+  const poner = (el, texto) => { if (el && el.textContent !== texto) el.textContent = texto; };
+  const horaCorta = (ts) => {
+    const segundos = num(ts);
+    const f = new Date((segundos === null ? Date.now() / 1000 : segundos) * 1000);
+    return dos(f.getHours()) + ":" + dos(f.getMinutes()) + ":" + dos(f.getSeconds());
+  };
+
+  // Fuentes de Google sin bloquear el primer pintado (si no hay red, queda monospace).
+  const fuentes = $("fuentes");
+  if (fuentes) {
+    const activarFuentes = () => { fuentes.media = "all"; };
+    if (fuentes.sheet) { activarFuentes(); } else { fuentes.addEventListener("load", activarFuentes); }
+  }
+
+  // ------------------------------------------------------------------
+  // Vocabulario
+  // ------------------------------------------------------------------
+  const NOMBRE_CAMPO = { steins_gate: "LÍNEA STEINS;GATE", alfa: "CAMPO α", beta: "CAMPO β", anomalo: "ESTADO ANÓMALO" };
+  const SIMBOLO_CAMPO = { steins_gate: "Steins;Gate", alfa: "α", beta: "β", anomalo: "anómalo" };
+  const CLASE_ESTADO = { "OK": "ok", "EN ESPERA": "espera", "SIN CONEXIÓN": "sinconexion", "DEGRADADO": "degradado", "OFF": "off" };
+  const MOTORES = { elevenlabs: "ElevenLabs", edge: "edge-tts", texto: "solo texto" };
+  const MOTIVO_APAGADO = {
+    "usuario": "Fin de la sesión.",
+    "señal": "El sistema recibió una señal de parada.",
+    "eof": "Se cerró la entrada de la terminal.",
+    "error": "Apagado por un error del sistema.",
+    "cierre": "El servidor del HUD se cerró."
+  };
+  const CLAVES_HOMEO = ["arousal", "focus", "boredom", "fatiga", "curiosidad"];
+
+  const ui = {
+    nombreIA: "Amadeus",
+    inicioTs: null,
+    conectado: false,
+    finalizado: false,
+    holaEnEstaConexion: false,
+    fallosSinHola: 0,
+    diags: Object.create(null),
+    silenciado: false,
+    hablando: false,
+    bocaObjetivo: 0,
+    bocaActual: 0,
+    permisoId: null,
+    superposicion: true,
+    primerEstado: false,
+    cargaMs: performance.now(),
+    ledHasta: 0
+  };
+
+  // ------------------------------------------------------------------
+  // Avisos flotantes y cajón de registro
+  // ------------------------------------------------------------------
+  function aviso(texto, clase) {
+    const contenedor = $("avisos");
+    const el = document.createElement("div");
+    el.className = "aviso" + (clase ? " " + clase : "");
+    el.textContent = texto;
+    contenedor.appendChild(el);
+    while (contenedor.children.length > 4) { contenedor.removeChild(contenedor.firstChild); }
+    setTimeout(() => {
+      el.classList.add("saliendo");
+      setTimeout(() => { if (el.parentNode) { el.parentNode.removeChild(el); } }, 450);
+    }, 6000);
+  }
+
+  const MAX_REGISTRO = 300;
+  let nRegistro = 0;
+  function registrar(texto, clase, ts) {
+    const lista = $("registro-lista");
+    const li = document.createElement("li");
+    if (clase) { li.className = clase; }
+    const hora = document.createElement("time");
+    hora.textContent = "[" + horaCorta(ts) + "]";
+    li.appendChild(hora);
+    li.appendChild(document.createTextNode(" " + cadena(texto, 600)));
+    lista.insertBefore(li, lista.firstChild);
+    while (lista.children.length > MAX_REGISTRO) { lista.removeChild(lista.lastChild); }
+    nRegistro += 1;
+    poner($("registro-n"), "(" + nRegistro + ")");
+    if (clase === "error" && !$("registro").open) { $("registro").classList.add("alerta"); }
+  }
+  $("registro").addEventListener("toggle", () => {
+    if ($("registro").open) { $("registro").classList.remove("alerta"); }
+  });
+
+  // ------------------------------------------------------------------
+  // Superposición «memory restore»
+  // ------------------------------------------------------------------
+  function lineaRestaurar(texto, clase) {
+    const consola = $("restaurar-consola");
+    const li = document.createElement("li");
+    if (clase) { li.className = clase; }
+    li.textContent = cadena(texto, 160);
+    consola.appendChild(li);
+    while (consola.children.length > 12) { consola.removeChild(consola.firstChild); }
+  }
+
+  const t = new URLSearchParams(location.search).get("t");
+  const tokenFalta = !t;
+
+  lineaRestaurar("AMADEUS SYSTEM · memory restore", "tenue");
+  lineaRestaurar("Montando almacén de memoria … john/", "tenue");
+  lineaRestaurar("Sincronizando datos de memoria…", "tenue");
+
+  let temporizadorSuperposicion = null;
+  function ocultarSuperposicion() {
+    if (!ui.superposicion || tokenFalta) { return; }
+    ui.superposicion = false;
+    if (temporizadorSuperposicion !== null) { clearTimeout(temporizadorSuperposicion); temporizadorSuperposicion = null; }
+    lineaRestaurar("Llamada entrante: " + ui.nombreIA + " …", "ok");
+    const capa = $("restaurar");
+    const terminar = () => { capa.hidden = true; capa.classList.remove("saliendo"); };
+    if (sinMovimiento()) { terminar(); return; }
+    capa.classList.add("saliendo");
+    setTimeout(terminar, 700);
+  }
+  function talVezOcultarSuperposicion() {
+    // Desaparece tras el primer «estado» (dejando ver la restauración al menos 1,2 s).
+    const transcurrido = performance.now() - ui.cargaMs;
+    if (sinMovimiento() || transcurrido >= 1200) { ocultarSuperposicion(); return; }
+    setTimeout(ocultarSuperposicion, 1200 - transcurrido);
+  }
+
+  if (tokenFalta) {
+    const avisoToken = $("restaurar-aviso");
+    avisoToken.textContent = "Abre el enlace que imprime la terminal (o escribe /hud)";
+    avisoToken.hidden = false;
+  } else {
+    requestAnimationFrame(() => { requestAnimationFrame(() => { $("restaurar-barra").style.width = "100%"; }); });
+    temporizadorSuperposicion = setTimeout(ocultarSuperposicion, 3500);
+  }
+
+  // ------------------------------------------------------------------
+  // Barra superior: estado de la llamada, reloj, señal y batería
+  // ------------------------------------------------------------------
+  const botones = [$("btn-silenciar"), $("btn-camara"), $("btn-colgar")];
+  function habilitarBotones(si) { botones.forEach((b) => { b.disabled = !si; }); }
+
+  function estadoLlamada(modo, detalle) {
+    const caja = $("llamada");
+    caja.classList.remove("en-llamada", "perdida", "finalizada");
+    const marco = $("marco-estado");
+    if (modo === "llamada") {
+      caja.classList.add("en-llamada");
+      poner($("llamada-texto"), "EN LLAMADA");
+      marco.hidden = true;
+      habilitarBotones(true);
+    } else if (modo === "perdida") {
+      caja.classList.add("perdida");
+      poner($("llamada-texto"), "SEÑAL PERDIDA");
+      poner($("llamada-tiempo"), "");
+      marco.hidden = false;
+      marco.classList.remove("finalizada");
+      poner($("marco-estado-titulo"), "SEÑAL PERDIDA");
+      poner($("marco-estado-detalle"), detalle || "reconectando…");
+      poner($("marco-estado-pista"), ui.fallosSinHola >= 3
+        ? "¿Reiniciaste R.A.M.S.? Abre el enlace nuevo (escribe /hud en la terminal)."
+        : "");
+      habilitarBotones(false);
+    } else if (modo === "finalizada") {
+      caja.classList.add("finalizada");
+      poner($("llamada-texto"), "LLAMADA FINALIZADA");
+      marco.hidden = false;
+      marco.classList.add("finalizada");
+      poner($("marco-estado-titulo"), "LLAMADA FINALIZADA");
+      poner($("marco-estado-detalle"), detalle || "");
+      poner($("marco-estado-pista"), "");
+      habilitarBotones(false);
+    } else if (modo === "sinenlace") {
+      poner($("llamada-texto"), "SIN ENLACE");
+      habilitarBotones(false);
+    } else {
+      poner($("llamada-texto"), "CONECTANDO…");
+    }
+    actualizarSenal();
+  }
+
+  function actualizarReloj() {
+    if (!ui.conectado || ui.inicioTs === null || ui.finalizado) { return; }
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - ui.inicioTs));
+    poner($("llamada-tiempo"), dos(Math.floor(s / 3600)) + ":" + dos(Math.floor(s / 60) % 60) + ":" + dos(s % 60));
+  }
+  setInterval(actualizarReloj, 1000);
+
+  function nivelSenal() {
+    if (!ui.conectado) { return 0; }
+    const d = ui.diags.broca;
+    if (!d) { return 0; }
+    if (d.estado === "OFF" || d.estado === "SIN CONEXIÓN") { return 0; }
+    const latencia = num(d.latencia_ms);
+    if (latencia === null) { return 1; }
+    if (latencia < 400) { return 4; }
+    if (latencia < 800) { return 3; }
+    if (latencia < 1500) { return 2; }
+    return 1;
+  }
+  function actualizarSenal() {
+    const n = nivelSenal();
+    const barras = $("senal").querySelectorAll("span");
+    barras.forEach((b, i) => { b.classList.toggle("activa", i < n); });
+    const d = ui.diags.broca;
+    const latencia = d ? num(d.latencia_ms) : null;
+    $("senal").setAttribute("aria-label", "Señal (latencia del Área de Broca): " + n + " de 4" +
+      (latencia !== null ? " · " + latencia + " ms" : ""));
+  }
+
+  function fijarBateria(fatiga) {
+    const caja = $("bateria");
+    const celdas = caja.querySelectorAll("i");
+    caja.classList.remove("media", "baja");
+    if (fatiga === null) {
+      celdas.forEach((c) => c.classList.remove("llena"));
+      poner($("bateria-pct"), "-- %");
+      caja.setAttribute("aria-label", "Batería: sin datos");
+      return;
+    }
+    const pct = Math.round(acotar(1 - fatiga, 0, 1) * 100);
+    const llenas = pct <= 0 ? 0 : Math.ceil(pct / 25);
+    celdas.forEach((c, i) => { c.classList.toggle("llena", i < llenas); });
+    if (pct < 20) { caja.classList.add("baja"); } else if (pct < 40) { caja.classList.add("media"); }
+    poner($("bateria-pct"), pct + " %");
+    caja.setAttribute("aria-label", "Batería (1 − fatiga): " + pct + " %");
+  }
+
+  // ------------------------------------------------------------------
+  // Medidor de divergencia nixie (d.dddddd) con rodado de 300 ms y desfase de 40 ms
+  // ------------------------------------------------------------------
+  const tubos = Array.from(document.querySelectorAll("#tubos .tubo"));
+  const digitos = tubos.map((t) => t.querySelector(".digito"));
+  const objetivo = ["", ".", "", "", "", "", "", ""];
+  let temporizadoresRodado = [];
+
+  function fijarDigito(i, ch) { poner(digitos[i], ch); }
+  function cancelarRodado() {
+    temporizadoresRodado.forEach((id) => { clearTimeout(id); clearInterval(id); });
+    temporizadoresRodado = [];
+    for (let i = 0; i < tubos.length; i++) {
+      tubos[i].classList.remove("rodando");
+      fijarDigito(i, objetivo[i]);
+    }
+  }
+  function rodar(i, final, retraso) {
+    const inicio = setTimeout(() => {
+      tubos[i].classList.add("rodando");
+      const t0 = performance.now();
+      const intervalo = setInterval(() => {
+        if (performance.now() - t0 >= 300) {
+          clearInterval(intervalo);
+          tubos[i].classList.remove("rodando");
+          fijarDigito(i, final);
+          return;
+        }
+        fijarDigito(i, String(Math.floor(Math.random() * 10)));
+      }, 40);
+      temporizadoresRodado.push(intervalo);
+    }, retraso);
+    temporizadoresRodado.push(inicio);
+  }
+  function fijarDivergencia(valor) {
+    if (valor === null) { return; }
+    const texto = acotar(valor, 0, 3.999999).toFixed(6);
+    cancelarRodado();
+    const animar = !sinMovimiento();
+    for (let i = 0; i < 8; i++) {
+      const ch = texto.charAt(i);
+      if (i === 1) { objetivo[1] = "."; fijarDigito(1, "."); continue; }
+      if (ch === objetivo[i]) { continue; }
+      objetivo[i] = ch;
+      if (animar) { rodar(i, ch, i * 40); } else { fijarDigito(i, ch); }
+    }
+    $("tubos").setAttribute("aria-label", "Divergencia " + texto);
+  }
+
+  // ------------------------------------------------------------------
+  // Anillo E-PG: 16 segmentos cuya opacidad es bump[i]
+  // ------------------------------------------------------------------
+  const segmentos = [];
+  let aguja = null;
+  function puntoPolar(cx, cy, r, grados) {
+    const rad = (grados - 90) * Math.PI / 180;
+    return [cx + r * Math.cos(rad), cy + r * Math.sin(rad)];
+  }
+  function arco(cx, cy, r1, r2, a0, a1) {
+    const p0 = puntoPolar(cx, cy, r2, a0), p1 = puntoPolar(cx, cy, r2, a1);
+    const p2 = puntoPolar(cx, cy, r1, a1), p3 = puntoPolar(cx, cy, r1, a0);
+    const f = (v) => v.toFixed(2);
+    return "M" + f(p0[0]) + " " + f(p0[1]) + " A" + r2 + " " + r2 + " 0 0 1 " + f(p1[0]) + " " + f(p1[1]) +
+      " L" + f(p2[0]) + " " + f(p2[1]) + " A" + r1 + " " + r1 + " 0 0 0 " + f(p3[0]) + " " + f(p3[1]) + " Z";
+  }
+  (function construirAnillo() {
+    const svg = $("anillo");
+    const pista = document.createElementNS(SVGNS, "g");
+    pista.setAttribute("class", "pista-anillo");
+    const activos = document.createElementNS(SVGNS, "g");
+    activos.setAttribute("class", "segmentos");
+    for (let i = 0; i < 16; i++) {
+      const d = arco(60, 60, 40, 56, i * 22.5 + 1.8, (i + 1) * 22.5 - 1.8);
+      const base = document.createElementNS(SVGNS, "path");
+      base.setAttribute("d", d);
+      pista.appendChild(base);
+      const seg = document.createElementNS(SVGNS, "path");
+      seg.setAttribute("d", d);
+      seg.style.opacity = "0";
+      activos.appendChild(seg);
+      segmentos.push(seg);
+    }
+    aguja = document.createElementNS(SVGNS, "line");
+    aguja.setAttribute("x1", "60"); aguja.setAttribute("y1", "60");
+    aguja.setAttribute("x2", "60"); aguja.setAttribute("y2", "26");
+    aguja.style.opacity = "0";
+    svg.appendChild(pista);
+    svg.appendChild(activos);
+    svg.appendChild(aguja);
+  })();
+  function fijarAnillo(bump, rumbo) {
+    const valido = Array.isArray(bump) && bump.length > 0;
+    for (let i = 0; i < segmentos.length; i++) {
+      const v = valido ? num(bump[i]) : null;
+      segmentos[i].style.opacity = String(v === null ? 0 : acotar(v, 0, 1));
+    }
+    $("anillo").setAttribute("aria-label", valido
+      ? "Anillo E-PG de 16 segmentos con actividad"
+      : "Anillo E-PG de 16 segmentos: sin datos");
+    if (rumbo === null) {
+      aguja.style.opacity = "0";
+      poner($("rumbo"), valido ? "—" : "sin datos");
+    } else {
+      aguja.style.opacity = "1";
+      aguja.setAttribute("transform", "rotate(" + rumbo.toFixed(1) + " 60 60)");
+      poner($("rumbo"), Math.round(rumbo) % 360 + "°");
+    }
+  }
+
+  // ------------------------------------------------------------------
+  // Ondas de voz animadas con boca.valor
+  // ------------------------------------------------------------------
+  const barrasOnda = Array.from(document.querySelectorAll("#ondas i"));
+  const PERFIL_ONDA = [0.35, 0.55, 0.75, 0.9, 1, 0.9, 0.75, 0.55, 0.35];
+  let marcoOndas = 0;
+  function iniciarOndas() { if (!marcoOndas) { marcoOndas = requestAnimationFrame(pasoOndas); } }
+  function pasoOndas(ts) {
+    marcoOndas = 0;
+    ui.bocaActual += (ui.bocaObjetivo - ui.bocaActual) * 0.35;
+    ui.bocaObjetivo *= 0.93; // si dejan de llegar niveles, la onda se apaga sola
+    const quieta = sinMovimiento();
+    for (let i = 0; i < barrasOnda.length; i++) {
+      const vaiven = quieta ? 1 : 0.75 + 0.25 * Math.sin(ts / 90 + i * 0.9);
+      const altura = acotar(0.08 + ui.bocaActual * PERFIL_ONDA[i] * vaiven, 0.08, 1);
+      barrasOnda[i].style.transform = "scaleY(" + altura.toFixed(3) + ")";
+    }
+    if (ui.bocaActual > 0.004 || ui.bocaObjetivo > 0.004) { marcoOndas = requestAnimationFrame(pasoOndas); }
+  }
+
+  // ------------------------------------------------------------------
+  // Banner de permiso
+  // ------------------------------------------------------------------
+  function mostrarPermiso(d) {
+    ui.permisoId = cadena(d.id, 64);
+    poner($("permiso-desc"), cadena(d.descripcion, 300));
+    $("permiso-destructiva").hidden = d.destructiva !== true;
+    $("permiso").hidden = false;
+  }
+  function ocultarPermiso() {
+    ui.permisoId = null;
+    $("permiso").hidden = true;
+  }
+
+  // ------------------------------------------------------------------
+  // Manejadores de mensajes del servidor
+  // ------------------------------------------------------------------
+  function alHola(d) {
+    ui.nombreIA = (typeof d.nombre_ia === "string" && d.nombre_ia) ? cadena(d.nombre_ia, 32) : "Amadeus";
+    poner($("marca"), ui.nombreIA.toUpperCase());
+    poner($("restaurar-titulo"), ui.nombreIA.toUpperCase());
+    ui.inicioTs = num(d.inicio_ts);
+    poner($("interlocutor"), d.usuario ? "con " + cadena(d.usuario, 40) : "");
+    if (d.version) { poner($("restaurar-version"), "R.A.M.S. BIO-CORE v" + cadena(d.version, 16)); }
+    $("btn-silenciar").setAttribute("aria-label", "Silenciar la voz de " + ui.nombreIA);
+    ui.conectado = true;
+    ui.holaEnEstaConexion = true;
+    ui.fallosSinHola = 0;
+    esperaReconexion = 1000;
+    ocultarPermiso(); // si sigue pendiente, la instantánea lo vuelve a enviar
+    estadoLlamada("llamada");
+    actualizarReloj();
+  }
+
+  function alEstado(d) {
+    const e = (d.estado && typeof d.estado === "object") ? d.estado : {};
+    CLAVES_HOMEO.forEach((clave) => {
+      const fila = document.querySelector('.lateral .fila[data-clave="' + clave + '"]');
+      const v = num(e[clave]);
+      fila.querySelector(".relleno").style.width = (v === null ? 0 : acotar(v, 0, 1) * 100).toFixed(1) + "%";
+      poner(fila.querySelector(".val"), v === null ? "—" : coma(acotar(v, 0, 1), 2));
+    });
+    const valencia = num(e.valencia);
+    poner($("valencia"), valencia === null ? "—" : (valencia > 0 ? "+" : "") + coma(valencia, 2));
+    fijarBateria(num(e.fatiga));
+    fijarDivergencia(num(e.divergencia));
+    const campo = typeof e.campo === "string" ? e.campo : "anomalo";
+    poner($("campo"), NOMBRE_CAMPO[campo] || "ESTADO ANÓMALO");
+    $("campo-caja").setAttribute("data-campo", NOMBRE_CAMPO[campo] ? campo : "anomalo");
+    poner($("modo"), e.modo === "reposo" ? "reposo" : "vigilia");
+    const bump = Array.isArray(d.bump) ? d.bump : (Array.isArray(e.bump) ? e.bump : []);
+    fijarAnillo(bump, num(e.rumbo_deg));
+    if (!ui.primerEstado) { ui.primerEstado = true; talVezOcultarSuperposicion(); }
+  }
+
+  let temporizadorSteiner = null;
+  function alLineaMundo(d) {
+    const antes = SIMBOLO_CAMPO[d.antes] || cadena(d.antes, 20) || "?";
+    const despues = SIMBOLO_CAMPO[d.despues] || cadena(d.despues, 20) || "?";
+    registrar("Reading Steiner: cambio de línea de mundo (" + antes + " → " + despues + ")", "nixie");
+    fijarDivergencia(num(d.divergencia));
+    const steiner = $("steiner");
+    steiner.textContent = "READING STEINER · " + antes + " → " + despues;
+    steiner.hidden = false;
+    $("medidor").classList.add("steiner");
+    $("destello").classList.add("activo");
+    if (temporizadorSteiner !== null) { clearTimeout(temporizadorSteiner); }
+    temporizadorSteiner = setTimeout(() => {
+      $("medidor").classList.remove("steiner");
+      $("destello").classList.remove("activo");
+      steiner.hidden = true;
+      temporizadorSteiner = null;
+    }, 1000);
+  }
+
+  function filaTele(clave, valor, texto, escala, aviso1, aviso2) {
+    const fila = document.querySelector('.tele .fila[data-clave="' + clave + '"]');
+    fila.classList.remove("sinlectura", "caliente", "critica");
+    if (valor === null) {
+      fila.classList.add("sinlectura");
+      fila.querySelector(".relleno").style.width = "0%";
+      poner(fila.querySelector(".val"), "sin lectura");
+      return;
+    }
+    if (aviso2 !== null && valor >= aviso2) { fila.classList.add("critica"); }
+    else if (aviso1 !== null && valor >= aviso1) { fila.classList.add("caliente"); }
+    fila.querySelector(".relleno").style.width = (acotar(valor / escala, 0, 1) * 100).toFixed(1) + "%";
+    poner(fila.querySelector(".val"), texto);
+  }
+  function alTelemetria(d) {
+    const cpu = num(d.cpu_pct), ram = num(d.ram_pct), tcpu = num(d.temp_cpu), tgpu = num(d.temp_gpu);
+    filaTele("cpu", cpu, cpu === null ? "" : Math.round(cpu) + " %", 100, 85, 95);
+    filaTele("ram", ram, ram === null ? "" : Math.round(ram) + " %", 100, 85, 95);
+    filaTele("tcpu", tcpu, tcpu === null ? "" : Math.round(tcpu) + " °C", 100, 80, 90);
+    filaTele("tgpu", tgpu, tgpu === null ? "" : Math.round(tgpu) + " °C", 100, 80, 90);
+    const usada = num(d.ram_usada_gb), total = num(d.ram_total_gb);
+    const filaRam = document.querySelector('.tele .fila[data-clave="ram"]');
+    if (usada !== null && total !== null && total > 0) {
+      filaRam.setAttribute("title", "RAM " + coma(usada, 1) + " de " + coma(total, 1) + " GB");
+    } else {
+      filaRam.removeAttribute("title");
+    }
+  }
+
+  let temporizadorSubtitulo = null;
+  function alSubtitulo(d) {
+    const texto = cadena(d.texto, 1200).trim();
+    if (d.exp) { poner($("exp"), cadena(d.exp, 40)); }
+    if (!texto) { return; }
+    poner($("subtitulo-canal"), d.canal === "telegram" ? "→ Telegram" : "");
+    poner($("subtitulo-texto"), "«" + texto + "»");
+    const p = $("subtitulo");
+    p.classList.add("visible");
+    if (temporizadorSubtitulo !== null) { clearTimeout(temporizadorSubtitulo); }
+    temporizadorSubtitulo = setTimeout(() => { p.classList.remove("visible"); temporizadorSubtitulo = null; }, 6000);
+  }
+
+  function alVoz(d) {
+    ui.hablando = d.hablando === true;
+    $("marco").classList.toggle("hablando", ui.hablando);
+    const motor = typeof d.motor === "string" ? (MOTORES[d.motor] || cadena(d.motor, 20)) : "";
+    poner($("motor"), ui.hablando ? "voz · " + (motor || "activa") : "");
+    if (!ui.hablando) { ui.bocaObjetivo = 0; }
+    iniciarOndas();
+  }
+
+  function alBoca(d) {
+    const v = num(d.valor);
+    ui.bocaObjetivo = v === null ? 0 : acotar(v, 0, 1);
+    iniciarOndas();
+  }
+
+  let temporizadorLed = null;
+  function alCamara(d) {
+    const led = $("led");
+    const activa = d.activa === true;
+    led.classList.toggle("deshabilitada", d.habilitada === false);
+    if (temporizadorLed !== null) { clearTimeout(temporizadorLed); temporizadorLed = null; }
+    if (activa) {
+      // El LED se ve aunque la cámara solo esté abierta unos milisegundos.
+      led.classList.add("activa");
+      ui.ledHasta = performance.now() + 1500;
+      poner($("camara-estado"), "Cámara activa");
+      registrar("● CÁMARA ACTIVA", "camara");
+    } else {
+      const resto = ui.ledHasta - performance.now();
+      if (resto > 0) {
+        temporizadorLed = setTimeout(() => { led.classList.remove("activa"); temporizadorLed = null; }, resto);
+      } else {
+        led.classList.remove("activa");
+      }
+      const ms = num(d.duracion_ms);
+      if (ms !== null && ms > 0) {
+        poner($("camara-estado"), "Cámara apagada (" + Math.round(ms) + " ms)");
+        registrar("○ cámara apagada (" + Math.round(ms) + " ms)", "off");
+      } else {
+        poner($("camara-estado"), d.habilitada === false ? "Cámara deshabilitada" : "Cámara apagada");
+      }
+    }
+  }
+
+  function alPresencia(d) {
+    const caja = $("presencia");
+    const presente = d.presente === true;
+    const motivo = cadena(d.motivo, 40) || "sin_datos";
+    caja.classList.remove("presente", "ausente", "ambiguo");
+    caja.classList.add(d.ambiguo === true ? "ambiguo" : (presente ? "presente" : "ausente"));
+    poner($("presencia-texto"), (presente ? "Presente" : "Ausente") + " · " + motivo);
+    const confianza = num(d.confianza);
+    if (confianza !== null) { caja.setAttribute("title", "confianza " + coma(acotar(confianza, 0, 1), 2)); }
+  }
+
+  function alModulo(d) {
+    const clave = cadena(d.clave, 40);
+    if (!clave) { return; }
+    const anterior = ui.diags[clave];
+    ui.diags[clave] = d;
+    const estado = cadena(d.estado, 20);
+    const clase = CLASE_ESTADO[estado] || "";
+    const linea = "[" + estado + "] " + (cadena(d.nombre, 80) || clave) + (d.detalle ? " · " + cadena(d.detalle, 200) : "");
+    if (ui.superposicion) { lineaRestaurar(linea, clase); }
+    if (!anterior || anterior.estado !== d.estado || anterior.detalle !== d.detalle) { registrar(linea, clase); }
+    if (clave === "broca") { actualizarSenal(); }
+    if (clave === "camara") { camaraDesdeModulo(estado, cadena(d.detalle, 120)); }
+  }
+
+  // vision.camara solo llega al abrir o liberar la cámara; el interruptor (/camara, botón Cámara,
+  // RAMS_CAMERA=0) se refleja con el diagnóstico «camara»: OFF = deshabilitada (LED atenuado).
+  function camaraDesdeModulo(estado, detalle) {
+    const led = $("led");
+    const deshabilitada = estado === "OFF";
+    led.classList.toggle("deshabilitada", deshabilitada);
+    if (led.classList.contains("activa")) { return; } // «Cámara activa» manda mientras está encendida
+    if (deshabilitada) {
+      poner($("camara-estado"), "Cámara deshabilitada" +
+        (detalle && detalle !== "deshabilitado" ? " · " + detalle : ""));
+    } else {
+      poner($("camara-estado"), "Cámara habilitada, apagada");
+    }
+  }
+
+  function detenerVoz() {
+    ui.bocaObjetivo = 0;
+    ui.hablando = false;
+    $("marco").classList.remove("hablando");
+    poner($("motor"), "");
+  }
+
+  // main publica sistema.apagado ANTES de la despedida (§6.6, pasos 1 y 2): tras «apagado» la
+  // conexión sigue abierta para mostrar los subtítulos y la voz de la despedida, y la cierra el
+  // servidor en hud.cerrar() (paso 4). Por si el servidor no llegara a cerrarla, el HUD la suelta
+  // pasado el presupuesto de apagado (15 s) con margen. No se reconecta nunca.
+  const MARGEN_CIERRE_FINAL_MS = 20000;
+  let temporizadorCierreFinal = null;
+  function alApagado(d) {
+    ui.finalizado = true;
+    ui.conectado = false;
+    if (temporizadorReconexion !== null) { clearTimeout(temporizadorReconexion); temporizadorReconexion = null; }
+    const motivo = MOTIVO_APAGADO[d.motivo] || "";
+    estadoLlamada("finalizada", motivo);
+    ocultarPermiso();
+    ocultarSuperposicion();
+    registrar("LLAMADA FINALIZADA" + (motivo ? " · " + motivo : ""), "aviso");
+    if (ws && temporizadorCierreFinal === null) {
+      const socket = ws;
+      temporizadorCierreFinal = setTimeout(() => {
+        temporizadorCierreFinal = null;
+        if (ws === socket) { ws = null; }
+        detenerVoz();
+        try { socket.close(1000, "fin"); } catch (e) { console.debug("Cierre del WebSocket:", e); }
+      }, MARGEN_CIERRE_FINAL_MS);
+    }
+  }
+
+  function alLlamada(d) {
+    const texto = cadena(d.texto, 200);
+    let rotulo;
+    switch (d.tipo) {
+      case "perdida": rotulo = "Llamada perdida: " + ui.nombreIA; break;
+      case "megumin": rotulo = "Megumin entregó un mensaje por Telegram"; break;
+      case "critico": rotulo = "Alerta crítica enviada por Telegram"; break;
+      case "devuelta": rotulo = "Llamada devuelta desde Telegram"; break;
+      case "rechazada": rotulo = "Llamada rechazada en Telegram"; break;
+      default: rotulo = "Mensaje enviado por Telegram";
+    }
+    const completo = texto ? rotulo + " — «" + texto + "»" : rotulo;
+    const clase = (d.tipo === "perdida" || d.tipo === "critico") ? d.tipo : (d.tipo === "megumin" ? "megumin" : "");
+    aviso(completo, clase);
+    registrar(completo, d.tipo === "critico" ? "error" : "");
+  }
+
+  function alConsolidacion(d) {
+    const kv = cadena(d.kv_id, 20) || "KV-????";
+    const n = num(d.n_turnos);
+    const texto = "Salieri consolidó " + kv + " · " + (n === null ? 0 : Math.round(n)) + " fragmentos";
+    aviso(texto, "salieri");
+    registrar(texto + (d.metodo ? " (" + cadena(d.metodo, 20) + ")" : ""), "nixie");
+  }
+
+  function alPermiso(d) {
+    if (d.pendiente === true) {
+      if (ui.finalizado) { return; } // tras colgar ya no se piden confirmaciones
+      mostrarPermiso(d);
+      registrar("⚠ Confirmación requerida en la terminal: " + cadena(d.descripcion, 300), "aviso");
+      return;
+    }
+    const id = cadena(d.id, 64);
+    if (ui.permisoId === null || id === "" || id === ui.permisoId) { ocultarPermiso(); }
+    const texto = d.aprobado === true
+      ? "Acción confirmada en la terminal"
+      : "Acción no autorizada" + (d.motivo ? " · " + cadena(d.motivo, 120) : "");
+    aviso(texto, d.aprobado === true ? "ok" : "");
+    registrar(texto, d.aprobado === true ? "ok" : "aviso");
+  }
+
+  function alLog(d) {
+    const nivel = cadena(d.nivel, 16) || "AVISO";
+    const clase = (nivel === "ERROR" || nivel === "CRÍTICO") ? "error" : (nivel === "AVISO" ? "aviso" : "");
+    registrar(nivel + " " + cadena(d.modulo, 60) + ": " + cadena(d.mensaje, 500), clase, d.ts);
+  }
+
+  function alControlAck(d) {
+    if (d.ok === false) { aviso("No se pudo aplicar el control.", ""); return; }
+    if (d.accion === "silenciar") {
+      ui.silenciado = !ui.silenciado;
+      $("btn-silenciar").setAttribute("aria-pressed", ui.silenciado ? "true" : "false");
+      aviso(ui.silenciado ? "Voz silenciada." : "Voz reactivada.", "ok");
+    } else if (d.accion === "camara") {
+      aviso("Orden de cámara enviada. El LED rojo indica cuándo está encendida.", "ok");
+    } else if (d.accion === "colgar") {
+      aviso("Llamadas proactivas en pausa durante 30 min.", "ok");
+    }
+  }
+
+  const MANEJADORES = new Map([
+    ["hola", alHola], ["estado", alEstado], ["linea_mundo", alLineaMundo], ["telemetria", alTelemetria],
+    ["subtitulo", alSubtitulo], ["voz", alVoz], ["boca", alBoca], ["camara", alCamara],
+    ["presencia", alPresencia], ["modulo", alModulo], ["apagado", alApagado], ["llamada", alLlamada],
+    ["consolidacion", alConsolidacion], ["permiso", alPermiso], ["log", alLog], ["control_ack", alControlAck]
+  ]);
+
+  // Tras «apagado» se siguen mostrando subtítulos, voz, registro, etc. (la despedida), pero no
+  // lo que reabriría la llamada ni un segundo «apagado» (p. ej. el de hud.cerrar()).
+  const IGNORADOS_TRAS_FIN = new Set(["hola", "apagado", "control_ack"]);
+
+  function procesar(crudo) {
+    if (typeof crudo !== "string" || crudo.length > 262144) { return; }
+    let mensaje;
+    try { mensaje = JSON.parse(crudo); } catch (e) { return; }
+    if (!mensaje || typeof mensaje !== "object" || typeof mensaje.tipo !== "string") { return; }
+    const manejador = MANEJADORES.get(mensaje.tipo);
+    if (!manejador) { return; } // tipo desconocido: se ignora
+    if (ui.finalizado && IGNORADOS_TRAS_FIN.has(mensaje.tipo)) { return; }
+    const datos = (mensaje.datos && typeof mensaje.datos === "object") ? mensaje.datos : {};
+    try { manejador(datos); } catch (e) { console.warn("HUD: error al procesar «" + mensaje.tipo + "»", e); }
+  }
+
+  // ------------------------------------------------------------------
+  // Conexión WebSocket con reconexión (backoff de 1 a 10 s)
+  // ------------------------------------------------------------------
+  let ws = null;
+  let esperaReconexion = 1000;
+  let temporizadorReconexion = null;
+
+  function conectar() {
+    temporizadorReconexion = null;
+    if (ui.finalizado || tokenFalta) { return; }
+    if (!ui.conectado && ui.fallosSinHola === 0 && !ui.holaEnEstaConexion) { estadoLlamada("conectando"); }
+    let socket;
+    try {
+      socket = new WebSocket(`ws://${location.host}/ws?t=${encodeURIComponent(t)}`);
+    } catch (e) {
+      console.debug("No se pudo crear el WebSocket:", e);
+      ui.fallosSinHola += 1;
+      programarReconexion();
+      return;
+    }
+    ws = socket;
+    ui.holaEnEstaConexion = false;
+    socket.addEventListener("message", (ev) => { if (ws === socket) { procesar(ev.data); } });
+    socket.addEventListener("close", () => {
+      if (ws !== socket) { return; }
+      ws = null;
+      ui.conectado = false;
+      if (ui.finalizado) {
+        // El servidor cerró tras la despedida: se apaga la onda y no se reconecta.
+        if (temporizadorCierreFinal !== null) { clearTimeout(temporizadorCierreFinal); temporizadorCierreFinal = null; }
+        detenerVoz();
+        return;
+      }
+      if (!ui.holaEnEstaConexion) { ui.fallosSinHola += 1; }
+      programarReconexion();
+    });
+  }
+
+  function programarReconexion() {
+    if (ui.finalizado || temporizadorReconexion !== null) { return; }
+    const ms = esperaReconexion;
+    esperaReconexion = Math.min(esperaReconexion * 2, 10000);
+    estadoLlamada("perdida", "reintento en " + Math.round(ms / 1000) + " s");
+    temporizadorReconexion = setTimeout(conectar, ms);
+  }
+
+  function enviarControl(accion, boton) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || ui.finalizado) { return; }
+    try {
+      ws.send(JSON.stringify({ tipo: "control", accion: accion }));
+    } catch (e) {
+      console.debug("No se pudo enviar el control:", e);
+      return;
+    }
+    boton.disabled = true; // evita ráfagas (el servidor admite 5 mensajes/s)
+    setTimeout(() => { boton.disabled = !ui.conectado || ui.finalizado; }, 350);
+  }
+  $("btn-silenciar").addEventListener("click", (ev) => enviarControl("silenciar", ev.currentTarget));
+  $("btn-camara").addEventListener("click", (ev) => enviarControl("camara", ev.currentTarget));
+  $("btn-colgar").addEventListener("click", (ev) => enviarControl("colgar", ev.currentTarget));
+
+  if (tokenFalta) {
+    estadoLlamada("sinenlace");
+  } else {
+    conectar();
+  }
+})();
+</script>
+</body>
+</html>
