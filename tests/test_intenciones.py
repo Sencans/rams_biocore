@@ -9,12 +9,14 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from core.contracts import AccionPC
+from core.contracts import DESTINOS_BASE, AccionPC
 from core.intenciones import (
     COMANDOS,
     COMANDOS_POR_CANAL,
     INTENCIONES_POR_CANAL,
+    MENSAJE_BUSCAR_DEFECTO,
     MENSAJE_SOLO_LOCAL,
+    TIPOS_INTENCION,
     Intencion,
     completar_programar,
     detectar_evento_social,
@@ -464,3 +466,197 @@ def test_quiere_cancelar() -> None:
         assert quiere_cancelar(texto) is True, texto
     for texto in ("", "no sé", "a las 6", "llamar a mamá", "gracias", "no olvides el pan"):
         assert quiere_cancelar(texto) is False, texto
+
+
+# ---------------------------------------------------------------------------
+# v0.2 (docs/COMPANION.md §C3 "Grupo orquestacion"): intenciones del companion
+# ---------------------------------------------------------------------------
+
+DESTINOS = {**{clave: clave for clave in DESTINOS_BASE}, "wasa": "whatsapp", "trino": "x"}
+
+
+def _v02(texto: str, canal: str = "escritorio", **kwargs: object) -> Intencion:
+    return enrutar(texto, ahora=AHORA, apps=APPS, canal=canal, destinos=kwargs.pop("destinos", DESTINOS),
+                   **kwargs)  # type: ignore[arg-type]
+
+
+def _accion_de(intencion: Intencion) -> AccionPC:
+    assert intencion.tipo == "accion_pc", intencion
+    accion = intencion.args["accion"]
+    assert isinstance(accion, AccionPC) and accion.origen == "usuario"
+    return accion
+
+
+def test_tipos_y_comandos_v02() -> None:
+    for tipo in ("publicar_borrador", "recordatorio_personal", "escritorio_venir", "escritorio_vete",
+                 "basta_travesuras", "vision_pausa"):
+        assert tipo in TIPOS_INTENCION
+    for comando in ("/vision", "/pantalla", "/travesuras"):
+        assert comando in COMANDOS and comando not in COMANDOS_POR_CANAL["telegram"]
+    assert _v02("/vision pausa 5").args == {"comando": "/vision", "resto": "pausa 5"}
+    assert _v02("/travesuras off").args == {"comando": "/travesuras", "resto": "off"}
+
+
+@pytest.mark.parametrize("texto, alias", [
+    ("abre whatsapp", "whatsapp"), ("Abre WhatsApp.", "whatsapp"), ("pon spotify", "spotify"),
+    ("lanza el navegador", "navegador"), ("abre twitter", "x"), ("abre wasa", "whatsapp"),
+    ("ábreme el correo", "correo"), ("abre trino", "x"),
+])
+def test_abrir_destino_da_la_clave(texto: str, alias: str) -> None:
+    accion = _accion_de(_v02(texto))
+    assert accion.tipo == "abrir_destino" and accion.args == {"alias": alias}
+
+
+def test_precedencia_catalogo_y_rams_apps() -> None:
+    apps = {**APPS, "youtube": "firefox", "spotify": "spotify-launcher"}
+    # Un alias del catálogo gana a RAMS_APPS.
+    accion = _accion_de(enrutar("abre youtube", ahora=AHORA, apps=apps, destinos=DESTINOS, plataforma="linux"))
+    assert accion.tipo == "abrir_destino" and accion.args == {"alias": "youtube"}
+    # Fuera del catálogo: RAMS_APPS → lanzar_app, solo en Linux.
+    linux = _accion_de(enrutar("abre terminal", ahora=AHORA, apps=apps, plataforma="linux"))
+    assert linux.tipo == "lanzar_app" and linux.args == {"alias": "terminal"}
+    assert enrutar("abre terminal", ahora=AHORA, apps=apps, plataforma="win32").tipo == "ninguna"
+    assert _accion_de(enrutar("abre terminal", ahora=AHORA, apps=apps)).tipo == "lanzar_app"   # sin plataforma
+    # Ni catálogo ni RAMS_APPS: sigue con las demás reglas ("pon pausa" es multimedia).
+    assert _v02("abre bitcoinminer").tipo == "ninguna"
+    assert _accion_de(_v02("pon pausa")).tipo == "media"
+
+
+def test_sinonimos_de_rams_destinos_y_claves_desconocidas() -> None:
+    assert _accion_de(_v02("abre wasa")).args["alias"] == "whatsapp"
+    sin_sinonimo = enrutar("abre wasa", ahora=AHORA, apps=APPS, destinos={c: c for c in DESTINOS_BASE})
+    assert _accion_de(sin_sinonimo).args["alias"] == "whatsapp"          # sinónimo de serie
+    # Un sinónimo que apunta fuera del catálogo nunca produce una acción.
+    malo = enrutar("abre cosa", ahora=AHORA, apps={}, destinos={"cosa": "no_existe"})
+    assert malo.tipo == "ninguna"
+
+
+def test_buscar_en() -> None:
+    accion = _accion_de(_v02("busca gatos graciosos en YouTube"))
+    assert accion.tipo == "buscar_en" and accion.args == {"alias": "youtube", "consulta": "gatos graciosos"}
+    spotify = _accion_de(_v02("pon Despacito de Luis Fonsi en spotify"))
+    assert spotify.args == {"alias": "spotify", "consulta": "Despacito de Luis Fonsi"}
+    assert _accion_de(_v02("busca vuelos a Cartagena en el navegador")).args["alias"] == "navegador"
+    # Destino sin búsqueda o desconocido: búsqueda web normal.
+    assert _v02("busca mamá en whatsapp").tipo == "buscar_web"
+    web = _v02("busca recetas de arepa en internet")
+    assert web.tipo == "buscar_web" and web.args["consulta"] == "recetas de arepa en internet"
+    assert _v02("busca precio del dólar hoy").tipo == "buscar_web"
+
+
+def test_prerrellenar_con_el_texto_original() -> None:
+    accion = _accion_de(_v02("Escríbele a mamá por WhatsApp: ¡Llego tarde, guárdame arepa!"))
+    assert accion.tipo == "prerrellenar"
+    assert accion.args == {"alias": "whatsapp", "texto": "¡Llego tarde, guárdame arepa!"}
+    assert "arepa" not in accion.descripcion
+    x = _accion_de(_v02("pon en X: Hoy aprendí algo sobre el conectoma"))
+    assert x.args == {"alias": "x", "texto": "Hoy aprendí algo sobre el conectoma"}
+    que = _accion_de(_v02("mándale un mensaje a Ana por telegram que ya voy saliendo"))
+    assert que.args == {"alias": "telegram", "texto": "ya voy saliendo"}
+    # Sin prerrelleno en el destino: teclear en la ventana previa (objetivo lo pone main).
+    insta = _v02("escríbele a Sofi por instagram: nos vemos a las 8")
+    accion_insta = _accion_de(insta)
+    assert accion_insta.tipo == "escribir_texto" and accion_insta.args == {"texto": "nos vemos a las 8"}
+    assert insta.args["destino"] == "instagram"
+
+
+def test_abrir_y_escribir_en_una_linea() -> None:
+    accion = _accion_de(_v02("abre whatsapp y escríbele a mamá: Hola, ¿cómo estás?"))
+    assert accion.tipo == "prerrellenar" and accion.args == {"alias": "whatsapp", "texto": "Hola, ¿cómo estás?"}
+    sin_prerrelleno = _v02("abre instagram y escríbele: hola")
+    assert _accion_de(sin_prerrelleno).tipo == "abrir_destino"
+    assert sin_prerrelleno.args["nota"] == "escribir_despues"
+
+
+def test_escribir_aqui_y_escribele_sin_destino() -> None:
+    aqui = _accion_de(_v02("escribe ahí: Buenas noches a todos"))
+    assert aqui.tipo == "escribir_texto" and aqui.args == {"texto": "Buenas noches a todos"}
+    assert _accion_de(_v02("escribe aquí que ya casi termino")).args == {"texto": "ya casi termino"}
+    escribele = _v02("escríbele a Ana que ya voy")
+    assert _accion_de(escribele).args == {"texto": "ya voy"} and escribele.args["sin_alias"] is True
+    assert _v02("escríbele a Ana: «nos vemos»").args["accion"].args == {"texto": "nos vemos"}
+
+
+@pytest.mark.parametrize("texto, alias", [
+    ("ponlo en WhatsApp", "whatsapp"), ("pásalo a instagram", "instagram"), ("publícalo en twitter", "x"),
+    ("mándalo por wasa", "whatsapp"),
+])
+def test_publicar_borrador(texto: str, alias: str) -> None:
+    intencion = _v02(texto)
+    assert intencion.tipo == "publicar_borrador" and intencion.args == {"alias": alias}
+
+
+def test_publicar_borrador_destino_desconocido_no_casa() -> None:
+    assert _v02("ponlo en la nevera").tipo == "ninguna"
+
+
+def test_recordatorio_personal() -> None:
+    simple = _v02("búscame en 10 minutos")
+    assert simple.tipo == "recordatorio_personal"
+    assert simple.args["vence"] == AHORA + timedelta(minutes=10)
+    assert simple.args["mensaje"] == MENSAJE_BUSCAR_DEFECTO and simple.args["con_mensaje"] is False
+    con_mensaje = _v02("llámame a las 6 pm para revisar el horno")
+    assert con_mensaje.args["vence"].hour == 18 and con_mensaje.args["mensaje"] == "revisar el horno"
+    assert con_mensaje.args["con_mensaje"] is True
+    assert _v02("ven a buscarme en media hora").args["vence"] == AHORA + timedelta(minutes=30)
+    # Sin una hora válida no es un recordatorio personal.
+    assert _v02("búscame la receta").tipo != "recordatorio_personal"
+
+
+@pytest.mark.parametrize("texto, tipo", [
+    ("ven", "escritorio_venir"), ("Ven!", "escritorio_venir"), ("aparece", "escritorio_venir"),
+    ("sal", "escritorio_venir"), ("Amadeus, ven", "escritorio_venir"), ("ven, Amadeus", "escritorio_venir"),
+    ("vete", "escritorio_vete"), ("escóndete", "escritorio_vete"),
+    ("basta", "basta_travesuras"), ("quieta", "basta_travesuras"), ("¡Quieta ya!", "basta_travesuras"),
+    ("deja el mouse", "basta_travesuras"), ("para ya", "basta_travesuras"), ("deja el ratón", "basta_travesuras"),
+    ("deja de mirarme", "vision_pausa"), ("no me mires", "vision_pausa"), ("cierra los ojos", "vision_pausa"),
+])
+def test_frases_cortas_ancladas(texto: str, tipo: str) -> None:
+    assert _v02(texto).tipo == tipo
+
+
+@pytest.mark.parametrize("texto", ["ven a ver esto", "sal de ahí", "basta de bromas, explícame el conectoma",
+                                   "vete a saber", "no me mires así, es en serio", "quieta la máquina de café"])
+def test_frases_cortas_solo_como_mensaje_completo(texto: str) -> None:
+    assert _v02(texto).tipo not in ("escritorio_venir", "escritorio_vete", "basta_travesuras", "vision_pausa")
+
+
+def test_vision_pausa_con_minutos() -> None:
+    assert _v02("deja de mirarme").args == {"minutos": None}
+    assert _v02("no me mires por 20 minutos").args == {"minutos": 20.0}
+    assert _v02("cierra los ojos durante una hora").args == {"minutos": 60.0}
+
+
+@pytest.mark.parametrize("texto", [
+    "abre whatsapp", "escríbele a mamá por whatsapp: hola", "pon en x: hola", "escribe ahí: hola",
+    "busca gatos en youtube", "ponlo en whatsapp", "ven", "vete", "basta", "deja de mirarme",
+    "/vision on", "/pantalla off", "/travesuras on",
+])
+def test_telegram_bloquea_lo_del_companion(texto: str) -> None:
+    intencion = _v02(texto, canal="telegram")
+    assert intencion.tipo == "bloqueada_canal", texto
+    assert _v02(texto, canal="nexus").tipo == "bloqueada_canal"
+
+
+def test_escritorio_hereda_lo_de_la_terminal_y_telegram_no_gana_capacidades() -> None:
+    for texto in ("abre terminal", "me ves", "mira mi pantalla", "/camara on", "/hud", "cierra la ventana"):
+        terminal = _v02(texto, canal="terminal")
+        assert _v02(texto, canal="escritorio").tipo == terminal.tipo != "bloqueada_canal", texto
+    # §C2.12: "llámame/búscame en 10 minutos" movería el avatar en el escritorio al vencer.
+    for texto in ("llámame en 10 minutos", "búscame a las 18:30"):
+        remoto = _v02(texto, canal="telegram")
+        assert remoto.tipo == "bloqueada_canal", texto
+        assert remoto.args["tipo_original"] == "recordatorio_personal"
+        assert _v02(texto, canal="escritorio").tipo == "recordatorio_personal"
+    # El recordatorio normal de la v0.1 sigue disponible por Telegram.
+    assert _v02("recuérdame en 10 minutos sacar la ropa", canal="telegram").tipo == "programar"
+    assert permitida_en_canal(Intencion("recordatorio_personal", {}), "telegram") is False
+    assert permitida_en_canal(Intencion("publicar_borrador", {"alias": "x"}), "escritorio") is True
+    assert permitida_en_canal(Intencion("publicar_borrador", {"alias": "x"}), "telegram") is False
+
+
+def test_alias_siempre_es_la_clave_y_origen_usuario() -> None:
+    for texto in ("abre wasa", "busca lofi en yt", "escríbele a mamá por wasa: hola", "pon en twitter: hola",
+                  "abre twitter y escríbele: hola"):
+        accion = _accion_de(_v02(texto))
+        assert accion.args["alias"] in DESTINOS_BASE, texto

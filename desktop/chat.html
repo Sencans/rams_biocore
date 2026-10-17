@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Amadeus Chat</title>
+  <link rel="stylesheet" href="chat.css">
+  <script src="chat.js" defer></script>
+</head>
+<body>
+  <div class="app">
+    <header class="barra">
+      <div class="marca">
+        <span class="logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="24" height="24" focusable="false"><path d="M12 3 4.5 21h3.2l1.6-4h5.4l1.6 4h3.2L12 3Zm-1.6 11 1.6-4.2 1.6 4.2h-3.2Z"/></svg>
+        </span>
+        <div class="titulos">
+          <h1>Amadeus</h1>
+          <p id="estado" class="estado desconectada" role="status" aria-live="polite">
+            <i aria-hidden="true"></i><span id="estado-texto">desconectada</span>
+          </p>
+        </div>
+      </div>
+      <div class="acciones">
+        <details class="menu" id="menu">
+          <summary class="icono" aria-label="Opciones" title="Opciones">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>
+          </summary>
+          <div class="menu-lista" role="menu">
+            <button type="button" role="menuitem" data-control="no_molestar_on">Activar «No molestar»</button>
+            <button type="button" role="menuitem" data-control="no_molestar_off">Quitar «No molestar»</button>
+            <button type="button" role="menuitem" data-control="basta_travesuras">Quieta (sin travesuras)</button>
+          </div>
+        </details>
+        <button type="button" class="icono" id="btn-cerrar" aria-label="Ocultar el chat" title="Ocultar (Esc)">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" focusable="false"><path d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4-5.6-5.6L19 6.4 17.6 5 12 10.6 6.4 5Z"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <main id="lista" class="lista" role="log" aria-live="polite" aria-label="Conversación con Amadeus" tabindex="0">
+      <p class="vacio" id="vacio">Escríbele a Amadeus. <kbd>Enter</kbd> envía, <kbd>Shift</kbd>+<kbd>Enter</kbd> hace un salto de línea.</p>
+    </main>
+
+    <p id="hablando" class="hablando" hidden><span class="ondas" aria-hidden="true"><i></i><i></i><i></i></span>Amadeus está hablando…</p>
+
+    <form id="form" class="entrada" autocomplete="off">
+      <label for="texto" class="oculto">Mensaje para Amadeus</label>
+      <textarea id="texto" rows="1" maxlength="2000" placeholder="Escríbele a Amadeus…" spellcheck="false"></textarea>
+      <button id="enviar" type="submit" class="enviar" aria-label="Enviar" title="Enviar (Enter)">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" focusable="false"><path d="M3.4 20.4 21 12 3.4 3.6 3.4 10l12.6 2-12.6 2v6.4Z"/></svg>
+      </button>
+    </form>
+    <p class="pie"><span id="contador" aria-live="off"></span></p>
+  </div>
+</body>
+</html>

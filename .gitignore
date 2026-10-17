@@ -21,6 +21,10 @@ __pycache__/
 venv/
 .pytest_cache/
 *.egg-info/
+# Amadeus Desktop (Electron): dependencias, compilados y logs
+desktop/node_modules/
+desktop/out/
+desktop/*.log
 # Editor / SO
 .vscode/
 .idea/

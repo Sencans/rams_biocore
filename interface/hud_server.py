@@ -15,6 +15,17 @@ Qué hace:
   ``CONTROLES_PERMITIDOS`` (máximo 5 mensajes/s por cliente): publica ``hud.control`` y responde
   ``control_ack``. El HUD **no** es un canal de texto ni de confirmaciones.
 
+v0.2 (``docs/COMPANION.md`` §C2.4): el mismo servidor sirve además ``/escritorio`` (Amadeus
+Desktop y el panel de chat RINE del HUD), con un token propio escrito en
+``settings.escritorio_token_file``; lo implementa ``interface/escritorio_link.py``. El servidor
+arranca si ``hud_habilitado or tiene_escritorio``; ``/`` y ``/ws`` solo existen con el HUD
+habilitado y ``/escritorio`` solo con ``tiene_escritorio`` (si no, 404). Justo **después** del
+``hola`` de ``/ws`` (que no cambia), y solo con ``tiene_escritorio and hud_chat``, el HUD recibe
+``{"tipo": "escritorio", "datos": {"token", "url": "/escritorio"}}``. ``/ws`` también traduce
+``vision.estado`` → ``vision``, ``pantalla.estado`` → ``pantalla`` (sin título si es privada),
+``pc.accion`` → ``accion`` y ``vision.camara`` con ``fuente``; nunca reenvía ``escritorio.chat``,
+``escritorio.sistema`` ni la ``vista_previa`` de los permisos.
+
 Dependencias opcionales: ``websockets`` (≥ 14, API ``websockets.asyncio``). Sin ella el módulo
 se importa igual y ``iniciar()`` devuelve ``OFF ("websockets no instalado")``.
 
@@ -49,6 +60,7 @@ from urllib.parse import parse_qs, urlsplit
 from core.bus import BusEventos, Evento
 from core.config import Settings
 from core.contracts import VERSION, DiagnosticoModulo, EstadoModulo
+from interface.escritorio_link import RUTA_ESCRITORIO, EnlaceEscritorio
 
 try:  # opcional: sin websockets el HUD queda en OFF
     from websockets.asyncio.server import broadcast as _ws_broadcast
@@ -115,16 +127,26 @@ EVENTOS_SUSCRITOS: Final = (
     "permiso.solicitado",
     "permiso.resuelto",
     "log",
+    # v0.2 (§C2.3/§C2.4.6). Nunca "escritorio.chat" ni "escritorio.sistema".
+    "vision.estado",
+    "pantalla.estado",
+    "pc.accion",
 )
 
 # Instantánea para clientes nuevos: (evento del bus, tipo de mensaje del HUD).
+# ``vision.camara`` se envía una vez por cada ``fuente`` vista (el LED es el OR de las fuentes).
 INSTANTANEA: Final = (
     ("homeostasis.estado", "estado"),
     ("pc.telemetria", "telemetria"),
     ("usuario.presencia", "presencia"),
     ("vision.camara", "camara"),
+    ("vision.estado", "vision"),
+    ("pantalla.estado", "pantalla"),
 )
 _NOMBRES_INSTANTANEA: Final = frozenset(nombre for nombre, _tipo in INSTANTANEA)
+
+# Fuentes de ``vision.camara`` (§C2.3): sin ``fuente`` = "vistazo".
+FUENTES_CAMARA: Final = ("vistazo", "continua")
 
 # Límites de frecuencia hacia los clientes: tipo → intervalo mínimo en segundos. Se aplican con
 # coalescencia: si llega otro mensaje dentro del intervalo se envía el más reciente al vencer
@@ -133,6 +155,7 @@ INTERVALOS_MIN_S: Final[dict[str, float]] = {
     "estado": 0.5,        # 2 Hz
     "telemetria": 1.0,    # 1 Hz
     "boca": 1.0 / 15.0,   # 15 Hz
+    "pantalla": 1.0,      # 1 Hz (v0.2)
 }
 MAX_LOG_POR_S: Final = 10
 MAX_MENSAJES_CLIENTE_S: Final = 5
@@ -297,6 +320,40 @@ def traducir_evento(nombre: str, datos: Mapping[str, Any]) -> tuple[str, dict[st
             "activa": bool(datos.get("activa", False)),
             "habilitada": bool(datos.get("habilitada", False)),
             "duracion_ms": _entero(datos.get("duracion_ms")) or 0,
+            "fuente": _fuente_camara(datos),
+        }
+    if nombre == "vision.estado":
+        return "vision", {
+            "camara": _texto(datos.get("camara"), 20),
+            "pantalla": _texto(datos.get("pantalla"), 20),
+            "fps_camara": _real(datos.get("fps_camara"), 0.0),
+            "fps_pantalla": _real(datos.get("fps_pantalla"), 0.0),
+            "nivel": _entero(datos.get("nivel")) or 0,
+            "detector": _texto(datos.get("detector"), 20) or None,
+            "presente": _bool_o_none(datos.get("presente")),
+            "atencion": _acotar01(datos.get("atencion")),
+        }
+    if nombre == "pantalla.estado":
+        privada = bool(datos.get("privada", False))
+        pantalla: dict[str, Any] = {
+            "cambio": _real(datos.get("cambio"), 0.0),
+            "brillo": _real(datos.get("brillo"), 0.0),
+            "tono": _entero(datos.get("tono")),
+            "video": bool(datos.get("video", False)),
+            "pantalla_completa": _bool_o_none(datos.get("pantalla_completa")),
+            "reproduciendo": _bool_o_none(datos.get("reproduciendo")),
+            "no_molestar": bool(datos.get("no_molestar", False)),
+            "privada": privada,
+            "clase": _texto(datos.get("clase"), 60),
+        }
+        if not privada:  # §C2.4.6: sin título si la ventana es privada
+            pantalla["titulo"] = _texto(datos.get("titulo"), 60)
+        return "pantalla", pantalla
+    if nombre == "pc.accion":  # auditoría: nunca el texto
+        return "accion", {
+            "tipo": _texto(datos.get("tipo"), 40),
+            "resultado": _texto(datos.get("resultado"), 200),
+            "destino": _texto(datos.get("destino"), 40) or None,
         }
     if nombre == "usuario.presencia":
         return "presencia", dict(datos)
@@ -338,6 +395,17 @@ def traducir_evento(nombre: str, datos: Mapping[str, Any]) -> tuple[str, dict[st
             "ts": _real(datos.get("ts"), time.time()),
         }
     return None
+
+
+def _bool_o_none(valor: Any) -> bool | None:
+    """``None`` se conserva; lo demás pasa a ``bool``."""
+    return None if valor is None else bool(valor)
+
+
+def _fuente_camara(datos: Mapping[str, Any]) -> str:
+    """``fuente`` de ``vision.camara`` (§C2.3): ``"vistazo"`` (defecto) o ``"continua"``."""
+    fuente = datos.get("fuente")
+    return fuente if fuente in FUENTES_CAMARA else "vistazo"
 
 
 def _normalizar_modulo(datos: Mapping[str, Any]) -> dict[str, Any]:
@@ -418,13 +486,20 @@ class ServidorHUD:
         self._bus = bus
         self._ruta_html = Path(ruta_html) if ruta_html is not None else Path(__file__).resolve().parent / NOMBRE_HTML
         self.token: str = secrets.token_urlsafe(16)
-        self.puerto_real: int | None = None
+        self._puerto: int | None = None
+        self._motivo_sin_servidor: str | None = None
         self._creado_ts = time.time()
+
+        # v0.2: endpoint /escritorio con su propio token (distinto del del HUD).
+        self._escritorio: EnlaceEscritorio | None = (
+            EnlaceEscritorio(settings, bus, evitar_token=self.token)
+            if getattr(settings, "tiene_escritorio", False) else None)
 
         # Estado observado del bus (protegido por _lock: el bus puede llamar desde otro hilo).
         self._lock = threading.Lock()
         self._diagnosticos: dict[str, dict[str, Any]] = {}
         self._ultimos: dict[str, Evento] = {}
+        self._camara_por_fuente: dict[str, Evento] = {}
         self._inicio_ts_evento: float | None = None
         self._permiso_pendiente: dict[str, Any] | None = None
         self._apagado: dict[str, Any] | None = None
@@ -454,31 +529,58 @@ class ServidorHUD:
     # ------------------------------------------------------------------
 
     @property
+    def hud_activo(self) -> bool:
+        """``True`` si ``/`` y ``/ws`` están servidos (HUD habilitado y servidor escuchando)."""
+        return bool(self._settings.hud_habilitado) and self._servidor is not None
+
+    @property
+    def puerto_real(self) -> int | None:
+        """Puerto real del HUD (``None`` si el HUD está deshabilitado o el servidor no escucha)."""
+        return self._puerto if self._settings.hud_habilitado else None
+
+    @property
+    def puerto_escritorio(self) -> int | None:
+        """Puerto real de ``/escritorio`` (``None`` si el enlace no está activo)."""
+        return self._puerto if (self._escritorio is not None and self._escritorio.activo) else None
+
+    @property
+    def escritorio(self) -> EnlaceEscritorio | None:
+        """Enlace ``/escritorio`` (``None`` sin ``tiene_escritorio``)."""
+        return self._escritorio
+
+    @property
     def url(self) -> str | None:
         """URL del HUD **con** token (solo para la consola local; nunca se registra)."""
-        if self.puerto_real is None or self._servidor is None:
+        if self._puerto is None or not self.hud_activo:
             return None
-        return f"http://{HOST}:{self.puerto_real}/?t={self.token}"
+        return f"http://{HOST}:{self._puerto}/?t={self.token}"
 
     @property
     def n_clientes(self) -> int:
-        """Número de clientes WebSocket conectados."""
+        """Número de clientes WebSocket conectados a ``/ws``."""
         return len(self._clientes)
 
-    def __repr__(self) -> str:  # sin token
-        return f"ServidorHUD(puerto={self.puerto_real!r}, clientes={self.n_clientes})"
+    def __repr__(self) -> str:  # sin tokens
+        escritorio = self._escritorio.n_clientes if self._escritorio is not None else None
+        return (f"ServidorHUD(puerto={self._puerto!r}, clientes={self.n_clientes}, "
+                f"escritorio={escritorio!r})")
 
     async def iniciar(self) -> DiagnosticoModulo:
-        """Abre el servidor en ``127.0.0.1:hud_puerto`` y devuelve el diagnóstico (clave ``"hud"``).
+        """Abre el servidor en ``127.0.0.1:hud_puerto`` y devuelve el diagnóstico del HUD (clave ``"hud"``).
 
-        ``OFF`` si ``hud_habilitado`` es ``False`` o falta websockets; ``SIN CONEXIÓN`` si el puerto
-        está ocupado; ``DEGRADADO`` si falta ``amadeus_hud.html``; ``OK`` con la URL **sin** token.
+        El servidor arranca si ``hud_habilitado or tiene_escritorio`` (§C2.4.2). Diagnóstico del
+        HUD: ``OFF`` si ``hud_habilitado`` es ``False`` (aunque ``/escritorio`` sí escuche) o falta
+        websockets; ``SIN CONEXIÓN`` si el puerto está ocupado; ``DEGRADADO`` si falta
+        ``amadeus_hud.html``; ``OK`` con la URL **sin** token. El de ``/escritorio`` lo da
+        :meth:`diagnostico_escritorio`.
         """
-        if not self._settings.hud_habilitado:
+        hud = bool(self._settings.hud_habilitado)
+        if not hud and self._escritorio is None:
             return self._registrar_propio(EstadoModulo.OFF, "deshabilitado")
         if not WEBSOCKETS_DISPONIBLE or _ws_serve is None:
-            log.info("HUD desactivado: websockets no está instalado")
-            return self._registrar_propio(EstadoModulo.OFF, "websockets no instalado")
+            log.info("HUD y /escritorio desactivados: websockets no está instalado")
+            self._motivo_sin_servidor = "websockets no instalado"
+            return self._registrar_propio(EstadoModulo.OFF, "websockets no instalado" if hud else "deshabilitado")
         if self._servidor is not None:
             return self._diagnostico_activo()
 
@@ -487,7 +589,7 @@ class ServidorHUD:
         self._loop = asyncio.get_running_loop()
         self._hilo_loop = threading.get_ident()
         self._apagado_enviado = False
-        self._html = await asyncio.to_thread(self._leer_html)
+        self._html = await asyncio.to_thread(self._leer_html) if hud else None
 
         try:
             servidor = await _ws_serve(
@@ -502,28 +604,63 @@ class ServidorHUD:
         except OSError as exc:
             if _es_puerto_ocupado(exc):
                 log.warning("HUD sin conexión: el puerto %d está ocupado", self._settings.hud_puerto)
-                return self._registrar_propio(EstadoModulo.SIN_CONEXION, "puerto ocupado")
+                return self._sin_servidor(hud, "puerto ocupado")
             if _es_puerto_prohibido(exc):
                 log.warning("HUD sin conexión: el puerto %d no está permitido", self._settings.hud_puerto)
-                return self._registrar_propio(EstadoModulo.SIN_CONEXION, "puerto no permitido")
+                return self._sin_servidor(hud, "puerto no permitido")
             log.warning("HUD sin conexión: no se pudo escuchar en %s:%d (%s)", HOST,
                         self._settings.hud_puerto, exc.strerror or type(exc).__name__)
-            return self._registrar_propio(EstadoModulo.SIN_CONEXION,
-                                          f"no se pudo escuchar ({exc.strerror or type(exc).__name__})")
+            return self._sin_servidor(hud, f"no se pudo escuchar ({exc.strerror or type(exc).__name__})")
         except Exception as exc:  # error inesperado de la librería: el HUD no tumba el sistema
             log.warning("HUD sin conexión: error al iniciar el servidor (%s)", type(exc).__name__)
-            return self._registrar_propio(EstadoModulo.SIN_CONEXION, f"error al iniciar ({type(exc).__name__})")
+            return self._sin_servidor(hud, f"error al iniciar ({type(exc).__name__})")
 
         self._servidor = servidor
-        self.puerto_real = self._puerto_de(servidor)
-        log.info("HUD escuchando en %s:%s", HOST, self.puerto_real)
+        self._puerto = self._puerto_de(servidor)
+        self._motivo_sin_servidor = None
+        if self._escritorio is not None:
+            await self._escritorio.activar(self._puerto)
+        log.info("Servidor del HUD escuchando en %s:%s (HUD %s, /escritorio %s)", HOST, self._puerto,
+                 "sí" if hud else "no", "sí" if self._escritorio is not None else "no")
         # CONTRATO: con RAMS_HUD_OPEN=1 es main quien llama a abrir_navegador() tras el arranque.
         return self._diagnostico_activo()
+
+    def _sin_servidor(self, hud: bool, motivo: str) -> DiagnosticoModulo:
+        """Diagnóstico del HUD cuando el servidor no pudo escuchar (guarda el motivo para /escritorio)."""
+        self._motivo_sin_servidor = motivo
+        if not hud:
+            return self._registrar_propio(EstadoModulo.OFF, "deshabilitado")
+        return self._registrar_propio(EstadoModulo.SIN_CONEXION, motivo)
+
+    def diagnostico_escritorio(self) -> DiagnosticoModulo:
+        """Diagnóstico de ``/escritorio`` (clave ``"escritorio"``, §C2.4.2); la URL nunca lleva el token.
+
+        ``OFF`` sin ``tiene_escritorio`` o sin websockets; ``SIN CONEXIÓN`` si el servidor no pudo
+        escuchar; ``EN ESPERA`` antes de :meth:`iniciar`; ``DEGRADADO`` si no se pudo escribir el
+        archivo del token; ``OK`` con ``ws://127.0.0.1:<puerto>/escritorio``.
+        """
+        nombre = "Amadeus Desktop (/escritorio)"
+        if self._escritorio is None or not getattr(self._settings, "tiene_escritorio", False):
+            diagnostico = DiagnosticoModulo("escritorio", nombre, EstadoModulo.OFF, "deshabilitado")
+        elif not WEBSOCKETS_DISPONIBLE or _ws_serve is None:
+            diagnostico = DiagnosticoModulo("escritorio", nombre, EstadoModulo.OFF, "websockets no instalado")
+        elif self._servidor is None:
+            if self._motivo_sin_servidor:
+                diagnostico = DiagnosticoModulo("escritorio", nombre, EstadoModulo.SIN_CONEXION,
+                                                self._motivo_sin_servidor)
+            else:
+                diagnostico = DiagnosticoModulo("escritorio", nombre, EstadoModulo.EN_ESPERA, "sin iniciar")
+        else:
+            diagnostico = self._escritorio.diagnostico()
+        with self._lock:
+            self._diagnosticos["escritorio"] = _normalizar_modulo(diagnostico.a_dict())
+        return diagnostico
 
     async def cerrar(self) -> None:
         """Avisa a los clientes (``apagado``), cierra el servidor y suelta la suscripción al bus.
 
-        Idempotente. Espera como máximo unos segundos al cierre de las conexiones.
+        Idempotente. Espera como máximo unos segundos al cierre de las conexiones. También cierra
+        ``/escritorio`` y borra su token si el archivo sigue siendo de esta instancia.
         """
         for desuscribir in self._desuscripciones:
             try:
@@ -556,6 +693,8 @@ class ServidorHUD:
             except Exception as exc:
                 log.debug("Error al esperar el cierre del HUD: %s", exc)
             log.info("HUD cerrado")
+        if self._escritorio is not None:
+            await self._escritorio.cerrar()  # suelta el bus y borra el token si sigue siendo propio
 
         # El lanzamiento del navegador NO se cancela: el navegador ya va desacoplado de RAMS
         # (setsid --fork o Popen en sesión nueva) y solo queda comprobar cómo salió el lanzador.
@@ -568,7 +707,7 @@ class ServidorHUD:
                 tarea.cancel()
         self._tareas_navegador.clear()
         self._clientes.clear()
-        self.puerto_real = None
+        self._puerto = None
 
     def abrir_navegador(self) -> bool:
         """Abre el HUD en el navegador. Devuelve ``True`` si se lanzó (o ya se acaba de lanzar).
@@ -650,6 +789,8 @@ class ServidorHUD:
                     pendiente = self._permiso_pendiente
                     if pendiente is None or pendiente.get("id") in ("", _texto(datos.get("id"), 64)):
                         self._permiso_pendiente = None
+                elif nombre == "vision.camara":
+                    self._camara_por_fuente[_fuente_camara(datos)] = evento
                 if nombre in _NOMBRES_INSTANTANEA:
                     self._ultimos[nombre] = evento
 
@@ -765,15 +906,22 @@ class ServidorHUD:
     # ------------------------------------------------------------------
 
     def _http(self, conexion: Any, solicitud: Any) -> Any:
-        """``process_request``: sirve el HTML, valida ``/ws`` y responde 204/404 al resto."""
+        """``process_request``: sirve el HTML, valida ``/ws`` y ``/escritorio`` y responde 204/404 al resto.
+
+        ``/``, ``/index.html``, ``/ws`` y el favicon solo existen con el HUD habilitado;
+        ``/escritorio`` solo con ``tiene_escritorio`` (§C2.4.2). Lo demás: 404.
+        """
         try:
             partes = urlsplit(solicitud.path)
             ruta = partes.path
-            if ruta in ("/", "/index.html"):
+            hud = bool(self._settings.hud_habilitado)
+            if ruta == RUTA_ESCRITORIO and self._escritorio is not None:
+                return self._escritorio.validar_handshake(conexion, solicitud, partes.query)
+            if hud and ruta in ("/", "/index.html"):
                 return self._respuesta_html()
-            if ruta == "/ws":
+            if hud and ruta == "/ws":
                 return self._validar_ws(conexion, solicitud, partes.query)
-            if ruta == "/favicon.ico":
+            if hud and ruta == "/favicon.ico":
                 return self._respuesta_vacia(HTTPStatus.NO_CONTENT)
             return conexion.respond(HTTPStatus.NOT_FOUND, "No encontrado\n")
         except Exception as exc:
@@ -803,7 +951,7 @@ class ServidorHUD:
 
     def _origenes_permitidos(self) -> frozenset[str]:
         """``{http://127.0.0.1:<p>, http://localhost:<p>}`` con el puerto real."""
-        puerto = self.puerto_real
+        puerto = self._puerto
         if puerto is None:
             return frozenset()
         return frozenset({f"http://127.0.0.1:{puerto}", f"http://localhost:{puerto}"})
@@ -842,9 +990,22 @@ class ServidorHUD:
         return _WsResponse(estado.value, estado.phrase, _WsHeaders(self._cabeceras_base(None)), b"")
 
     async def _manejar(self, conexion: Any) -> None:
-        """Ciclo de vida de un cliente: ``hola`` + instantánea, y luego solo controles permitidos."""
+        """Ciclo de vida de un cliente: ``hola`` + instantánea, y luego solo controles permitidos.
+
+        Las conexiones de ``/escritorio`` las lleva :class:`EnlaceEscritorio` (§C2.4).
+        """
         if self._servidor is None:
             return
+        try:
+            ruta = urlsplit(conexion.request.path).path
+        except Exception:
+            ruta = ""
+        if ruta == RUTA_ESCRITORIO:
+            if self._escritorio is not None:
+                await self._escritorio.manejar(conexion)
+            return
+        if ruta != "/ws" or not self._settings.hud_habilitado:
+            return  # no debería ocurrir: process_request ya respondió 404
         iniciales = self._mensajes_iniciales()
         if _ws_broadcast is None:
             return
@@ -902,12 +1063,26 @@ class ServidorHUD:
     def _mensajes_iniciales(self) -> list[str]:
         """``hola``, instantánea de los últimos eventos, diagnósticos, permiso pendiente y apagado."""
         mensajes = [_serializar("hola", self._datos_hola())]
+        # v0.2 (§C2.4.6): justo DESPUÉS del hola (que no cambia), el token de /escritorio para el
+        # panel de chat, solo con tiene_escritorio and hud_chat. Únicamente por /ws (token + Origin).
+        if self._escritorio is not None and getattr(self._settings, "tiene_escritorio", False) \
+                and getattr(self._settings, "hud_chat", True):
+            datos_escritorio = self._escritorio.datos_para_hud()
+            if datos_escritorio is not None:
+                mensajes.append(_serializar("escritorio", datos_escritorio))
         with self._lock:
             ultimos = dict(self._ultimos)
             diagnosticos = [dict(d) for d in self._diagnosticos.values()]
             permiso = dict(self._permiso_pendiente) if self._permiso_pendiente else None
             apagado = dict(self._apagado) if self._apagado else None
+            camaras = [self._camara_por_fuente[f] for f in FUENTES_CAMARA if f in self._camara_por_fuente]
         for nombre, _tipo in INSTANTANEA:
+            if nombre == "vision.camara" and camaras:  # una por fuente: el LED es el OR
+                for evento in camaras:
+                    traducido = traducir_evento(nombre, evento.datos)
+                    if traducido is not None:
+                        mensajes.append(_serializar(*traducido))
+                continue
             evento = self._bus.ultimo(nombre) or ultimos.get(nombre)
             if evento is None:
                 continue
@@ -968,8 +1143,13 @@ class ServidorHUD:
         return None
 
     def _diagnostico_activo(self) -> DiagnosticoModulo:
-        """Diagnóstico del servidor en marcha: ``OK`` (o ``DEGRADADO`` sin HTML) con la URL sin token."""
-        url_publica = f"http://{HOST}:{self.puerto_real}/"
+        """Diagnóstico del servidor en marcha: ``OK`` (o ``DEGRADADO`` sin HTML) con la URL sin token.
+
+        Con el HUD deshabilitado (servidor solo para ``/escritorio``): ``OFF``.
+        """
+        if not self._settings.hud_habilitado:
+            return self._registrar_propio(EstadoModulo.OFF, "deshabilitado")
+        url_publica = f"http://{HOST}:{self._puerto}/"
         if self._html is None:
             return self._registrar_propio(EstadoModulo.DEGRADADO, f"falta {NOMBRE_HTML} · {url_publica}")
         return self._registrar_propio(EstadoModulo.OK, url_publica)

@@ -18,9 +18,23 @@ Qué hace:
 
 Dependencias opcionales: ``httpx`` (ElevenLabs y Telegram), ``edge_tts`` (voz de respaldo),
 ``numpy`` (RMS del lip-sync; si falta, ``array('h')`` + ``math``; **nunca** ``audioop``),
-``sounddevice`` (reproducción en Windows, importado solo al reproducir). Binarios opcionales:
-``pw-play``/``paplay``/``aplay`` (PCM), ``ffmpeg`` (MP3 → PCM), ``mpv``/``ffplay`` (MP3),
-``notify-send``.
+``sounddevice`` (reproducción en Windows, importado solo al reproducir), ``soundfile`` (decodifica
+el MP3 de edge-tts sin ffmpeg; su wheel trae libsndfile con MP3; importado solo en el executor de
+audio). Binarios opcionales: ``pw-play``/``paplay``/``aplay`` (PCM), ``ffmpeg`` (MP3 → PCM),
+``mpv``/``ffplay`` (MP3), ``notify-send``.
+
+Caminos de edge-tts (MP3 24 kHz), por orden de preferencia:
+1. ``ffmpeg`` en streaming → PCM → reproductor PCM, con lip-sync RMS.
+2. ``soundfile`` (sin ffmpeg): MP3 completo → PCM decodificado en el executor de audio →
+   reproductor PCM por bloques de 100 ms, con el mismo lip-sync RMS. Es el camino de Windows
+   (``soundfile`` + ``sounddevice``), donde no suele haber ffmpeg. ``iniciar`` comprueba que
+   soundfile carga y que su libsndfile lee MP3 (≥ 1.1); si no, se descarta antes de hablar. El MP3
+   del segmento siguiente se descarga mientras suena el actual.
+3. ``mpv``/``ffplay`` leyendo el MP3, con la boca simulada.
+
+Sincronía con el avatar: el subtítulo (``salida.subtitulo``, canal ``voz``) de cada segmento
+hablado se publica cuando su audio empieza de verdad (al abrir el reproductor), porque el puente
+de VTuber AI Studio mueve los labios del visor en cuanto lo recibe.
 
 Degradación: sin httpx no hay ElevenLabs ni Telegram; sin edge_tts no hay *fallback* de voz;
 sin reproductor solo hay texto; sin avatar, voz sin boca; sin memoria, la cuota, las llamadas y
@@ -36,12 +50,15 @@ from __future__ import annotations
 import array
 import asyncio
 import contextlib
+import functools
 import html
 import importlib.util
+import io
 import itertools
 import json
 import logging
 import math
+import os
 import random
 import re
 import shutil
@@ -94,7 +111,8 @@ except ImportError:  # sin edge-tts: sin fallback de voz
 
 
 def _modulo_instalado(nombre: str) -> bool:
-    """``True`` si el módulo existe, **sin importarlo** (sounddevice inicializa PortAudio al importarse)."""
+    """``True`` si el módulo existe, **sin importarlo** (sounddevice inicializa PortAudio al importarse
+    y soundfile carga libsndfile por cffi)."""
     try:
         return importlib.util.find_spec(nombre) is not None
     except (ImportError, ValueError):
@@ -102,6 +120,7 @@ def _modulo_instalado(nombre: str) -> bool:
 
 
 SOUNDDEVICE_INSTALADO: Final = _modulo_instalado("sounddevice")
+SOUNDFILE_INSTALADO: Final = _modulo_instalado("soundfile")
 
 __all__ = [
     "RikoMeguminIO",
@@ -150,6 +169,14 @@ FORMATO_NOTA_VOZ: Final = "mp3_44100_64"
 # edge-tts
 VOCES_EDGE_POR_LANG: Final = {"en": "en-US-AriaNeural", "ja": "ja-JP-NanamiNeural"}
 SR_EDGE: Final = 24000
+TIMEOUT_EDGE_MP3_S: Final = 45.0          # MP3 completo de edge-tts (soundfile, mpv/ffplay y notas de voz)
+TIMEOUT_DECODIFICAR_S: Final = 20.0       # decodificación con soundfile en el executor de audio
+BLOQUE_PCM_MS: Final = 100                # bloques del PCM decodificado hacia _reproducir_pcm
+INTERVALO_CORTE_S: Final = 0.1            # cada cuánto se atiende un corte mientras se descarga el MP3
+MAX_FALLOS_SOUNDFILE: Final = 3           # decodificaciones fallidas seguidas antes de descartar soundfile
+# Comprobación de soundfile en ``iniciar`` (importarlo carga libsndfile y numpy: ~0,3 s en frío). Va
+# en paralelo con el sondeo de ElevenLabs y por debajo de TIMEOUT_DIAGNOSTICO_S. Variable de módulo.
+TIMEOUT_VALIDAR_SOUNDFILE_S: float = 2.0
 
 # Lip-sync (informe 04 §10.2)
 TRAMA_MS: Final = 20
@@ -574,6 +601,66 @@ def _argv_reproductor_mp3() -> list[str] | None:
     return None
 
 
+def _nombre_programa(ruta: str) -> str:
+    """Ruta de un ejecutable → nombre corto para el diagnóstico (``…/ffplay.EXE`` → ``"ffplay"``)."""
+    return os.path.splitext(os.path.basename(ruta))[0].lower() or ruta
+
+
+def _soundfile_con_mp3() -> Any:
+    """Importa ``soundfile`` y comprueba que su libsndfile decodifica MP3. Devuelve el módulo.
+
+    **Bloqueante** (executor de audio). La wheel de soundfile trae libsndfile ≥ 1.1 con MP3, pero
+    donde no hay librería empaquetada (armv7, musl, paquete de la distro, sdist) soundfile carga la
+    libsndfile del sistema, que puede ser anterior a 1.1 y no leer MP3: cada ``sf.read`` fallaría
+    con «Format not recognised». Eso se trata como un soundfile que no carga: ``ImportError``.
+    Lanza ``ImportError``/``OSError`` si soundfile o libsndfile no se pueden cargar.
+    """
+    import soundfile as sf  # opcional; importación diferida a propósito
+
+    if "MP3" not in sf.available_formats():
+        version = getattr(sf, "__libsndfile_version__", "?")
+        raise ImportError(f"libsndfile {version} no decodifica MP3 (hace falta 1.1 o posterior)")
+    return sf
+
+
+def _mp3_a_pcm_soundfile(mp3: bytes) -> tuple[bytes, int]:
+    """MP3 completo → ``(PCM s16le mono, frecuencia real)`` con soundfile (libsndfile ≥ 1.1).
+
+    **Bloqueante**: corre en el executor de audio, nunca en el event loop. ``soundfile`` se importa
+    aquí a propósito (al importarse carga libsndfile por cffi y numpy). Si el audio trae varios
+    canales se mezclan a mono promediándolos. Lanza ``ImportError``/``OSError`` si soundfile o
+    libsndfile no se pueden cargar o no decodifican MP3 (``_soundfile_con_mp3``) y
+    ``RuntimeError`` (``LibsndfileError``) si el MP3 es ilegible.
+    """
+    sf = _soundfile_con_mp3()
+    datos, sr = sf.read(io.BytesIO(mp3), dtype="int16", always_2d=True)
+    if datos.shape[1] > 1:
+        mono = datos.mean(axis=1).round()      # la media de int16 siempre cabe en int16
+    else:
+        mono = datos[:, 0]
+    return mono.astype("<i2").tobytes(), int(sr)
+
+
+async def _bloques_pcm(pcm: bytes, sr: int, ms: int = BLOQUE_PCM_MS) -> AsyncIterator[bytes]:
+    """Fuente asíncrona de PCM s16le mono en bloques de ``ms`` (≈ 100 ms) para ``_reproducir_pcm``."""
+    tam = max(2, (sr * ms // 1000) * 2)
+    for inicio in range(0, len(pcm), tam):
+        yield pcm[inicio:inicio + tam]
+
+
+def _motivo_excepcion(exc: BaseException) -> str:
+    """``"Tipo: mensaje"`` (≤ 200 caracteres) para explicar en el log por qué se descarta algo."""
+    mensaje = str(exc).strip()
+    return f"{type(exc).__name__}: {mensaje}"[:200] if mensaje else type(exc).__name__
+
+
+def _recoger_resultado(tarea: asyncio.Future[Any]) -> None:
+    """*Done callback* de una descarga anticipada que quizá nadie espere: recoge su excepción para
+    que el loop no avise de «Task exception was never retrieved»."""
+    if not tarea.cancelled():
+        tarea.exception()
+
+
 def _fabricar_reproductor(nombre: str, obtener_ejecutor: Callable[[], ThreadPoolExecutor]) -> _Reproductor:
     """Crea el reproductor PCM ``nombre`` (punto de inyección para los tests)."""
     if nombre == "sounddevice":
@@ -658,6 +745,10 @@ class RikoMeguminIO:
         self._reproductores_rotos: set[str] = set()
         self._reproductor_mp3: list[str] | None = None
         self._ffmpeg: str | None = None
+        self._soundfile = False      # soundfile instalado y utilizable (se descarta si no carga)
+        self._fallos_soundfile = 0   # decodificaciones fallidas seguidas (MAX_FALLOS_SOUNDFILE)
+        # MP3 de edge-tts del segmento siguiente, descargado mientras suena el actual (texto, tono, lang).
+        self._mp3_anticipados: dict[tuple[str, str, str], asyncio.Task[bytes]] = {}
         self._notify_send: str | None = None
         self._reproductor_activo: _Reproductor | None = None
         self._proc_mp3_activo: asyncio.subprocess.Process | None = None
@@ -689,7 +780,8 @@ class RikoMeguminIO:
         """Hay motor de voz y reproductor, no está silenciado y ``settings.voz_habilitada``.
 
         Motor: ElevenLabs activo en la sesión o edge-tts importable con ``tiene_edge_tts``.
-        Reproductor: PCM (pw-play/paplay/aplay/sounddevice) o, para MP3, mpv/ffplay.
+        Reproductor: PCM (pw-play/paplay/aplay/sounddevice) o, para MP3, mpv/ffplay. edge-tts
+        (MP3) necesita además un decodificador para ir por el reproductor PCM: ffmpeg o soundfile.
         Antes de ``iniciar()`` siempre es ``False``.
         """
         if self._voz_forzada is not None:
@@ -702,7 +794,7 @@ class RikoMeguminIO:
         hay_mp3 = self._reproductor_mp3 is not None
         if self._eleven_activo() and (hay_pcm or hay_mp3):
             return True
-        return self._edge_disponible() and ((hay_pcm and self._ffmpeg is not None) or hay_mp3)
+        return self._edge_disponible() and self._edge_reproducible()
 
     @voz_disponible.setter
     def voz_disponible(self, valor: bool | None) -> None:
@@ -746,6 +838,7 @@ class RikoMeguminIO:
             return
         self._cerrado = True
         self._cortar_voz = True
+        self._cancelar_anticipados()
         reproductor = self._reproductor_activo
         if reproductor is not None:
             try:
@@ -1096,9 +1189,17 @@ class RikoMeguminIO:
     async def _entregar_voz(self, u: Utterance, segs: list[Segmento]) -> str:
         """Imprime el texto completo y habla la parte que cabe en voz (2 oraciones, 45 palabras).
 
-        Los subtítulos del HUD llevan **todos** los segmentos completos: cada uno se publica al
-        empezar a hablarlo y, al terminar, los que no se hablaron (recorte de voz, corte por
-        silencio o voz que no sonó) se publican igualmente; nunca se pierden en el HUD.
+        Los subtítulos del HUD llevan **todos** los segmentos completos. Cada segmento hablado se
+        publica cuando su audio empieza de verdad (al abrir el reproductor), no antes de
+        sintetizarlo: el puente de VTuber AI Studio mueve los labios del visor en cuanto recibe un
+        subtítulo con ``canal == "voz"``, y publicarlo antes adelantaría la boca a la voz (con
+        edge-tts sin ffmpeg, todo lo que tarda en llegar el MP3 completo). Al terminar se publican
+        los que no se hablaron (recorte de voz, corte por silencio o voz que no sonó); nunca se
+        pierden en el HUD. Si no sonó nada y nadie cortó la voz, esos subtítulos salen con
+        ``canal == "terminal"``, el canal real de la entrega (el mismo que se guarda en el turno).
+
+        Con edge-tts por MP3 completo (soundfile o mpv/ffplay), el MP3 del segmento siguiente se
+        descarga mientras suena el actual, para no dejar entre ellos la espera de la síntesis.
         """
         self._imprimir_utterance(u, segs, "voz", subtitulos=False)
         recortados, recortado = recortar_segmentos(segs, "voz")
@@ -1116,42 +1217,69 @@ class RikoMeguminIO:
         inicio = time.monotonic()
         motor = "texto"
         publicados = 0      # segmentos originales ya publicados como subtítulo (en orden)
+
+        def al_empezar(indice: int) -> None:
+            """El audio del segmento hablado ``indice`` acaba de empezar (idempotente).
+
+            El recorte conserva un prefijo: el segmento hablado i procede del original i, así que
+            se publican en orden los originales hasta ``indice`` (incluidos los anteriores que no
+            sonaron). Después se anticipa el MP3 del siguiente segmento.
+            """
+            nonlocal publicados
+            while publicados <= indice and publicados < len(segs):
+                self._publicar_subtitulo(segs[publicados], "voz", u.origen)
+                publicados += 1
+            if indice + 1 < len(recortados):
+                self._anticipar_mp3_edge(u, recortados[indice + 1])
+
+        cancelado = False
         try:
             for indice, seg in enumerate(recortados):
                 if self._debe_cortar():
                     break
                 if indice > 0:
                     await asyncio.sleep(PAUSA_ENTRE_SEGMENTOS_S)
-                # El recorte conserva un prefijo: el segmento hablado i procede del original i.
-                while publicados <= indice and publicados < len(segs):
-                    self._publicar_subtitulo(segs[publicados], "voz", u.origen)
-                    publicados += 1
                 await self._aplicar_etiquetas_avatar(seg.etiquetas)
-                motor_segmento = await self._hablar_segmento(u, seg)
+                motor_segmento = await self._hablar_segmento(
+                    u, seg, al_empezar=functools.partial(al_empezar, indice))
                 if motor_segmento != "texto":
                     motor = motor_segmento
+        except asyncio.CancelledError:
+            cancelado = True
+            raise
         finally:
             self._hablando = False
+            self._cancelar_anticipados()
             self._publicar("voz.fin", {"utterance_id": u.id,
                                        "duracion_s": round(time.monotonic() - inicio, 3),
                                        "motor": motor})
-            for seg in segs[publicados:]:     # lo que no se habló también llega al HUD
-                self._publicar_subtitulo(seg, "voz", u.origen)
+            # Lo que no se habló también llega al HUD. Si no sonó nada (y no fue un corte ni una
+            # cancelación), la entrega real fue por la terminal: así el visor 3D puede leerlo con
+            # su propia voz.
+            cortado = cancelado or self._debe_cortar()
+            canal_resto = "voz" if motor != "texto" or cortado else "terminal"
+            for seg in segs[publicados:]:
+                self._publicar_subtitulo(seg, canal_resto, u.origen)
         return "voz" if motor != "texto" else "terminal"
 
-    async def _hablar_segmento(self, u: Utterance, seg: Segmento) -> str:
-        """Sintetiza y reproduce un segmento. Devuelve el motor usado (``"texto"`` si no sonó)."""
+    async def _hablar_segmento(self, u: Utterance, seg: Segmento, *,
+                               al_empezar: Callable[[], None] | None = None) -> str:
+        """Sintetiza y reproduce un segmento. Devuelve el motor usado (``"texto"`` si no sonó).
+
+        ``al_empezar`` se llama cuando el audio empieza de verdad (al abrir el reproductor PCM o
+        al lanzar mpv/ffplay); puede llamarse más de una vez si ElevenLabs reintenta.
+        """
         texto_voz = limpiar_para_voz(seg.texto)
         if not texto_voz:
             return "texto"
         try:
             if self._eleven_activo() and self._omitir_eleven_utterance != u.id:
-                if await self._hablar_eleven(u, seg, texto_voz):
+                if await self._hablar_eleven(u, seg, texto_voz, al_empezar=al_empezar):
                     return "elevenlabs"
             if self._debe_cortar():
                 return "texto"
             if self._edge_disponible():
-                duracion = await self._hablar_edge(texto_voz, seg)
+                duracion = await self._hablar_edge(texto_voz, seg, al_empezar=al_empezar)
                 if duracion:
                     return "edge"
         except _ErrorReproductor as exc:
@@ -1163,37 +1291,62 @@ class RikoMeguminIO:
             log.debug("Detalle del fallo de voz.", exc_info=True)
         return "texto"
 
-    async def _hablar_eleven(self, u: Utterance, seg: Segmento, texto_voz: str) -> bool:
+    async def _hablar_eleven(self, u: Utterance, seg: Segmento, texto_voz: str, *,
+                             al_empezar: Callable[[], None] | None = None) -> bool:
         """ElevenLabs: streaming PCM con lip-sync o, sin reproductor PCM, MP3 por mpv/ffplay."""
         tone, lang = seg.etiquetas.tone, seg.lang
         sr = int(self._settings.elevenlabs_sample_rate)
         if self._nombre_reproductor_pcm() is not None:
             async def accion(extras: bool) -> float:
                 texto = self._texto_eleven([(tone, texto_voz)], extras)
-                return await self._reproducir_pcm(self._eleven_chunks(texto, tone, lang, extras), sr)
+                return await self._reproducir_pcm(self._eleven_chunks(texto, tone, lang, extras), sr,
+                                                  al_empezar=al_empezar)
         elif self._reproductor_mp3 is not None:
             async def accion(extras: bool) -> float:
                 texto = self._texto_eleven([(tone, texto_voz)], extras)
                 mp3 = await self._eleven_mp3(texto, tone, lang, extras)
-                return await self._reproducir_mp3(mp3, len(texto_voz.split()))
+                return await self._reproducir_mp3(mp3, len(texto_voz.split()), al_empezar=al_empezar)
         else:
             return False
         resultado = await self._intentar_eleven(accion, utterance_id=u.id)
         return bool(resultado)
 
-    async def _hablar_edge(self, texto_voz: str, seg: Segmento) -> float | None:
-        """edge-tts: MP3 → ffmpeg → PCM con lip-sync, o MP3 directo por mpv/ffplay (boca simulada)."""
+    async def _hablar_edge(self, texto_voz: str, seg: Segmento, *,
+                           al_empezar: Callable[[], None] | None = None) -> float | None:
+        """edge-tts por el mejor camino disponible. Devuelve los segundos sonados o ``None``.
+
+        Orden: ``ffmpeg`` en streaming → PCM (lip-sync RMS) > ``soundfile``: MP3 completo →
+        PCM decodificado en el executor de audio → ``_reproducir_pcm`` por bloques de 100 ms
+        (mismo lip-sync RMS, ``voz.nivel_boca`` y boca del avatar) > MP3 directo por mpv/ffplay
+        (boca simulada). Si soundfile no puede decodificar ese MP3, se reproduce con mpv/ffplay
+        cuando existen, sin volver a sintetizar. El MP3 completo puede venir ya descargado
+        (``_anticipar_mp3_edge``) y su descarga atiende los cortes. ``al_empezar`` se llama
+        cuando el audio empieza de verdad, nunca antes de tener el MP3 y decodificarlo.
+        """
         tone, lang = seg.etiquetas.tone, seg.lang
+        hay_pcm = self._nombre_reproductor_pcm() is not None
+        decodificador = self._decodificador_edge() if hay_pcm else None
         try:
-            if self._ffmpeg is not None and self._nombre_reproductor_pcm() is not None:
+            if decodificador == "ffmpeg":
                 duracion = await self._reproducir_pcm(
-                    self._decodificar_mp3(self._edge_stream(texto_voz, tone, lang)), SR_EDGE)
+                    self._decodificar_mp3(self._edge_stream(texto_voz, tone, lang)), SR_EDGE,
+                    al_empezar=al_empezar)
                 return duracion or None
-            if self._reproductor_mp3 is not None:
-                mp3 = await asyncio.wait_for(self._edge_mp3(texto_voz, tone, lang), 45.0)
-                if not mp3:
+            if decodificador is None and self._reproductor_mp3 is None:
+                return None
+            mp3 = await self._esperar_mp3_edge(texto_voz, tone, lang)
+            if not mp3 or self._debe_cortar():
+                return None
+            if decodificador == "soundfile":
+                decodificado = await self._decodificar_soundfile(mp3)
+                if decodificado is not None:
+                    pcm, sr = decodificado
+                    return await self._reproducir_pcm(_bloques_pcm(pcm, sr), sr,
+                                                      al_empezar=al_empezar) or None
+                if self._reproductor_mp3 is None or self._debe_cortar():
                     return None
-                return await self._reproducir_mp3(mp3, len(texto_voz.split())) or None
+            return await self._reproducir_mp3(mp3, len(texto_voz.split()),
+                                              al_empezar=al_empezar) or None
         except (_ErrorReproductor, asyncio.CancelledError):
             raise
         except Exception as exc:  # NoAudioReceived, WebSocketError, aiohttp, ffmpeg…
@@ -1259,12 +1412,24 @@ class RikoMeguminIO:
 
     # --- Reproducción PCM con lip-sync -------------------------------
 
-    async def _reproducir_pcm(self, fuente: AsyncIterator[bytes], sr: int) -> float:
+    @staticmethod
+    def _avisar_inicio(al_empezar: Callable[[], None] | None) -> None:
+        """El audio acaba de empezar: llama a ``al_empezar``. Un fallo suyo nunca corta la voz."""
+        if al_empezar is None:
+            return
+        try:
+            al_empezar()
+        except Exception:
+            log.debug("Fallo del aviso de inicio del audio.", exc_info=True)
+
+    async def _reproducir_pcm(self, fuente: AsyncIterator[bytes], sr: int, *,
+                              al_empezar: Callable[[], None] | None = None) -> float:
         """Reproduce PCM s16le mono al ritmo del reloj (tramas de 20 ms, ventaja de 120 ms).
 
         Abre el reproductor con el primer fragmento (si la fuente falla antes de sonar, la
-        excepción sube y el llamador cae al siguiente motor). Mueve la boca a 30 Hz con
-        *attack* 0,6 / *release* 0,25 y publica ``voz.nivel_boca`` a ≤ 15 Hz.
+        excepción sube y el llamador cae al siguiente motor) y en ese momento llama a
+        ``al_empezar`` (los subtítulos de voz salen cuando el audio empieza de verdad). Mueve la
+        boca a 30 Hz con *attack* 0,6 / *release* 0,25 y publica ``voz.nivel_boca`` a ≤ 15 Hz.
         Devuelve los segundos de audio escritos.
         """
         bytes_trama = max(2, (sr * TRAMA_MS // 1000) * 2)
@@ -1288,6 +1453,7 @@ class RikoMeguminIO:
                             progreso.t0 = time.monotonic()
                             progreso.latencia = reproductor.latencia_s
                             tarea_boca = asyncio.create_task(self._bucle_boca(niveles, progreso))
+                            self._avisar_inicio(al_empezar)
                         pendiente += parte
                         while len(pendiente) >= bytes_trama:
                             trama = bytes(pendiente[:bytes_trama])
@@ -1396,7 +1562,7 @@ class RikoMeguminIO:
             self._publicar("voz.nivel_boca", {"valor": 0.0})
 
     async def _boca_simulada(self, duracion: float, progreso: _ProgresoAudio) -> None:
-        """Boca simulada (MP3 sin ffmpeg): senoide de 4 Hz entre 0,2 y 0,7 durante ``duracion`` s."""
+        """Boca simulada (MP3 por mpv/ffplay): senoide de 4 Hz entre 0,2 y 0,7 durante ``duracion`` s."""
         inicio = time.monotonic()
         ultimo_pub = 0.0
         try:
@@ -1415,8 +1581,12 @@ class RikoMeguminIO:
             await self._cerrar_boca_avatar()
             self._publicar("voz.nivel_boca", {"valor": 0.0})
 
-    async def _reproducir_mp3(self, mp3: bytes, palabras: int) -> float:
-        """Reproduce un MP3 con mpv/ffplay por stdin y simula la boca ``palabras/2,6`` s."""
+    async def _reproducir_mp3(self, mp3: bytes, palabras: int, *,
+                              al_empezar: Callable[[], None] | None = None) -> float:
+        """Reproduce un MP3 con mpv/ffplay por stdin y simula la boca ``palabras/2,6`` s.
+
+        ``al_empezar`` se llama en cuanto el reproductor arranca, con el MP3 ya completo.
+        """
         argv = self._reproductor_mp3
         if not argv:
             raise _ErrorReproductor("no hay reproductor MP3")
@@ -1432,6 +1602,7 @@ class RikoMeguminIO:
         progreso = _ProgresoAudio()
         boca = asyncio.create_task(self._boca_simulada(duracion, progreso))
         inicio = time.monotonic()
+        self._avisar_inicio(al_empezar)
         try:
             if proc.stdin is not None:
                 try:
@@ -1619,6 +1790,170 @@ class RikoMeguminIO:
     def _edge_disponible(self) -> bool:
         return edge_tts is not None and self._settings.tiene_edge_tts and not self._cerrado
 
+    def _decodificador_edge(self) -> str | None:
+        """Decodificador MP3 → PCM para edge-tts: ``"ffmpeg"`` (streaming) > ``"soundfile"``, o ``None``."""
+        if self._ffmpeg is not None:
+            return "ffmpeg"
+        if self._soundfile:
+            return "soundfile"
+        return None
+
+    def _edge_reproducible(self) -> bool:
+        """edge-tts puede sonar: decodificador + reproductor PCM, o el MP3 directo por mpv/ffplay."""
+        hay_pcm = self._nombre_reproductor_pcm() is not None
+        return (hay_pcm and self._decodificador_edge() is not None) or self._reproductor_mp3 is not None
+
+    def _detalle_edge(self) -> str:
+        """Detalle del diagnóstico con edge-tts: voz y camino del audio.
+
+        P. ej. ``"edge-tts es-CO-SalomeNeural · soundfile + sounddevice"``,
+        ``"edge-tts es-CO-SalomeNeural · ffmpeg + pw-play"`` o ``"edge-tts es-CO-SalomeNeural · mpv"``.
+        """
+        pcm = self._nombre_reproductor_pcm()
+        decodificador = self._decodificador_edge() if pcm is not None else None
+        if decodificador is not None:
+            camino = f"{decodificador} + {pcm}"
+        elif self._reproductor_mp3:
+            camino = _nombre_programa(self._reproductor_mp3[0])
+        else:
+            camino = "sin reproductor"
+        return f"edge-tts {self._settings.edge_tts_voz} · {camino}"
+
+    def _edge_por_mp3_completo(self) -> bool:
+        """edge-tts sonará desde el MP3 entero (soundfile o mpv/ffplay), no en streaming por ffmpeg."""
+        if not self._edge_disponible() or self._debe_cortar():
+            return False
+        decodificador = self._decodificador_edge() if self._nombre_reproductor_pcm() is not None else None
+        if decodificador == "ffmpeg":
+            return False
+        return decodificador == "soundfile" or self._reproductor_mp3 is not None
+
+    def _tarea_mp3_edge(self, texto: str, tone: str, lang: str) -> asyncio.Task[bytes]:
+        """Descarga del MP3 completo de edge-tts en su propia tarea (acotada a ``TIMEOUT_EDGE_MP3_S``)."""
+        tarea = asyncio.create_task(
+            asyncio.wait_for(self._edge_mp3(texto, tone, lang), TIMEOUT_EDGE_MP3_S))
+        tarea.add_done_callback(_recoger_resultado)
+        return tarea
+
+    def _anticipar_mp3_edge(self, u: Utterance, seg: Segmento) -> None:
+        """Empieza a descargar el MP3 de ``seg`` mientras suena el segmento actual.
+
+        Solo si edge-tts usará el MP3 completo (soundfile o mpv/ffplay) y el segmento no irá por
+        ElevenLabs. Lo recoge ``_esperar_mp3_edge`` y lo que sobra se cancela al acabar la utterance.
+        """
+        if not self._edge_por_mp3_completo():
+            return
+        if self._eleven_activo() and self._omitir_eleven_utterance != u.id:
+            return
+        texto_voz = limpiar_para_voz(seg.texto)
+        if not texto_voz:
+            return
+        clave = (texto_voz, seg.etiquetas.tone, seg.lang)
+        if clave not in self._mp3_anticipados:
+            self._mp3_anticipados[clave] = self._tarea_mp3_edge(*clave)
+
+    def _cancelar_anticipados(self) -> None:
+        """Cancela las descargas anticipadas que nadie recogió (fin de la utterance o cierre)."""
+        anticipados, self._mp3_anticipados = self._mp3_anticipados, {}
+        for tarea in anticipados.values():
+            tarea.cancel()
+
+    async def _esperar_mp3_edge(self, texto: str, tone: str, lang: str) -> bytes | None:
+        """MP3 completo de edge-tts (el anticipado, si lo hay). ``None`` si la voz se corta antes.
+
+        La descarga corre en su propia tarea y aquí se atiende un corte (silencio, cierre) cada
+        ``INTERVALO_CORTE_S``, sin esperar a que termine la síntesis. Los errores de edge-tts y el
+        ``TimeoutError`` de ``TIMEOUT_EDGE_MP3_S`` se propagan al llamador.
+        """
+        tarea = self._mp3_anticipados.pop((texto, tone, lang), None)
+        if tarea is None:
+            tarea = self._tarea_mp3_edge(texto, tone, lang)
+        try:
+            while not tarea.done():
+                if self._debe_cortar():
+                    tarea.cancel()
+                    return None
+                await asyncio.wait({tarea}, timeout=INTERVALO_CORTE_S)
+        except asyncio.CancelledError:
+            tarea.cancel()
+            raise
+        if tarea.cancelled():
+            return None
+        return tarea.result()
+
+    def _descartar_soundfile(self, motivo: str, *, publicar: bool = True) -> None:
+        """soundfile no sirve en esta sesión: edge-tts pasa a ffmpeg o mpv/ffplay, o a solo texto.
+
+        Con ``publicar`` se publica el diagnóstico nuevo (``voz_disponible`` cambia con él).
+        """
+        if not self._soundfile:
+            return
+        self._soundfile = False
+        self._fallos_soundfile = 0
+        log.warning("soundfile no sirve para la voz (%s); edge-tts %s.", motivo,
+                    "usará mpv/ffplay" if self._reproductor_mp3 is not None
+                    else "necesita ffmpeg, mpv o ffplay para sonar")
+        if publicar:
+            self._publicar_diagnostico_voz()
+
+    async def _validar_soundfile(self) -> None:
+        """En ``iniciar``: comprueba una vez, en el executor de audio, que soundfile carga y lee MP3.
+
+        Solo cuando soundfile sería el camino de edge-tts (edge-tts disponible, reproductor PCM y
+        sin ffmpeg). Si no sirve se descarta antes de la primera frase, así ``voz_disponible`` y el
+        diagnóstico de arranque dicen la verdad y ninguna frase se sintetiza para nada. Si tarda
+        más de ``TIMEOUT_VALIDAR_SOUNDFILE_S`` queda para la primera decodificación, que repite la
+        misma comprobación (``_soundfile_con_mp3``).
+        """
+        if not (self._soundfile and self._ffmpeg is None and self._edge_disponible()
+                and self._nombre_reproductor_pcm() is not None):
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(self._obtener_ejecutor_audio(), _soundfile_con_mp3),
+                TIMEOUT_VALIDAR_SOUNDFILE_S)
+        except asyncio.TimeoutError:     # antes que OSError: en 3.11+ TimeoutError hereda de OSError
+            log.info("soundfile tardó más de %g s en cargar; se comprobará en la primera frase.",
+                     TIMEOUT_VALIDAR_SOUNDFILE_S)
+        except Exception as exc:  # ImportError, OSError, cffi…: no sirve
+            self._descartar_soundfile(_motivo_excepcion(exc), publicar=False)
+
+    async def _decodificar_soundfile(self, mp3: bytes) -> tuple[bytes, int] | None:
+        """MP3 completo → ``(PCM s16le mono, sr)`` con soundfile en el executor de audio (no en el loop).
+
+        Si soundfile o libsndfile no cargan o no decodifican MP3 (``ImportError``/``OSError``), se
+        descarta durante la sesión y se publica el diagnóstico nuevo. Un MP3 ilegible o una
+        decodificación que no termina en ``TIMEOUT_DECODIFICAR_S`` solo pierden ese segmento, pero
+        ``MAX_FALLOS_SOUNDFILE`` fallos seguidos lo descartan igual (un decodificador que nunca
+        decodifica no es una voz). En esos casos devuelve ``None`` y el llamador cae a mpv/ffplay
+        si existen.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            resultado = await asyncio.wait_for(
+                loop.run_in_executor(self._obtener_ejecutor_audio(), _mp3_a_pcm_soundfile, mp3),
+                TIMEOUT_DECODIFICAR_S)
+        except asyncio.TimeoutError:     # antes que OSError: en 3.11+ TimeoutError hereda de OSError
+            log.info("soundfile tardó más de %g s en decodificar el MP3 de edge-tts.",
+                     TIMEOUT_DECODIFICAR_S)
+            self._registrar_fallo_soundfile()
+        except (ImportError, OSError) as exc:
+            self._descartar_soundfile(_motivo_excepcion(exc))
+        except Exception as exc:  # LibsndfileError (RuntimeError): MP3 truncado o ilegible
+            log.info("soundfile no pudo decodificar el MP3 de edge-tts (%s).", type(exc).__name__)
+            self._registrar_fallo_soundfile()
+        else:
+            self._fallos_soundfile = 0
+            return resultado
+        return None
+
+    def _registrar_fallo_soundfile(self) -> None:
+        """Cuenta una decodificación fallida; ``MAX_FALLOS_SOUNDFILE`` seguidas descartan soundfile."""
+        self._fallos_soundfile += 1
+        if self._fallos_soundfile >= MAX_FALLOS_SOUNDFILE:
+            self._descartar_soundfile(f"{self._fallos_soundfile} decodificaciones fallidas seguidas")
+
     def _voz_edge(self, lang: str) -> str:
         return VOCES_EDGE_POR_LANG.get(lang, self._settings.edge_tts_voz)
 
@@ -1691,7 +2026,11 @@ class RikoMeguminIO:
     # --- Diagnóstico de voz --------------------------------------------
 
     async def _diagnostico_voz(self) -> DiagnosticoModulo:
-        """``OK (ElevenLabs)`` tras ``GET /v1/voices/{id}`` → 200; si no, edge-tts, sin reproductor u OFF."""
+        """``OK (ElevenLabs)`` tras ``GET /v1/voices/{id}`` → 200; si no, edge-tts, sin reproductor u OFF.
+
+        La comprobación de soundfile (``_validar_soundfile``) corre en paralelo con el sondeo de
+        ElevenLabs; cada una tiene su tope y ambas caben en el de ``_diagnostico_acotado``.
+        """
         nombre = "Salida de voz"
         s = self._settings
         if s.offline:
@@ -1702,6 +2041,22 @@ class RikoMeguminIO:
         hay_mp3 = self._reproductor_mp3 is not None
         if not hay_pcm and not hay_mp3:
             return DiagnosticoModulo("voz", nombre, EstadoModulo.DEGRADADO, "sin reproductor de audio")
+        validacion = asyncio.create_task(self._validar_soundfile())
+        try:
+            sondeo = await self._sondear_elevenlabs(nombre)
+            await validacion
+        finally:
+            if not validacion.done():
+                validacion.cancel()
+        return sondeo or self._diagnostico_voz_local(sin_verificar=True)
+
+    async def _sondear_elevenlabs(self, nombre: str) -> DiagnosticoModulo | None:
+        """``GET /v1/voices/{id}`` (sin coste): ``OK (ElevenLabs)`` si responde 200; si no, ``None``.
+
+        Aplica los errores definitivos (401/402/403/404) sin publicar: el diagnóstico de arranque
+        lo publica ``iniciar``.
+        """
+        s = self._settings
         if self._eleven_activo():
             cliente = self._obtener_cliente()
             inicio = time.monotonic()
@@ -1725,7 +2080,7 @@ class RikoMeguminIO:
                     self._aplicar_error_eleven(respuesta.status_code, codigo, publicar=False)
             except _ERRORES_RED as exc:
                 log.info("ElevenLabs no respondió al diagnóstico (%s).", type(exc).__name__)
-        return self._diagnostico_voz_local(sin_verificar=True)
+        return None
 
     def _diagnostico_voz_local(self, *, sin_verificar: bool = False) -> DiagnosticoModulo:
         """Diagnóstico de voz sin red (para los cambios de estado en tiempo de ejecución)."""
@@ -1741,13 +2096,13 @@ class RikoMeguminIO:
             return DiagnosticoModulo("voz", nombre, EstadoModulo.DEGRADADO, "sin reproductor de audio")
         if self._eleven_activo() and not sin_verificar:
             return DiagnosticoModulo("voz", nombre, EstadoModulo.OK, "ElevenLabs")
-        if self._edge_disponible() and ((hay_pcm and self._ffmpeg is not None) or hay_mp3):
-            return DiagnosticoModulo("voz", nombre, EstadoModulo.DEGRADADO, "edge-tts")
+        if self._edge_disponible() and self._edge_reproducible():
+            return DiagnosticoModulo("voz", nombre, EstadoModulo.DEGRADADO, self._detalle_edge())
         if self._eleven_activo():
             return DiagnosticoModulo("voz", nombre, EstadoModulo.DEGRADADO, "ElevenLabs sin verificar")
         if edge_tts is not None and s.tiene_edge_tts:
             return DiagnosticoModulo("voz", nombre, EstadoModulo.DEGRADADO,
-                                     "edge-tts necesita ffmpeg, mpv o ffplay")
+                                     "edge-tts necesita soundfile, ffmpeg, mpv o ffplay")
         if s.tiene_elevenlabs:
             return DiagnosticoModulo("voz", nombre, EstadoModulo.OFF,
                                      "ElevenLabs desactivado y sin edge-tts")
@@ -1764,13 +2119,21 @@ class RikoMeguminIO:
             self._publicar("sistema.modulo", diagnostico.a_dict())
 
     def _detectar_capacidades(self) -> None:
-        """Reproductores PCM/MP3, ffmpeg y notify-send (``shutil.which``; sin abrir dispositivos)."""
+        """Reproductores PCM/MP3, ffmpeg, soundfile y notify-send, sin abrir dispositivos.
+
+        Binarios con ``shutil.which``; soundfile con ``SOUNDFILE_INSTALADO`` (``find_spec``, sin
+        importarlo: se importa y se comprueba que lee MP3 en el executor de audio, durante el
+        diagnóstico de ``iniciar`` y en cada decodificación).
+        """
+        self._fallos_soundfile = 0
         self._reproductor_pcm = _detectar_reproductor_pcm(frozenset(self._reproductores_rotos))
         self._reproductor_mp3 = _argv_reproductor_mp3()
         self._ffmpeg = shutil.which("ffmpeg")
+        self._soundfile = bool(SOUNDFILE_INSTALADO)
         self._notify_send = shutil.which("notify-send")
-        log.debug("Audio: PCM=%s, MP3=%s, ffmpeg=%s.", self._reproductor_pcm,
-                  "sí" if self._reproductor_mp3 else "no", "sí" if self._ffmpeg else "no")
+        log.debug("Audio: PCM=%s, MP3=%s, ffmpeg=%s, soundfile=%s.", self._reproductor_pcm,
+                  "sí" if self._reproductor_mp3 else "no", "sí" if self._ffmpeg else "no",
+                  "sí" if self._soundfile else "no")
 
     async def _diagnostico_acotado(self, corrutina: Awaitable[DiagnosticoModulo], clave: str,
                                    nombre: str) -> DiagnosticoModulo:
@@ -2071,7 +2434,7 @@ class RikoMeguminIO:
         if self._edge_disponible():
             try:
                 audio = await asyncio.wait_for(
-                    self._edge_mp3(" ".join(t for _, t in partes), tone, lang), 45.0)
+                    self._edge_mp3(" ".join(t for _, t in partes), tone, lang), TIMEOUT_EDGE_MP3_S)
                 if audio:
                     return audio
             except asyncio.CancelledError:

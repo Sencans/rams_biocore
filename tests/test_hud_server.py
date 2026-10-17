@@ -12,7 +12,10 @@ import asyncio
 import inspect
 import json
 import logging
+import os
+import shutil
 import socket
+import subprocess
 import time
 from pathlib import Path
 from typing import Any
@@ -518,6 +521,84 @@ def test_traducir_evento_tabla() -> None:
     assert traducir_evento("hud.control", {"accion": "colgar"}) is None
 
 
+def test_traducir_evento_v02() -> None:
+    """§C2.4.6: vision.estado, pantalla.estado (sin título si privada), pc.accion y vision.camara{fuente}."""
+    assert traducir_evento("vision.camara", {"activa": True, "habilitada": True, "duracion_ms": 0}) == (
+        "camara", {"activa": True, "habilitada": True, "duracion_ms": 0, "fuente": "vistazo"})
+    assert traducir_evento("vision.camara", {"activa": True, "habilitada": True, "duracion_ms": 0,
+                                             "fuente": "continua"})[1]["fuente"] == "continua"
+    assert traducir_evento("vision.camara", {"activa": False, "fuente": "rara"})[1]["fuente"] == "vistazo"
+
+    tipo, vision = traducir_evento("vision.estado", {
+        "camara": "continua", "pantalla": "metadatos", "fps_camara": 3.0, "fps_pantalla": 1.0, "nivel": 0,
+        "detector": "yunet", "presente": True, "atencion": 1.7})
+    assert tipo == "vision"
+    assert vision == {"camara": "continua", "pantalla": "metadatos", "fps_camara": 3.0, "fps_pantalla": 1.0,
+                      "nivel": 0, "detector": "yunet", "presente": True, "atencion": 1.0}
+    assert traducir_evento("vision.estado", {"camara": "off", "presente": None})[1]["presente"] is None
+
+    base = {"cambio": 0.1, "brillo": 0.4, "tono": 210, "video": True, "pantalla_completa": False,
+            "reproduciendo": None, "no_molestar": False, "clase": "chrome", "titulo": "YouTube - Steins;Gate OP"}
+    tipo, pantalla = traducir_evento("pantalla.estado", {**base, "privada": False})
+    assert tipo == "pantalla" and pantalla["titulo"] == "YouTube - Steins;Gate OP"
+    assert pantalla["reproduciendo"] is None and pantalla["video"] is True and pantalla["clase"] == "chrome"
+    _tipo, privada = traducir_evento("pantalla.estado", {**base, "privada": True, "titulo": "Bitwarden"})
+    assert privada["privada"] is True and "titulo" not in privada
+    assert "Bitwarden" not in json.dumps(privada)
+
+    assert traducir_evento("pc.accion", {"tipo": "prerrellenar", "resultado": "ok", "destino": "whatsapp",
+                                         "texto": "nunca"}) == (
+        "accion", {"tipo": "prerrellenar", "resultado": "ok", "destino": "whatsapp"})
+    assert traducir_evento("pc.accion", {"tipo": "escribir_texto", "resultado": "abortada"})[1]["destino"] is None
+
+    # La vista previa de un permiso nunca sale por /ws, y el chat/sistema del escritorio tampoco.
+    _tipo, permiso = traducir_evento("permiso.solicitado", {"id": "a1b2c3d4", "descripcion": "d",
+                                                            "destructiva": False, "vista_previa": "hola mamá"})
+    assert "vista_previa" not in permiso
+    assert traducir_evento("escritorio.chat", {"texto": "x"}) is None
+    assert traducir_evento("escritorio.sistema", {"texto": "x"}) is None
+    assert traducir_evento("escritorio.orden", {"accion": "aparecer"}) is None
+    for nombre in ("vision.estado", "pantalla.estado", "pc.accion"):
+        assert nombre in hud_server.EVENTOS_SUSCRITOS
+    for nombre in ("escritorio.chat", "escritorio.sistema"):
+        assert nombre not in hud_server.EVENTOS_SUSCRITOS
+
+
+def test_ws_reenvia_vision_pantalla_accion_y_led_por_fuente(settings_prueba: Settings, bus: BusEventos,
+                                                            correr: Any) -> None:
+    async def caso() -> None:
+        hud = _hud(settings_prueba, bus)
+        # Antes de iniciar: cámara continua abierta y un vistazo ya cerrado.
+        bus.publicar("vision.camara", {"activa": True, "habilitada": True, "duracion_ms": 0, "fuente": "continua"})
+        bus.publicar("vision.camara", {"activa": False, "habilitada": True, "duracion_ms": 120})
+        bus.publicar("vision.estado", {"camara": "continua", "pantalla": "off", "fps_camara": 3.0,
+                                       "fps_pantalla": 0.0, "nivel": 0, "detector": "haar", "presente": True,
+                                       "atencion": 0.5})
+        await hud.iniciar()
+        try:
+            async with _conectar(hud) as ws:
+                vistos = await _recoger(ws, 0.4)
+                camaras = [m["datos"] for m in vistos if m["tipo"] == "camara"]
+                # Una por fuente: el HUD calcula el LED como OR (la continua sigue encendida).
+                assert {(c["fuente"], c["activa"]) for c in camaras} == {("vistazo", False), ("continua", True)}
+                vision = next(m["datos"] for m in vistos if m["tipo"] == "vision")
+                assert vision["camara"] == "continua" and vision["detector"] == "haar"
+
+                bus.publicar("pantalla.estado", {"cambio": 0.0, "brillo": 0.3, "tono": None, "video": False,
+                                                 "pantalla_completa": None, "reproduciendo": None,
+                                                 "no_molestar": False, "privada": True, "clase": "keepassxc",
+                                                 "titulo": ""})
+                pantalla, _ = await _recibir_hasta(ws, "pantalla")
+                assert pantalla["privada"] is True and "titulo" not in pantalla
+                bus.publicar("pc.accion", {"tipo": "abrir_destino", "resultado": "ok", "destino": "youtube"})
+                accion, _ = await _recibir_hasta(ws, "accion")
+                assert accion == {"tipo": "abrir_destino", "resultado": "ok", "destino": "youtube"}
+        finally:
+            await hud.cerrar()
+
+    correr(caso())
+
+
 # ---------------------------------------------------------------------------
 # Navegador (sin abrir nada real)
 # ---------------------------------------------------------------------------
@@ -757,3 +838,300 @@ def test_html_seguro_y_fiel() -> None:
         assert f'["{tipo}", ' in html, tipo
     assert "encodeURIComponent(t)" in html and "/ws?t=" in html
     assert html.count("aria-label=") >= 3
+
+
+def test_html_chat_rine_e_indicadores_v02() -> None:
+    """§C2.4 / §C2.13: panel RINE seguro, LED = OR por fuente e indicador 👁."""
+    html = RUTA_HTML.read_text(encoding="utf-8")
+    assert "innerHTML" not in html and "outerHTML" not in html and "insertAdjacentHTML" not in html
+    assert "document.write" not in html and "eval(" not in html and "new Function" not in html
+    # Mensajes nuevos de /ws.
+    for tipo in ("vision", "pantalla", "accion", "escritorio"):
+        assert f'["{tipo}", ' in html, tipo
+    # Panel RINE: segundo cliente de /escritorio con el token que llega por /ws.
+    for texto in ('id="rine"', 'id="rine-lista"', 'id="rine-form"', 'maxlength="2000"', "RINE",
+                  "/escritorio?t=${encodeURIComponent(chat.token)}", 'tipo: "confirmacion"', 'tipo: "chat"',
+                  "/^[0-9a-f]{8}$/", '"noopener noreferrer"', 'protocol !== "https:"', "vista-previa",
+                  "no_molestar_on", "basta_travesuras", "pausar_vision", 'role="log"'):
+        assert texto in html, texto
+    for tipo in ("hola", "subtitulo", "voz", "permiso", "sistema", "travesuras"):
+        assert f'["{tipo}", ' in html, tipo
+    # El token nunca se pinta: solo se usa para abrir el WebSocket.
+    assert "chat.token;" not in html and "textContent = chat.token" not in html
+    # LED = OR de fuentes e indicador de visión.
+    assert "camaraFuentes.vistazo || camaraFuentes.continua" in html
+    assert 'id="ojo"' in html and "👁" in html
+
+
+
+# ---------------------------------------------------------------------------
+# Panel RINE de verdad: el HUD cargado en jsdom (Node) contra un ServidorHUD propio en
+# 127.0.0.1:0. Opcional: se salta si no hay ``node`` o ``jsdom`` (``npm i jsdom`` en una carpeta y
+# ``RAMS_TEST_NODE_PATH=<carpeta>/node_modules``). jsdom no carga recursos externos (fuentes) ni
+# abre ventanas: nada sale de 127.0.0.1.
+# ---------------------------------------------------------------------------
+
+_HARNESS_JSDOM = r"""
+"use strict";
+const { JSDOM, VirtualConsole } = require("jsdom");
+const [url, modo, tokenEscritorio] = process.argv.slice(2);
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+const errores = [];
+const avisos = [];
+function paso(nombre, datos) {
+  process.stdout.write(JSON.stringify(Object.assign({ paso: nombre }, datos || {})) + "\n");
+}
+async function hasta(cond, ms, nombre) {
+  const fin = Date.now() + ms;
+  while (Date.now() < fin) {
+    try { if (cond()) { return; } } catch (e) { /* aún no */ }
+    await esperar(20);
+  }
+  throw new Error("tiempo agotado: " + nombre);
+}
+(async () => {
+  const consola = new VirtualConsole();
+  consola.on("jsdomError", (e) => errores.push(String(e && e.message)));
+  consola.on("error", (...a) => errores.push(a.map(String).join(" ")));
+  consola.on("warn", (...a) => avisos.push(a.map(String).join(" ")));
+  const dom = await JSDOM.fromURL(url, { runScripts: "dangerously", pretendToBeVisual: true, virtualConsole: consola });
+  const w = dom.window;
+  const d = w.document;
+  const $ = (id) => d.getElementById(id);
+  const enLinea = () => $("rine-estado").textContent === "en línea";
+  const pulsado = () => $("rine-no-molestar").getAttribute("aria-pressed");
+  const permisos = () => Array.from(d.querySelectorAll("#rine-lista .msg.permiso")).map((li) => ({
+    texto: li.querySelector(".burbuja").textContent,
+    aprobar: li.querySelector(".aprobar") ? li.querySelector(".aprobar").disabled : null,
+    resolucion: (li.querySelector(".resolucion") || {}).textContent || ""
+  }));
+  await hasta(() => $("llamada-texto").textContent === "EN LLAMADA", 8000, "en llamada");
+  if (modo === "sin_chat") {
+    await esperar(600);
+    paso("fin", { lanzador_oculto: $("rine-lanzador").hidden, panel_oculto: $("rine").hidden,
+                  estado: $("rine-estado").textContent, errores, avisos });
+    w.close();
+    return;
+  }
+  await hasta(enLinea, 8000, "chat en línea");
+  await hasta(() => pulsado() === "true", 3000, "no molestar desde la instantánea");
+  paso("conectado", { lanzador_oculto: $("rine-lanzador").hidden, pulsado: pulsado(),
+                      token_en_dom: d.documentElement.outerHTML.includes(tokenEscritorio) });
+  $("rine-no-molestar").click();
+  paso("clic1", { pulsado: pulsado() });
+  await hasta(() => pulsado() === "true", 5000, "no molestar reactivado por otro cliente");
+  $("rine-no-molestar").click();
+  paso("clic2", { pulsado: pulsado() });
+
+  await hasta(() => d.querySelector("#rine-lista .msg.permiso .aprobar"), 8000, "permiso A");
+  const ella = Array.from(d.querySelectorAll("#rine-lista .msg.ella .burbuja")).pop();
+  const datos = {
+    texto_ella: ella ? ella.textContent : null,
+    enlaces: ella ? Array.from(ella.querySelectorAll("a")).map((a) => ({ href: a.href, rel: a.rel, target: a.target })) : [],
+    sistema: Array.from(d.querySelectorAll("#rine-lista .msg.sistema .burbuja")).map((b) => b.textContent),
+    html_inyectado: d.querySelectorAll("#rine-lista b, #rine-lista script, #rine-lista img").length,
+    vista: (d.querySelector("#rine-lista .msg.permiso .vista-previa") || {}).textContent || null
+  };
+  d.querySelector("#rine-lista .msg.permiso .aprobar").click();
+  paso("aprobado", datos);
+
+  await hasta(() => permisos().length === 2 && permisos()[1].aprobar === false &&
+                    permisos()[0].resolucion === "Aprobada.", 8000, "permiso B");
+  paso("segundo", { permisos: permisos() });
+  await hasta(() => !enLinea(), 5000, "desconexión 1");
+  await hasta(enLinea, 8000, "reconexión 1");
+  await hasta(() => permisos().length === 3, 3000, "permiso C");
+  await esperar(200);
+  paso("reconectado", { permisos: permisos() });
+  await hasta(() => !enLinea(), 5000, "desconexión 2");
+  await hasta(enLinea, 8000, "reconexión 2");
+  await esperar(300);
+  paso("revivido", { permisos: permisos(), errores, avisos });
+  w.close();
+})().catch((e) => {
+  paso("fallo", { error: String(e && e.stack || e), errores, avisos });
+  process.exit(1);
+});
+"""
+
+
+def _entorno_jsdom() -> tuple[str, dict[str, str]] | None:
+    """``(node, entorno)`` si ``node`` resuelve ``jsdom`` (NODE_PATH: ``RAMS_TEST_NODE_PATH``,
+    ``NODE_PATH`` y los ``node_modules`` del proyecto); si no, ``None``."""
+    node = shutil.which("node")
+    if node is None:
+        return None
+    raiz = Path(__file__).resolve().parents[1]
+    rutas = [os.environ.get("RAMS_TEST_NODE_PATH", ""), os.environ.get("NODE_PATH", ""),
+             str(raiz / "node_modules"), str(raiz / "desktop" / "node_modules")]
+    entorno = dict(os.environ)
+    entorno["NODE_PATH"] = os.pathsep.join(r for r in rutas if r)
+    try:
+        resultado = subprocess.run([node, "-e", "require.resolve('jsdom')"], env=entorno,
+                                   capture_output=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return (node, entorno) if resultado.returncode == 0 else None
+
+
+async def _hud_en_jsdom(hud: ServidorHUD, modo: str, token: str, tmp_path: Path,
+                        node: str, entorno: dict[str, str]) -> tuple[Any, Any]:
+    """Lanza el HUD en jsdom; devuelve el proceso y ``paso(nombre)`` para leer sus hitos."""
+    script = tmp_path / "hud_jsdom.cjs"
+    script.write_text(_HARNESS_JSDOM, encoding="utf-8")
+    proceso = await asyncio.create_subprocess_exec(
+        node, str(script), str(hud.url), modo, token, cwd=str(tmp_path), env=entorno,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+
+    async def paso(nombre: str, timeout: float = 20.0) -> dict[str, Any]:
+        async with asyncio.timeout(timeout):
+            while True:
+                linea = await proceso.stdout.readline()
+                if not linea:
+                    error = (await proceso.stderr.read()).decode("utf-8", "replace")[-2000:]
+                    pytest.fail(f"jsdom terminó antes de «{nombre}»: {error}")
+                try:
+                    datos = json.loads(linea)
+                except ValueError:
+                    continue  # salida de consola ajena al protocolo
+                if not isinstance(datos, dict):
+                    continue
+                if datos.get("paso") == "fallo":
+                    pytest.fail(f"jsdom falló antes de «{nombre}»: {datos}")
+                if datos.get("paso") == nombre:
+                    return datos
+
+    return proceso, paso
+
+
+async def _terminar(proceso: Any) -> None:
+    """Espera a que termine el proceso de jsdom (o lo mata) y vacía sus tuberías."""
+    try:
+        await asyncio.wait_for(proceso.communicate(), timeout=5)
+    except TimeoutError:
+        proceso.kill()
+        await proceso.communicate()
+
+
+def _cortar_paneles(hud: ServidorHUD) -> None:
+    """Corta desde el servidor los paneles del HUD conectados a ``/escritorio`` (sin cierre limpio)."""
+    assert hud.escritorio is not None
+    for cliente in list(hud.escritorio._huds.values()):
+        cliente.conexion.transport.abort()
+
+
+def test_rine_en_jsdom_no_molestar_saneado_y_permisos(settings_prueba: Settings, bus: BusEventos, correr: Any,
+                                                      tmp_path: Path) -> None:
+    """Regresión del panel RINE (revisión escritorio-ws): token de /ws, «No molestar» derivado del
+    estado real, texto y enlaces saneados, botones ligados al id y reconciliación tras reconectar."""
+    jsdom = _entorno_jsdom()
+    if jsdom is None:
+        pytest.skip("sin node o sin jsdom (npm i jsdom; RAMS_TEST_NODE_PATH=<carpeta>/node_modules)")
+    node, entorno = jsdom
+    controles: list[dict[str, Any]] = []
+    confirmaciones: list[dict[str, Any]] = []
+    bus.suscribir("escritorio.control", lambda e: controles.append(dict(e.datos)))
+    bus.suscribir("escritorio.confirmacion", lambda e: confirmaciones.append(dict(e.datos)))
+
+    async def esperar(cond: Any, timeout: float = 5.0) -> None:
+        async with asyncio.timeout(timeout):
+            while not cond():
+                await asyncio.sleep(0.01)
+
+    async def caso() -> None:
+        # Estado previo: el usuario activó «No molestar» (p. ej. desde la bandeja de Electron) antes
+        # de que el HUD cargara: el botón tiene que salir pulsado.
+        bus.publicar("pc.no_molestar", {"activo": True, "motivo": "usuario"})
+        hud = ServidorHUD(settings_prueba.con(hud_habilitado=True, hud_puerto=0, escritorio_habilitado=True,
+                                              hud_chat=True), bus)
+        await hud.iniciar()
+        proceso = None
+        try:
+            token = json.loads(Path(settings_prueba.escritorio_token_file).read_text(encoding="utf-8"))["token"]
+            proceso, paso = await _hud_en_jsdom(hud, "chat", token, tmp_path, node, entorno)
+            datos = await paso("conectado")
+            assert datos["lanzador_oculto"] is False and datos["pulsado"] == "true"
+            assert datos["token_en_dom"] is False
+
+            # 1.er clic: con el estado real «activo», el HUD manda «off» (no otro «on»).
+            assert (await paso("clic1"))["pulsado"] == "false"
+            await esperar(lambda: controles == [{"accion": "no_molestar_off"}])
+            bus.publicar("pc.no_molestar", {"activo": False, "motivo": ""})        # main lo aplica
+            bus.publicar("pc.no_molestar", {"activo": True, "motivo": "usuario"})  # la bandeja lo reactiva
+            assert (await paso("clic2"))["pulsado"] == "false"
+            await esperar(lambda: len(controles) == 2)
+            assert controles[1] == {"accion": "no_molestar_off"}
+
+            # Texto y enlaces saneados; botones ligados al id.
+            bus.publicar("salida.subtitulo", {"texto": "Mira <b>esto</b>: https://example.org/a?b=1. "
+                                                       "Y javascript:alert(1)", "exp": "feliz",
+                                              "canal": "terminal", "origen": "respuesta"})
+            bus.publicar("escritorio.sistema", {"texto": "Estado: <img src=x onerror=alert(1)>"})
+            bus.publicar("permiso.solicitado", {"id": "a1b2c3d4", "descripcion": "Acción A", "destructiva": False,
+                                                "tipo": "prerrellenar", "vista_previa": "hola <script>x</script>"})
+            datos = await paso("aprobado")
+            assert datos["html_inyectado"] == 0
+            assert "<b>esto</b>" in datos["texto_ella"] and "javascript:alert(1)" in datos["texto_ella"]
+            assert datos["enlaces"] == [{"href": "https://example.org/a?b=1", "rel": "noopener noreferrer",
+                                         "target": "_blank"}]
+            assert "Estado: <img src=x onerror=alert(1)>" in datos["sistema"]
+            assert datos["vista"] == "hola <script>x</script>"
+            await esperar(lambda: confirmaciones == [{"id": "a1b2c3d4", "aprobado": True}])
+
+            bus.publicar("permiso.resuelto", {"id": "a1b2c3d4", "aprobado": True, "motivo": "aprobada"})
+            bus.publicar("permiso.solicitado", {"id": "0badc0de", "descripcion": "Acción B", "destructiva": False,
+                                                "tipo": "abrir_app"})
+            datos = await paso("segundo")
+            assert [p["aprobar"] for p in datos["permisos"]] == [True, False]
+
+            # Sin conexión, B se resuelve en otro lado y llega C: al reconectar, B queda caducada (no
+            # pulsable) y C aparece vigente.
+            _cortar_paneles(hud)
+            await asyncio.sleep(0.05)
+            bus.publicar("permiso.resuelto", {"id": "0badc0de", "aprobado": False, "motivo": "sin respuesta"})
+            bus.publicar("permiso.solicitado", {"id": "cafe1234", "descripcion": "Acción C", "destructiva": False,
+                                                "tipo": "abrir_app"})
+            a, b, c = (await paso("reconectado"))["permisos"]
+            assert a["resolucion"] == "Aprobada." and a["aprobar"] is True
+            assert b["resolucion"] == "Ya no está pendiente." and b["aprobar"] is True
+            assert "Acción C" in c["texto"] and c["aprobar"] is False and c["resolucion"] == ""
+
+            # Otra reconexión sin cambios: C sigue vigente en la misma burbuja (sin duplicados).
+            _cortar_paneles(hud)
+            datos = await paso("revivido")
+            assert len(datos["permisos"]) == 3
+            assert datos["permisos"][2]["aprobar"] is False and datos["permisos"][2]["resolucion"] == ""
+            assert datos["errores"] == [] and datos["avisos"] == []
+        finally:
+            if proceso is not None:
+                await _terminar(proceso)
+            await hud.cerrar()
+
+    correr(caso())
+
+
+@pytest.mark.parametrize("cambios", [{"hud_chat": False}, {"escritorio_habilitado": False}],
+                         ids=["sin_hud_chat", "sin_escritorio"])
+def test_rine_en_jsdom_sin_chat_no_muestra_el_lanzador(settings_prueba: Settings, bus: BusEventos, correr: Any,
+                                                       tmp_path: Path, cambios: dict[str, Any]) -> None:
+    """§C1.5: sin ``RAMS_HUD_CHAT=1`` (o sin /escritorio) no hay lanzador ni panel RINE."""
+    jsdom = _entorno_jsdom()
+    if jsdom is None:
+        pytest.skip("sin node o sin jsdom (npm i jsdom; RAMS_TEST_NODE_PATH=<carpeta>/node_modules)")
+    node, entorno = jsdom
+
+    async def caso() -> None:
+        hud = ServidorHUD(settings_prueba.con(hud_habilitado=True, hud_puerto=0, **cambios), bus)
+        await hud.iniciar()
+        proceso = None
+        try:
+            proceso, paso = await _hud_en_jsdom(hud, "sin_chat", "-", tmp_path, node, entorno)
+            datos = await paso("fin")
+            assert datos["lanzador_oculto"] is True and datos["panel_oculto"] is True
+            assert datos["errores"] == [] and datos["avisos"] == []
+        finally:
+            if proceso is not None:
+                await _terminar(proceso)
+            await hud.cerrar()
+
+    correr(caso())

@@ -4,9 +4,16 @@ Qué hace:
 - ``leer_inactividad(settings)`` lee la inactividad del sistema: en Linux con el archivo-bandera
   que crea hypridle (``RAMS_IDLE_FLAG``) y, si no existe, comprobando con psutil que hypridle
   esté corriendo; en Windows con ``GetLastInputInfo`` (ctypes). En otros sistemas no hay fuente.
-- ``RastreadorPresencia`` fusiona la última entrada local (terminal), el último vistazo de
-  cámara y la inactividad del sistema con la tabla de 7 reglas de §7. Es lógica pura y
-  determinista: **no** abre la cámara ni hace E/S salvo la lectura de inactividad.
+- ``RastreadorPresencia`` fusiona la última entrada local (terminal o chat de escritorio), el
+  último rostro (vistazo de cámara o visión continua, que registra main) y la inactividad del
+  sistema con la tabla de 7 reglas de §7. Es lógica pura y determinista: **no** abre la cámara
+  ni hace E/S salvo la lectura de inactividad.
+- v0.2 (``docs/COMPANION.md`` §C3 "Grupo orquestacion"): el canal ``escritorio`` cuenta como
+  entrada local; la inactividad de Windows puede venir de ``ControlPC.inactividad_s`` (callable
+  inyectado) y un reinicio de la inactividad a ±1 s de ``ControlPC.ts_ultima_inyeccion()`` (el
+  cursor o el teclado los movió Amadeus, no el usuario) se ignora. Un rostro visto hace < 60 s
+  (si fue el último registro) gana a la inactividad: main lo refresca cada 30 s mientras la
+  visión continua ve al usuario, y quien mira un vídeo sin tocar nada no está ausente.
 
 Dependencias opcionales: ``psutil`` (detección del proceso hypridle; sin él no hay esa
 comprobación). ``ctypes`` es de la biblioteca estándar y solo se usa en Windows.
@@ -41,6 +48,7 @@ __all__ = [
     "VENTANA_TERMINAL_RECIENTE_S",
     "VENTANA_ROSTRO_S",
     "INACTIVIDAD_MAX_CON_ROSTRO_S",
+    "VENTANA_ROSTRO_FRESCO_S",
     "INACTIVIDAD_MIN_SIN_ROSTRO_S",
     "UMBRAL_AMBIGUO",
     "CACHE_HYPRIDLE_S",
@@ -52,10 +60,16 @@ log = logging.getLogger("rams.presencia")
 VENTANA_TERMINAL_RECIENTE_S: Final = 120.0     # regla 1
 VENTANA_ROSTRO_S: Final = 300.0                # reglas 2 y 3
 INACTIVIDAD_MAX_CON_ROSTRO_S: Final = 600.0    # regla 2
+# Regla 2 (v0.2): un rostro visto hace < 60 s, si fue el último registro, gana a la inactividad.
+# La visión continua (main) lo refresca cada 30 s mientras ve al usuario: ver un vídeo largo sin
+# tocar el teclado no es estar ausente (si no, la regla 5 mandaría las iniciativas a Telegram).
+VENTANA_ROSTRO_FRESCO_S: Final = 60.0
 INACTIVIDAD_MIN_SIN_ROSTRO_S: Final = 180.0    # regla 3
 UMBRAL_AMBIGUO: Final = 0.6                    # ambiguo = confianza < 0,6
 CACHE_HYPRIDLE_S: Final = 30.0                 # caché de la comprobación del proceso hypridle
 ESPERA_PRIMER_RECORRIDO_S: Final = 0.25        # espera máxima del primer recorrido (sin caché)
+TOLERANCIA_INYECCION_S: Final = 1.0            # ±1 s alrededor de una entrada inyectada por Amadeus
+UMBRAL_REINICIO_S: Final = 0.5                 # un "último input" que avanza más que esto es un input nuevo
 
 _FUENTES_VALIDAS: Final = frozenset({"hypridle", "win32", "ninguna"})
 
@@ -240,10 +254,22 @@ class RastreadorPresencia:
 
     ``reloj`` (por defecto ``time.time``) y ``fuente_inactividad`` (por defecto
     ``leer_inactividad(settings)``) se inyectan para poder probar las reglas sin tocar el sistema.
+
+    v0.2 (todos opcionales, también con :meth:`conectar_control_pc`):
+
+    - ``inactividad_pc``: ``ControlPC.inactividad_s`` (Windows: ``GetLastInputInfo``). Si
+      devuelve un número válido, manda sobre ``fuente_inactividad`` (fuente ``"win32"``); si
+      devuelve ``None`` (Hyprland) se usa la fuente normal (archivo-bandera de hypridle).
+    - ``ts_ultima_inyeccion``: ``ControlPC.ts_ultima_inyeccion`` en el reloj ``reloj_inyeccion``
+      (por defecto ``time.monotonic``, el de ``ControlPC``). Un reinicio de la inactividad cuyo
+      instante cae a ±1 s de la última inyección propia no cuenta como actividad del usuario.
     """
 
     def __init__(self, settings: Settings, *, reloj: Callable[[], float] = time.time,
-                 fuente_inactividad: Callable[[], tuple[float | None, str]] | None = None) -> None:
+                 fuente_inactividad: Callable[[], tuple[float | None, str]] | None = None,
+                 inactividad_pc: Callable[[], float | None] | None = None,
+                 ts_ultima_inyeccion: Callable[[], float | None] | None = None,
+                 reloj_inyeccion: Callable[[], float] = time.monotonic) -> None:
         self._settings = settings
         self._reloj = reloj
         if fuente_inactividad is None:
@@ -251,6 +277,12 @@ class RastreadorPresencia:
                 return leer_inactividad(settings)
             fuente_inactividad = _fuente_defecto
         self._fuente = fuente_inactividad
+        self._inactividad_pc: Callable[[], float | None] | None = inactividad_pc
+        self._ts_inyeccion: Callable[[], float | None] | None = ts_ultima_inyeccion
+        self._reloj_inyeccion = reloj_inyeccion
+        # Instante (en reloj_inyeccion) del último input REAL del usuario según la fuente de
+        # inactividad; None hasta la primera lectura. Lo usa el filtro de inyecciones propias.
+        self._input_real: float | None = None
         self._lock = threading.Lock()
         self._ultima_entrada_local: float | None = None
         self.ultima_entrada_remota_ts: float | None = None
@@ -259,6 +291,17 @@ class RastreadorPresencia:
         self._ultimo_rostro_ts: float | None = None
         self._estado: EstadoPresencia = EstadoPresencia.desconocido()
 
+    def conectar_control_pc(self, *, inactividad_pc: Callable[[], float | None] | None = None,
+                            ts_ultima_inyeccion: Callable[[], float | None] | None = None,
+                            reloj_inyeccion: Callable[[], float] | None = None) -> None:
+        """Conecta (o desconecta con ``None``) las fuentes de ``ControlPC`` tras construir el rastreador."""
+        with self._lock:
+            self._inactividad_pc = inactividad_pc
+            self._ts_inyeccion = ts_ultima_inyeccion
+            if reloj_inyeccion is not None:
+                self._reloj_inyeccion = reloj_inyeccion
+            self._input_real = None
+
     # ------------------------------------------------------------------
     # Entradas
     # ------------------------------------------------------------------
@@ -266,7 +309,8 @@ class RastreadorPresencia:
     def registrar_entrada(self, canal: str) -> None:
         """Anota una entrada del usuario.
 
-        Solo los canales de ``CANALES_LOCALES`` (``terminal``) cuentan como presencia.
+        Solo los canales de ``CANALES_LOCALES`` (``terminal`` y, desde la v0.2, ``escritorio``:
+        el chat de Amadeus Desktop o del HUD) cuentan como presencia.
         ``telegram`` fija ``ultima_entrada_remota_ts`` (indica más bien que el usuario está
         lejos). Cualquier otro canal (``nexus``) se ignora.
         """
@@ -313,10 +357,12 @@ class RastreadorPresencia:
         desde_rostro = None if ultimo_rostro is None else max(0.0, ahora - ultimo_rostro)
         desde_vistazo = None if ultimo_vistazo is None else max(0.0, ahora - ultimo_vistazo)
 
+        rostro_fresco = (desde_rostro is not None and desde_rostro < VENTANA_ROSTRO_FRESCO_S
+                         and vistazo_con_rostro is True)
         if desde_entrada is not None and desde_entrada < VENTANA_TERMINAL_RECIENTE_S:
             presente, confianza, motivo = True, 0.95, "terminal_reciente"            # regla 1
-        elif (desde_rostro is not None and desde_rostro < VENTANA_ROSTRO_S
-              and (inactividad is None or inactividad < INACTIVIDAD_MAX_CON_ROSTRO_S)):
+        elif rostro_fresco or (desde_rostro is not None and desde_rostro < VENTANA_ROSTRO_S
+                               and (inactividad is None or inactividad < INACTIVIDAD_MAX_CON_ROSTRO_S)):
             presente, confianza, motivo = True, 0.90, "rostro"                       # regla 2
         elif (desde_vistazo is not None and desde_vistazo < VENTANA_ROSTRO_S
               and vistazo_con_rostro is False
@@ -376,15 +422,67 @@ class RastreadorPresencia:
         return valor if math.isfinite(valor) else time.time()
 
     def _leer_fuente(self) -> tuple[float | None, str]:
-        """Lee y sanea la fuente de inactividad; ante cualquier fallo, ``(None, "ninguna")``."""
-        try:
-            resultado = self._fuente()
-            segundos_crudos, fuente = resultado
-        except Exception as exc:
-            log.debug("Fuente de inactividad fallida: %s", type(exc).__name__)
-            return None, "ninguna"
-        segundos = _segundos_validos(segundos_crudos)
+        """Lee y sanea la fuente de inactividad; ante cualquier fallo, ``(None, "ninguna")``.
+
+        Con ``inactividad_pc`` conectada (ControlPC en Windows) se usa esa lectura; después se
+        aplica el filtro de inyecciones propias (:meth:`_filtrar_inyeccion`).
+        """
+        segundos: float | None = None
+        fuente = "ninguna"
+        externa = self._inactividad_pc
+        if externa is not None:
+            try:
+                segundos = _segundos_validos(externa())
+            except Exception as exc:
+                log.debug("Inactividad de ControlPC fallida: %s", type(exc).__name__)
+                segundos = None
+            if segundos is not None:
+                fuente = "win32"
         if segundos is None:
-            return None, "ninguna"
-        fuente = str(fuente) if str(fuente) in _FUENTES_VALIDAS else "ninguna"
-        return segundos, fuente
+            try:
+                resultado = self._fuente()
+                segundos_crudos, fuente_cruda = resultado
+            except Exception as exc:
+                log.debug("Fuente de inactividad fallida: %s", type(exc).__name__)
+                return None, "ninguna"
+            segundos = _segundos_validos(segundos_crudos)
+            if segundos is None:
+                return None, "ninguna"
+            fuente = str(fuente_cruda) if str(fuente_cruda) in _FUENTES_VALIDAS else "ninguna"
+        return self._filtrar_inyeccion(segundos), fuente
+
+    def _filtrar_inyeccion(self, segundos: float) -> float:
+        """Ignora los reinicios de inactividad causados por Amadeus (travesura o tecleo).
+
+        Se lleva el instante del último input real (``reloj_inyeccion() − segundos``). Si una
+        lectura indica un input nuevo (el instante avanza más de ``UMBRAL_REINICIO_S``) y ese
+        instante cae a ±``TOLERANCIA_INYECCION_S`` de ``ts_ultima_inyeccion()``, se ignora y la
+        inactividad sigue contando desde el input real anterior. Sin ``ts_ultima_inyeccion``
+        devuelve ``segundos`` tal cual. Nunca lanza.
+        """
+        fuente_ts = self._ts_inyeccion
+        if fuente_ts is None:
+            return segundos
+        try:
+            ahora = float(self._reloj_inyeccion())
+            crudo = fuente_ts()
+            inyeccion = None if crudo is None or isinstance(crudo, bool) else float(crudo)
+        except Exception as exc:
+            log.debug("Filtro de inyecciones no disponible (%s)", type(exc).__name__)
+            return segundos
+        if not math.isfinite(ahora):
+            return segundos
+        momento = ahora - segundos
+        with self._lock:
+            previo = self._input_real
+            if previo is None or momento <= previo + UMBRAL_REINICIO_S:
+                # Primera lectura o sin input nuevo: se adopta la lectura (corrige derivas).
+                if previo is None or momento > previo:
+                    self._input_real = momento
+                return segundos if previo is None else max(segundos, ahora - self._input_real)
+            if (inyeccion is not None and math.isfinite(inyeccion)
+                    and abs(momento - inyeccion) <= TOLERANCIA_INYECCION_S):
+                log.debug("Reinicio de inactividad causado por una inyección propia; se ignora")
+                return max(0.0, ahora - previo)
+            self._input_real = momento
+            return segundos

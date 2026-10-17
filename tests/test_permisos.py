@@ -8,6 +8,7 @@ dependa de los procesos de la máquina.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import threading
 
@@ -367,3 +368,272 @@ def test_cancelacion_de_la_tarea_limpia_la_pendiente(ajustes: Settings, bus: Bus
     assert [n for n, _ in eventos] == ["permiso.solicitado", "permiso.resuelto"]
     solicitado, resuelto = eventos[0][1], eventos[1][1]
     assert resuelto == {"id": solicitado["id"], "aprobado": False, "motivo": "confirmación cancelada"}
+
+
+# ---------------------------------------------------------------------------
+# v0.2 (docs/COMPANION.md §C2.11): filas nuevas, vista previa y resolver_por_id
+# ---------------------------------------------------------------------------
+
+HWND_AJENO = 0x1A2B
+PID_EXTRA = 31337
+
+
+def _v02(ajustes: Settings, *, maestro: bool = False, activas: bool = False, bus: BusEventos | None = None,
+         preguntar=None, timeout_s: float = 60.0, pids_extra=None) -> CompuertaPermisos:
+    ajustes = ajustes.con(travesuras_habilitadas=maestro)
+    return CompuertaPermisos(ajustes, bus, preguntar=preguntar or (lambda _t: None), timeout_s=timeout_s,
+                             pids_propios=PIDS_PROPIOS,
+                             pids_extra=pids_extra if pids_extra is not None else (lambda: frozenset({PID_EXTRA})),
+                             travesuras_activas=lambda: activas)
+
+
+def _escribir(texto: str = "hola", **objetivo: object) -> AccionPC:
+    args: dict[str, object] = {"texto": texto, "hwnd": HWND_AJENO, "pid": PID_AJENO, "exe": "chrome.exe",
+                               "direccion": None, "clase": "Chrome_WidgetWin_1"}
+    args.update(objetivo)
+    return AccionPC("escribir_texto", args, "escribir en la ventana anterior")
+
+
+def _travesura(origen: str = "iniciativa", **cambios: object) -> AccionPC:
+    args: dict[str, object] = {"patron": "empujon", "amplitud_px": 30, "segundos": 0.5}
+    args.update(cambios)
+    return AccionPC("travesura_cursor", args, "travesura de cursor", origen=origen)
+
+
+def test_constructor_v02_por_defecto(ajustes: Settings) -> None:
+    compuerta = CompuertaPermisos(ajustes, pids_propios=PIDS_PROPIOS)
+    assert compuerta.pids_extra() == frozenset()
+    assert compuerta.travesuras_activas() is False
+
+    def roto() -> frozenset[int]:
+        raise RuntimeError("callback roto")
+
+    rota = CompuertaPermisos(ajustes, pids_propios=PIDS_PROPIOS, pids_extra=roto,
+                             travesuras_activas=lambda: 1 / 0)  # type: ignore[arg-type,return-value]
+    assert rota.pids_extra() == frozenset() and rota.travesuras_activas() is False
+
+
+def test_iniciativa_solo_vistazo_y_travesura(ajustes: Settings) -> None:
+    compuerta = _v02(ajustes, maestro=True, activas=True)
+    vistazo = AccionPC("vistazo", {"motivo": "curiosidad"}, "vistazo", origen="iniciativa")
+    assert compuerta.evaluar(vistazo).veredicto == "permitida"
+    assert compuerta.evaluar(_travesura("iniciativa")).veredicto == "permitida"
+    for tipo, args in (("abrir_destino", {"alias": "whatsapp"}), ("buscar_en", {"alias": "youtube", "consulta": "x"}),
+                       ("prerrellenar", {"alias": "whatsapp", "texto": "hola"}), ("lanzar_app", {"alias": "terminal"})):
+        decision = compuerta.evaluar(AccionPC(tipo, args, tipo, origen="iniciativa"))
+        assert decision.veredicto == "denegada", tipo
+    assert compuerta.evaluar(_escribir()).veredicto == "confirmar"
+    assert compuerta.evaluar(AccionPC("escribir_texto", dict(_escribir().args), "x",
+                                      origen="iniciativa")).veredicto == "denegada"
+    # Nexus, Telegram y el LLM siguen sin poder nada de esto.
+    for origen in ("nexus", "telegram", "llm"):
+        assert compuerta.evaluar(AccionPC("abrir_destino", {"alias": "whatsapp"}, "abrir",
+                                          origen=origen)).veredicto == "denegada"
+        assert compuerta.evaluar(_travesura(origen)).veredicto == "denegada"
+
+
+def test_abrir_destino_solo_claves_del_catalogo(ajustes: Settings) -> None:
+    compuerta = _v02(ajustes)
+    assert compuerta.evaluar(AccionPC("abrir_destino", {"alias": "whatsapp"}, "abrir")).aprobada is True
+    assert compuerta.evaluar(AccionPC("abrir_destino", {"alias": "navegador"}, "abrir")).aprobada is True
+    for alias in ("WhatsApp", "wasap", "malware", "", None, 3, "a" * 25, "whatsapp; rm -rf /"):
+        decision = compuerta.evaluar(AccionPC("abrir_destino", {"alias": alias}, "abrir"))
+        assert decision.veredicto == "denegada", alias
+
+
+def test_buscar_en_destinos_con_busqueda(ajustes: Settings) -> None:
+    compuerta = _v02(ajustes)
+
+    def buscar(alias: str, consulta: object) -> str:
+        return compuerta.evaluar(AccionPC("buscar_en", {"alias": alias, "consulta": consulta}, "buscar")).veredicto
+
+    assert buscar("youtube", "gatos graciosos") == "permitida"
+    assert buscar("navegador", "clima en Bogotá") == "permitida"
+    assert buscar("whatsapp", "mamá") == "denegada"                   # sin búsqueda en el catálogo
+    assert buscar("youtube", "") == "denegada" and buscar("youtube", None) == "denegada"
+    assert buscar("youtube", "x" * 121) == "denegada"
+    assert buscar("youtube", "AIza" + "B" * 35) == "denegada"         # parece una clave
+
+
+def test_prerrellenar_confirma_y_rechaza_secretos(ajustes: Settings) -> None:
+    compuerta = _v02(ajustes)
+
+    def prerrellenar(alias: str, texto: object) -> DecisionPermiso:
+        return compuerta.evaluar(AccionPC("prerrellenar", {"alias": alias, "texto": texto}, "borrador"))
+
+    decision = prerrellenar("whatsapp", "Llego tarde,\nguárdame comida")
+    assert decision.veredicto == "confirmar" and decision.aprobada is False and decision.destructiva is False
+    assert prerrellenar("x", "Hola mundo").veredicto == "confirmar"
+    assert prerrellenar("instagram", "hola").veredicto == "denegada"   # sin prerrelleno: escribir_texto
+    for secreto in ("482915", "4111 1111 1111 1111", "password: hunter2", "AIza" + "C" * 35):
+        assert prerrellenar("whatsapp", secreto).veredicto == "denegada", secreto
+    assert prerrellenar("whatsapp", "x" * 501).veredicto == "denegada"
+    assert prerrellenar("whatsapp", " \n\t ").veredicto == "denegada"
+    assert prerrellenar("whatsapp", ("hola mamá " * 60)[:500]).veredicto == "confirmar"
+
+
+def test_escribir_texto_objetivo_y_texto(ajustes: Settings) -> None:
+    compuerta = _v02(ajustes)
+    assert compuerta.evaluar(_escribir()).veredicto == "confirmar"
+    assert compuerta.evaluar(_escribir(hwnd=None, direccion="0x55aa")).veredicto == "confirmar"
+    denegadas = [
+        _escribir(pid=os.getpid()),                 # R.A.M.S. (pids_propios)
+        _escribir(pid=4242),                        # ancestro de R.A.M.S.
+        _escribir(pid=PID_EXTRA),                   # Amadeus Desktop (pids_extra)
+        _escribir(pid=None), _escribir(pid=True), _escribir(pid="999"),
+        _escribir(hwnd=None, direccion=None),       # sin ventana
+        _escribir(hwnd=None, direccion="0xZZ"), _escribir(hwnd=None, direccion="0xABC"),
+        _escribir(hwnd=True),
+        _escribir(texto="482915"), _escribir(texto="clave = sup3r"), _escribir(texto=""), _escribir(texto="x" * 501),
+    ]
+    for accion in denegadas:
+        assert compuerta.evaluar(accion).veredicto == "denegada", accion.args
+
+
+def test_travesura_exige_maestro_y_estado_de_main(ajustes: Settings) -> None:
+    assert _v02(ajustes, maestro=False, activas=True).evaluar(_travesura()).veredicto == "denegada"
+    assert _v02(ajustes, maestro=True, activas=False).evaluar(_travesura()).veredicto == "denegada"
+    compuerta = _v02(ajustes, maestro=True, activas=True)
+    assert compuerta.evaluar(_travesura()).veredicto == "permitida"
+    assert compuerta.evaluar(_travesura("usuario")).veredicto == "permitida"
+    maximo = ajustes.travesura_amplitud_max_px
+    for cambios in ({"patron": "clic"}, {"amplitud_px": maximo + 1}, {"amplitud_px": 0}, {"amplitud_px": 2.5},
+                    {"amplitud_px": True}, {"segundos": 0.61}, {"segundos": 0}, {"segundos": "0.5"},
+                    {"segundos": float("nan")}):
+        assert compuerta.evaluar(_travesura(**cambios)).veredicto == "denegada", cambios
+    for patron in ("empujon", "circulo", "temblor", "hacia_avatar"):
+        assert compuerta.evaluar(_travesura(patron=patron, amplitud_px=maximo, segundos=0.6)).aprobada is True
+
+
+def test_vista_previa_y_recuento_iguales_a_lo_que_escribe_control_pc(compuerta: CompuertaPermisos) -> None:
+    """La vista previa y el «N caracteres» salen del mismo saneado que teclea ControlPC:
+    los invisibles (ZWSP, marcas bidi, etiquetas Unicode) no viajan ni inflan el recuento."""
+    from core.permisos import sanear_texto_accion
+    from lobes.control_pc import _sanear
+
+    oculto = "".join(chr(0xE0000 + ord(c)) for c in "clave")       # "ASCII smuggling"
+    texto = "ho​la‮  mundo\t" + oculto + "\n"
+    assert sanear_texto_accion(texto) == _sanear(texto, 500) == "hola mundo"
+    assert sanear_texto_accion("​⁠") == "" and sanear_texto_accion(None) == ""
+    decision = compuerta.evaluar(AccionPC("prerrellenar", {"alias": "whatsapp", "texto": "​" * 600 + "hola"},
+                                          "borrador"))
+    assert decision.veredicto == "confirmar"                        # 4 caracteres visibles, no 604
+
+
+def test_vista_previa_va_aparte_de_la_descripcion(ajustes: Settings, bus: BusEventos, correr,
+                                                 caplog: pytest.LogCaptureFixture) -> None:
+    eventos: list[tuple[str, dict]] = []
+    preguntas: list[str] = []
+    bus.suscribir("permiso.*", lambda ev: eventos.append((ev.nombre, dict(ev.datos))))
+    compuerta = _v02(ajustes, bus=bus, preguntar=preguntas.append)
+    texto = "Llego tarde,\nguárdame arepa"
+
+    async def principal() -> tuple[DecisionPermiso, bool]:
+        tarea = asyncio.ensure_future(compuerta.autorizar(
+            AccionPC("prerrellenar", {"alias": "whatsapp", "texto": texto}, f"borrador: {texto}")))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        resuelta = compuerta.resolver_por_id(compuerta.pendiente().id, True)
+        return await tarea, resuelta
+
+    with caplog.at_level("DEBUG"):
+        decision, resuelta = correr(principal())
+    assert resuelta is True and decision.aprobada is True and decision.destructiva is False
+    assert decision.motivo == "confirmada con el botón del chat"
+    solicitado = eventos[0][1]
+    saneado = "Llego tarde, guárdame arepa"
+    assert solicitado["vista_previa"] == saneado and solicitado["tipo"] == "prerrellenar"
+    assert solicitado["descripcion"] == f"Abrir WhatsApp con un borrador de {len(saneado)} caracteres (no se enviará)"
+    assert "arepa" not in solicitado["descripcion"] and solicitado["destructiva"] is False
+    assert eventos[1][1]["aprobado"] is True
+    # La consola local SÍ la muestra (pantalla), pero ningún log la registra.
+    assert "arepa" in preguntas[0] and preguntas[0].startswith("⚠ Confirmación requerida: Abrir WhatsApp")
+    assert all("arepa" not in r.getMessage() for r in caplog.records)
+    # escribir_texto: "Escribir N caracteres en chrome.exe (sin enviar)".
+    eventos.clear()
+
+    async def escribir() -> DecisionPermiso:
+        tarea = asyncio.ensure_future(compuerta.autorizar(_escribir("hola")))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        assert compuerta.resolver_por_id(compuerta.pendiente().id, False) is True
+        return await tarea
+
+    rechazo = correr(escribir())
+    assert rechazo.aprobada is False and rechazo.motivo == "rechazada con el botón del chat"
+    assert eventos[0][1]["descripcion"] == "Escribir 4 caracteres en chrome.exe (sin enviar)"
+    assert eventos[0][1]["vista_previa"] == "hola"
+
+
+def test_cerrar_ventana_no_lleva_vista_previa(ajustes: Settings, bus: BusEventos, correr) -> None:
+    eventos: list[dict] = []
+    bus.suscribir("permiso.solicitado", lambda ev: eventos.append(dict(ev.datos)))
+    compuerta = _v02(ajustes, bus=bus, timeout_s=0.02)
+    correr(compuerta.autorizar(_cerrar()))
+    assert "vista_previa" not in eventos[0] and eventos[0]["destructiva"] is True
+
+
+def test_resolver_por_id(ajustes: Settings, correr) -> None:
+    compuerta = _v02(ajustes)
+    assert compuerta.resolver_por_id("0123abcd", True) is False          # nada pendiente
+    assert not inspect.iscoroutinefunction(compuerta.resolver_por_id)
+
+    async def principal() -> tuple[list[bool], DecisionPermiso]:
+        tarea = asyncio.ensure_future(compuerta.autorizar(
+            AccionPC("prerrellenar", {"alias": "x", "texto": "hola"}, "borrador")))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        ident = compuerta.pendiente().id
+        viejo = "ffffffff" if ident != "ffffffff" else "00000000"
+        intentos = [compuerta.resolver_por_id(viejo, True),               # id viejo
+                    compuerta.resolver_por_id(ident.upper(), True) if ident.upper() != ident else False,
+                    compuerta.resolver_por_id(ident[:7], True),
+                    compuerta.resolver_por_id(ident, "sí"),                # type: ignore[arg-type]
+                    compuerta.resolver_por_id(ident, 1),                   # type: ignore[arg-type]
+                    compuerta.resolver_por_id(None, True)]                 # type: ignore[arg-type]
+        intentos.append(compuerta.hay_pendiente())                         # sigue pendiente
+        # Un lock asyncio tomado (como _lock_turno de main) no impide resolver: es síncrono.
+        candado = asyncio.Lock()
+        async with candado:
+            intentos.append(compuerta.resolver_por_id(ident, True))
+        return intentos, await tarea
+
+    intentos, decision = correr(principal())
+    assert intentos[:6] == [False] * 6
+    assert intentos[6] is True and intentos[7] is True
+    assert decision.aprobada is True
+
+
+def test_resolver_por_id_no_cierra_ventanas(ajustes: Settings, correr) -> None:
+    compuerta = _v02(ajustes)
+
+    async def principal() -> tuple[bool, bool, DecisionPermiso]:
+        tarea = asyncio.ensure_future(compuerta.autorizar(_cerrar()))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        con_boton = compuerta.resolver_por_id(compuerta.pendiente().id, True)
+        sigue = compuerta.hay_pendiente()
+        assert compuerta.resolver("no") is True                           # la terminal sí puede
+        return con_boton, sigue, await tarea
+
+    con_boton, sigue, decision = correr(principal())
+    assert con_boton is False and sigue is True
+    assert decision.aprobada is False and decision.motivo == "rechazada por el usuario"
+
+
+def test_resolver_por_id_desde_otro_hilo(ajustes: Settings, correr) -> None:
+    compuerta = _v02(ajustes)
+
+    async def principal() -> tuple[list[bool], DecisionPermiso]:
+        tarea = asyncio.ensure_future(compuerta.autorizar(_escribir()))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        ident = compuerta.pendiente().id
+        resultados: list[bool] = []
+        hilo = threading.Thread(target=lambda: resultados.append(compuerta.resolver_por_id(ident, True)))
+        hilo.start()
+        await asyncio.to_thread(hilo.join, 2.0)
+        return resultados, await asyncio.wait_for(tarea, 2.0)
+
+    resultados, decision = correr(principal())
+    assert resultados == [True] and decision.aprobada is True

@@ -12,8 +12,10 @@ ddgs>=9.0                            # DuckDuckGo: sucesor de duckduckgo-search 
 tzdata>=2024.1                       # base de zonas horarias para zoneinfo (Windows y Linux mínimos/contenedores)
 prompt_toolkit>=3.0.43               # consola: Amadeus imprime sin borrar lo que estás escribiendo
 sounddevice>=0.5 ; sys_platform == "win32"   # reproducción PCM en Windows (modo degradado)
+soundfile>=0.12                      # decodifica el MP3 de edge-tts sin ffmpeg (la wheel trae libsndfile con MP3)
 
 # --- Opcionales (descomenta según tu caso; NUNCA instales dos variantes de OpenCV a la vez) ---
 # opencv-contrib-python-headless>=4.10,<5   # EN LUGAR de opencv-python-headless si quieres los módulos contrib
 # duckduckgo-search>=8.1,<9                 # solo si no puedes instalar ddgs (paquete congelado en 8.1.1)
 # sounddevice>=0.5                          # en Linux, si prefieres PortAudio a pw-play (sudo pacman -S portaudio)
+# mss==10.2.0   # opcional: visión de pantalla en Windows

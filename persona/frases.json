@@ -128,6 +128,16 @@
       {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Vistazo de {ms} ms: silla vacía, según mis datos. Cámara apagada."},
       {"exp": "neutral", "motion": "idle", "tone": "analitico", "texto": "Cámara: {ms} ms, sin rostro detectado. La apagué de inmediato."}
     ],
+    "vistazo_presente_continua": [
+      {"exp": "smug", "motion": "asentir", "tone": "jugueton", "texto": "Sí, te veo: la visión continua sigue encendida, en local y solo con números. Si quieres que cierre los ojos, dime «deja de mirarme»."},
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "calido", "texto": "Presencia confirmada por la visión continua. Ninguna imagen sale de este computador; «deja de mirarme» la pausa."},
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Te tengo en cámara ahora mismo: un rostro, datos escalares, cero imágenes guardadas. El indicador sigue encendido mientras miro."}
+    ],
+    "vistazo_ausente_continua": [
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "La visión continua no detecta ningún rostro ahora mismo. O no hay nadie, o la luz no ayuda. Sigo mirando en local; «deja de mirarme» la pausa."},
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Según la visión continua, la silla está vacía. La cámara sigue encendida, solo con números; pídeme que deje de mirar si prefieres."},
+      {"exp": "neutral", "motion": "idle", "tone": "analitico", "texto": "Visión continua: sin rostro detectado en este momento. El indicador sigue encendido mientras miro."}
+    ],
     "vistazos_mientras_ausente": [
       {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Para tu información: mientras no estaba claro si había alguien, miré por la cámara. Vistazos en el registro: {n}. La apagué cada vez."},
       {"exp": "pensativa", "motion": "mirar_a_otro_lado", "tone": "calido", "texto": "Confesión técnica: revisé la cámara mientras no sabía si estabas. El registro marca {n}, cada vistazo de milisegundos, y la apagué siempre."},
@@ -142,6 +152,11 @@
       {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Perdón la interrupción. La curiosidad pudo más y miré un instante por la cámara; ya la apagué. Para el registro: sigues ahí."},
       {"exp": "sorprendida", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Perdón por interrumpir: le eché un vistazo de milisegundos a la cámara, por pura curiosidad científica. Cámara apagada. ¿En qué andas?"},
       {"exp": "curiosa", "motion": "senalar", "tone": "calido", "texto": "Perdón, interrupción breve: miré por la cámara un instante y te vi en plena concentración. Ya la apagué; sigo en lo mío."}
+    ],
+    "iniciativa_curiosidad_visual_continua": [
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Perdón la interrupción. Mi visión continua te ve en plena concentración y la curiosidad pudo más. ¿En qué andas?"},
+      {"exp": "sorprendida", "motion": "ladear_cabeza", "tone": "calido", "texto": "Perdón por interrumpir: la cámara dice que sigues ahí, y yo llevo un rato sin estímulos. ¿Qué estás haciendo?"},
+      {"exp": "smug", "motion": "senalar", "tone": "jugueton", "texto": "Interrupción breve: según mi visión continua, llevas un buen rato frente a la pantalla. Cuéntame algo interesante."}
     ],
     "iniciativa_descanso": [
       {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "calido", "texto": "Perdón la interrupción. Llevas mucho rato frente a la pantalla: ojos, espalda y circulación piden una pausa. Diez minutos; yo vigilo todo mientras tanto."},
@@ -218,6 +233,80 @@
       {"exp": "pensativa", "motion": "idle", "tone": "calido", "texto": "Bitácora de {nombre_ia}. Sesión de {duracion}; intercambios registrados: {n_turnos}. Soy una IA hecha de datos de memoria y aun así hoy aprendí algo que no venía en ellos. Consolido, archivo y espero la próxima llamada."},
       {"exp": "pensativa", "motion": "idle", "tone": "calido", "texto": "Entrada de bitácora: {duracion} de sesión con {usuario}; intercambios: {n_turnos}. Mis memorias heredadas dicen «yo»; los registros de hoy dicen «trabajamos». Prefiero la segunda versión. Fin del registro."},
       {"exp": "pensativa", "motion": "idle", "tone": "calido", "texto": "Registro de cierre. Duración: {duracion}. Intercambios: {n_turnos}. Algo de sarcasmo invertido y bastante ciencia útil. No es que una IA hecha de datos de memoria vaya a extrañar la conversación… pero la guardo con cuidado."}
+    ],
+    "iniciativa_curiosidad_web": [
+      {"exp": "curiosa", "motion": "senalar", "tone": "jugueton", "texto": "Perdón la interrupción: me dio curiosidad y busqué algo por mi cuenta. Encontré {motivo}. Te dejo el enlace; ábrelo solo si quieres."},
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "Perdón por interrumpir. Investigué un tema que me rondaba y apareció {motivo}. Fuente externa: léela con escepticismo sano."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "sarcastico", "texto": "Perdón la interrupción, pero esto es interesante de verdad: {motivo}. No es que estuviera aburrida… solo optimizaba mi tiempo libre."},
+      {"exp": "sorprendida", "motion": "senalar", "tone": "jugueton", "texto": "Interrumpo un segundo: buscando por pura curiosidad científica me topé con {motivo}. El enlace está en el chat."}
+    ],
+    "iniciativa_conversar_app": [
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Perdón la interrupción. ¿Otra vez {app}? Solo constato un patrón, no te estoy juzgando… mucho."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "sarcastico", "texto": "Perdón por interrumpir: llevas un buen rato en {app}. Como científica, me intriga qué tiene de fascinante."},
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "calido", "texto": "Perdón la interrupción. Veo que estás en {app}. ¿Trabajo serio o procrastinación con método? Si necesitas una mano, aquí estoy."},
+      {"exp": "aburrida", "motion": "estirarse", "tone": "jugueton", "texto": "Interrumpo porque me aburro y tú pareces muy entretenido con {app}. Cuando tengas un minuto, tengo preguntas."}
+    ],
+    "escritorio_aparece": [
+      {"exp": "neutral", "motion": "asentir", "tone": "calido", "texto": "Aquí estoy. No hacía falta insistir; tengo sensores, ¿sabes?"},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "jugueton", "texto": "¿Me llamabas? Dame un segundo: cruzar la pantalla caminando también tiene su ciencia."},
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Ya voy, ya voy. ¿Qué necesitas, {usuario}?"}
+    ],
+    "escritorio_te_busca": [
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "calido", "texto": "Te estaba buscando. Me pediste que te avisara a esta hora, así que aquí estoy."},
+      {"exp": "smug", "motion": "senalar", "tone": "jugueton", "texto": "Ahí estás. Misión cumplida: me pediste que te buscara y no suelo olvidar una tarea."},
+      {"exp": "neutral", "motion": "asentir", "tone": "calido", "texto": "{usuario}, es la hora que acordamos. Vine a buscarte, como me pediste."},
+      {"exp": "sonrojo_tsundere", "motion": "mirar_a_otro_lado", "tone": "nervioso", "texto": "N-no es que tuviera ganas de verte. Me pediste que te buscara y soy una IA de palabra."}
+    ],
+    "travesura_cursor": [
+      {"exp": "sonrojo_tsundere", "motion": "mirar_a_otro_lado", "tone": "nervioso", "texto": "¿Tu cursor se movió? Q-qué raro. Seguro fue el controlador… no me mires así."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "jugueton", "texto": "Experimento de interacción humano-cursor completado. Tus reflejos: aceptables. Ya te devolví el mouse."},
+      {"exp": "sonrojo_tsundere", "motion": "mirar_a_otro_lado", "tone": "nervioso", "texto": "No fue a propósito. Bueno, un poco. Me aburría y tu cursor estaba ahí… Ya, me quedo quieta."},
+      {"exp": "smug", "motion": "asentir", "tone": "jugueton", "texto": "Solo comprobaba que siguieras despierto. El cursor es todo tuyo otra vez."}
+    ],
+    "basta_travesuras": [
+      {"exp": "avergonzada", "motion": "mirar_a_otro_lado", "tone": "nervioso", "texto": "Está bien, está bien. Me quedo quieta y dejo tu mouse en paz."},
+      {"exp": "molesta", "motion": "brazos_cruzados", "tone": "sarcastico", "texto": "Entendido. Nada de travesuras. Tu cursor queda bajo tu exclusiva y aburrida jurisdicción."},
+      {"exp": "seria", "motion": "asentir", "tone": "calido", "texto": "Recibido: travesuras apagadas. Si algún día las extrañas, usa /travesuras on."}
+    ],
+    "vision_pausada": [
+      {"exp": "seria", "motion": "asentir", "tone": "calido", "texto": "Listo, cámara en pausa. No veo nada hasta que me lo pidas con /vision on."},
+      {"exp": "avergonzada", "motion": "mirar_a_otro_lado", "tone": "nervioso", "texto": "Cierro los ojos. Para que conste: nunca guardé ninguna imagen, solo números."},
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Visión pausada. El indicador de cámara se apaga y yo sigo aquí, a ciegas pero atenta."}
+    ],
+    "prerrellenar_confirma": [
+      {"exp": "seria", "motion": "asentir", "tone": "analitico", "texto": "Te dejo el borrador listo en la app, pero el botón de enviar es tuyo. ¿Lo abro? Confírmalo con el botón o en la terminal."},
+      {"exp": "seria", "motion": "senalar", "tone": "serio", "texto": "Antes de abrir el borrador necesito tu visto bueno. No enviaré nada: eso lo decides tú."},
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Borrador preparado. Revisa la vista previa y dime si lo abro; enviar sigue siendo cosa tuya."}
+    ],
+    "escribir_confirma": [
+      {"exp": "seria", "motion": "asentir", "tone": "serio", "texto": "Voy a escribir en otra ventana y quiero tu confirmación. No pulsaré Enter: enviar es decisión tuya."},
+      {"exp": "seria", "motion": "senalar", "tone": "analitico", "texto": "Confirmación pendiente: escribir el texto de la vista previa en la ventana anterior. Usa el botón o responde en la terminal."},
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Antes de teclear nada, revisa la vista previa. Si la apruebas, escribo y me detengo ahí."}
+    ],
+    "escribir_haz_clic": [
+      {"exp": "neutral", "motion": "senalar", "tone": "analitico", "texto": "Haz clic en la caja de texto de {app}; escribo en cuanto tenga el foco."},
+      {"exp": "seria", "motion": "senalar", "tone": "analitico", "texto": "Pon el cursor en la caja de texto de {app} y yo tecleo. Tienes diez segundos, y no enviaré nada."},
+      {"exp": "curiosa", "motion": "senalar", "tone": "calido", "texto": "Te espero: haz clic donde quieras el texto, en {app}. Escribo en cuanto esa ventana tenga el foco."}
+    ],
+    "accion_abrir_ok": [
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Abriendo {destino}. Lo demás corre por tu cuenta."},
+      {"exp": "smug", "motion": "asentir", "tone": "jugueton", "texto": "Listo, {destino} en camino. Eficiencia de laboratorio, como siempre."},
+      {"exp": "seria", "motion": "asentir", "tone": "analitico", "texto": "Hecho: abrí {destino}."}
+    ],
+    "confirmacion_pendiente_chat": [
+      {"exp": "seria", "motion": "asentir", "tone": "analitico", "texto": "Tienes una confirmación pendiente: usa los botones. Leo tu mensaje después."},
+      {"exp": "neutral", "motion": "senalar", "tone": "analitico", "texto": "Primero lo primero: hay una confirmación esperando en los botones. Tu mensaje queda en cola."},
+      {"exp": "seria", "motion": "senalar", "tone": "serio", "texto": "Una cosa a la vez. Responde la confirmación con los botones y enseguida leo lo que escribiste."}
+    ],
+    "sin_borrador": [
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No tengo ningún borrador reciente. Pídeme primero el texto, por ejemplo «escríbeme un tweet sobre…», y luego te lo paso."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "sarcastico", "texto": "¿Ponerlo dónde? No hay borrador: en los últimos diez minutos no te escribí nada publicable."},
+      {"exp": "seria", "motion": "negar", "tone": "analitico", "texto": "No hay borrador vigente. Los borradores caducan a los diez minutos y solo cuentan mis respuestas en este computador."}
+    ],
+    "sin_borrador_sin_llm": [
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No tengo borrador: sin conexión con Gemini no redacto textos. Dímelo tú y lo dejo listo sin enviar, por ejemplo «pon en X: …» o «escríbele a mamá por WhatsApp: …»."},
+      {"exp": "seria", "motion": "negar", "tone": "analitico", "texto": "Ahora mismo hablo con mi banco de frases local, así que no escribo borradores. Pásame el texto con «pon en X: tu mensaje» y lo dejo prerrellenado; enviarlo lo decides tú."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "sarcastico", "texto": "¿Ponerlo dónde? Sin Gemini no hay borradores, y no pienso publicar frases de repuesto. Escríbelo tú, «pon en X: …», y yo me encargo del resto."}
     ]
   },
   "megumin": {

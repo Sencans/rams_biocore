@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Amadeus Desktop
+Comment=Amadeus (R.A.M.S. BIO-CORE) en tu escritorio: avatar, chat y bandeja
+Exec=amadeus-desktop --hidden
+Icon=amadeus-desktop
+Terminal=false
+Categories=Utility;
+StartupWMClass=amadeus-desktop
+Keywords=amadeus;rams;avatar;chat;

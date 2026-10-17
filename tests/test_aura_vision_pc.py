@@ -677,8 +677,9 @@ def test_vistazo_ok_publica_y_no_expone_imagenes(settings_camara: Settings, bus:
     assert r.motivo == "usuario" and r.duracion_ms == 250
     nombres = [(n, d.get("activa")) for n, d, _ in eventos]
     assert nombres == [("vision.camara", True), ("vision.camara", False), ("vision.vistazo", None)]
-    assert eventos[0][1] == {"activa": True, "habilitada": True, "duracion_ms": 0}
-    assert set(eventos[1][1]) == {"activa", "habilitada", "duracion_ms"}
+    assert eventos[0][1] == {"activa": True, "habilitada": True, "duracion_ms": 0, "fuente": "vistazo"}
+    assert set(eventos[1][1]) == {"activa", "habilitada", "duracion_ms", "fuente"}
+    assert eventos[1][1]["fuente"] == "vistazo"
     assert set(eventos[2][1]) == {"rostro", "n_rostros", "duracion_ms", "brillo", "motivo", "error", "ts"}
     assert aura._ocupada is False
     correr(aura.cerrar())
@@ -1168,3 +1169,204 @@ def test_correr_cancelado_mata_y_espera_al_subproceso(correr) -> None:
     codigo, duracion = correr(principal())
     assert codigo is not None                     # el proceso terminó antes de devolver el control
     assert duracion <= aura_mod.ESPERA_SALIDA_CANCELADO_S + 1.0
+
+
+# ---------------------------------------------------------------------------
+# v0.2: delegación en la visión continua, fuente de vision.camara y Haar de OpenCV 5
+# ---------------------------------------------------------------------------
+
+
+def test_dirs_haar_incluyen_opencv5() -> None:
+    dirs = aura_mod._DIRS_HAAR_SISTEMA
+    assert "/usr/share/opencv4/haarcascades" in dirs
+    assert "/usr/share/opencv5/haarcascades" in dirs
+    assert "/usr/local/share/opencv5/haarcascades" in dirs
+
+
+def test_haar_de_opencv5_en_xobjdetect(settings_camara: Settings, tmp_path: Path,
+                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenCV 5 con contrib: la cascada vive en ``cv2.xobjdetect`` y los XML en ``opencv5``."""
+    pytest.importorskip("numpy")
+    directorio = tmp_path / "usr" / "share" / "opencv5" / "haarcascades"
+    directorio.mkdir(parents=True)
+    (directorio / "haarcascade_frontalface_default.xml").write_text("<opencv_storage/>", encoding="utf-8")
+    falso = _cv2_falso(haar_dir=tmp_path / "no_existe", caras=1)
+    cascada = falso.CascadeClassifier
+    del falso.CascadeClassifier                   # OpenCV 5 sin la clase en el núcleo
+    del falso.data                                # la rueda sin contrib no trae cv2.data.haarcascades
+    falso.xobjdetect = types.SimpleNamespace(CascadeClassifier=cascada)
+    monkeypatch.setattr(aura_mod, "cv2", falso)
+    monkeypatch.setattr(aura_mod, "_DIRS_HAAR_SISTEMA", (str(tmp_path / "nada"), str(directorio)))
+    aura = AuraVisionPC(settings_camara)
+    assert aura._ruta_haar() == directorio / "haarcascade_frontalface_default.xml"
+    r = aura._parpadeo(threading.Event())
+    assert r.rostro is True and r.n_rostros == 1
+    aura._ejecutor.shutdown(wait=False)
+
+
+def test_fuente_continua_delega_sin_abrir_ni_cupo(settings_camara: Settings, bus: BusEventos, correr,
+                                                  cv2_simulado: types.SimpleNamespace) -> None:
+    camara = _eventos(bus, "vision.camara")
+    vistazos = _eventos(bus, "vision.vistazo")
+    reloj = Reloj(1000.0)
+    aura = AuraVisionPC(settings_camara.con(camara_max_dia=1), bus, reloj=reloj)
+    abiertos: list[int] = []
+    aura._parpadeo = _parpadeo_fijo(ResultadoVistazo(False, duracion_ms=300), abiertos)  # type: ignore[method-assign]
+    motivos: list[str] = []
+
+    def fuente(motivo: str) -> ResultadoVistazo:
+        motivos.append(motivo)
+        return ResultadoVistazo(True, n_rostros=1, duracion_ms=0, brillo=0.4, motivo="otro")
+
+    aura.set_fuente_continua(fuente)
+    resultados = [correr(aura.vistazo(m)) for m in ("curiosidad", "presencia", "curiosidad", "usuario", "usuario")]
+    assert motivos == ["curiosidad", "presencia", "curiosidad", "usuario", "usuario"]
+    assert all(r.error is None and r.rostro is True and r.n_rostros == 1 for r in resultados)
+    assert [r.motivo for r in resultados] == ["curiosidad", "presencia", "curiosidad", "usuario", "usuario"]
+    assert abiertos == []                         # nunca se abrió el dispositivo
+    assert camara == []                           # ni vision.camara (lo publica la visión continua)
+    assert aura._vistazos_dia == 0 and aura._ultimo_vistazo_ts is None and aura._escalon == 0
+    assert [d["rostro"] for _, d, _ in vistazos] == [True] * 5     # un vistazo ⇒ un vision.vistazo
+    assert aura._ocupada is False
+
+    # Sin muestra de la visión continua (None) vuelve el parpadeo de la v0.1, con su fuente.
+    aura.set_fuente_continua(lambda motivo: None)
+    r = correr(aura.vistazo("curiosidad"))
+    assert r.error is None and r.rostro is False and abiertos == [1]
+    assert [(d["activa"], d["fuente"]) for _, d, _ in camara] == [(True, "vistazo"), (False, "vistazo")]
+    assert aura._vistazos_dia == 1
+    # Quitar la fuente y fijar algo no invocable no rompe nada.
+    aura.set_fuente_continua(None)
+    aura.set_fuente_continua("no invocable")  # type: ignore[arg-type]
+    assert aura._fuente_continua is None
+    correr(aura.cerrar())
+
+
+def test_fuente_continua_respeta_compuerta_e_interruptor(settings_camara: Settings, bus: BusEventos, correr,
+                                                         cv2_simulado: types.SimpleNamespace) -> None:
+    llamadas: list[str] = []
+
+    def fuente(motivo: str) -> ResultadoVistazo:
+        llamadas.append(motivo)
+        return ResultadoVistazo(True, n_rostros=1)
+
+    permisos = CompuertaPermisos(settings_camara, bus, preguntar=lambda _t: None)
+    aura = AuraVisionPC(settings_camara, bus, permisos=permisos)
+    aura.set_fuente_continua(fuente)
+    assert correr(aura.vistazo("curiosidad", origen="telegram")).error == "denegada"
+    assert correr(aura.vistazo("curiosidad", origen="nexus")).error == "denegada"
+    assert llamadas == []                         # la compuerta va antes que la fuente
+    aura.set_camara(False)
+    assert correr(aura.vistazo("usuario")).error == "camara_deshabilitada"
+    assert llamadas == []
+    aura.set_camara(True)
+    assert correr(aura.vistazo("usuario")).rostro is True and llamadas == ["usuario"]
+    correr(aura.cerrar())
+
+
+def test_fuente_continua_sin_opencv_y_fuente_rota(settings_camara: Settings, correr,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(aura_mod, "cv2", None)
+    aura = AuraVisionPC(settings_camara)
+    aura.set_fuente_continua(lambda motivo: ResultadoVistazo(None, motivo=motivo, error="ocupada"))
+    r = correr(aura.vistazo("usuario"))
+    assert r.error == "ocupada" and r.motivo == "usuario"   # el dispositivo lo tiene la visión continua
+
+    def rota(motivo: str) -> ResultadoVistazo:
+        raise RuntimeError("fuente rota")
+
+    aura.set_fuente_continua(rota)
+    assert correr(aura.vistazo("usuario")).error == "sin_opencv"   # sin fuente útil ni cv2
+    correr(aura.cerrar())
+
+
+def test_fuente_continua_con_vision_continua_real(settings_camara: Settings, bus: BusEventos, correr,
+                                                  cv2_simulado: types.SimpleNamespace) -> None:
+    """Integración con ``VisionContinua.como_vistazo``: sin cámara continua abierta ⇒ parpadeo normal."""
+    from lobes.vision_continua import MuestraCamara, VisionContinua
+
+    reloj = Reloj(50.0)
+    vision = VisionContinua(settings_camara.con(vision_continua=True), bus, reloj=reloj)
+    aura = AuraVisionPC(settings_camara, bus, reloj=reloj)
+    abiertos: list[int] = []
+    aura._parpadeo = _parpadeo_fijo(ResultadoVistazo(False), abiertos)  # type: ignore[method-assign]
+    aura.set_fuente_continua(vision.como_vistazo)
+    assert correr(aura.vistazo("usuario")).rostro is False and abiertos == [1]
+    # La visión continua abre la cámara y entrega una muestra con una cara.
+    vision._detector_tipo = "yunet"
+    vision._al_camara_abierta(vision._gen_cam, "yunet")
+    vision._al_muestra_camara(vision._gen_cam, MuestraCamara(
+        ts=0.0, rostro=True, n=1, u=0.5, v=0.5, dist_m=0.7, yaw_r=0.0, pitch_r=0.5, frontal=True,
+        mov=0.0, brillo=0.5, score=0.9, ms_proc=3.0))
+    reloj.t += 0.4
+    r = correr(aura.vistazo("curiosidad"))
+    assert r.rostro is True and r.n_rostros == 1 and r.motivo == "curiosidad" and r.error is None
+    assert abiertos == [1]
+    correr(aura.cerrar())
+
+
+
+def test_fuente_continua_en_pausa_o_abriendo_no_deja_abrir_la_camara(
+        settings_camara: Settings, bus: BusEventos, correr, cv2_simulado: types.SimpleNamespace) -> None:
+    """"Deja de mirarme" y el hilo continuo abriendo el dispositivo: aura no parpadea por su cuenta."""
+    from lobes.vision_continua import VisionContinua
+
+    reloj = Reloj(50.0)
+    vision = VisionContinua(settings_camara.con(vision_continua=True), bus, reloj=reloj)
+    vision._leer_entorno = lambda: {}  # type: ignore[method-assign]
+    aura = AuraVisionPC(settings_camara, bus, reloj=reloj)
+    abiertos: list[int] = []
+    aura._parpadeo = _parpadeo_fijo(ResultadoVistazo(True, n_rostros=1), abiertos)  # type: ignore[method-assign]
+    aura.set_fuente_continua(vision.como_vistazo)
+    vision.pausar(None, "usuario")
+    for motivo in ("curiosidad", "presencia"):
+        r = correr(aura.vistazo(motivo))
+        assert r.error == "denegada" and r.rostro is None and r.motivo == motivo
+    assert abiertos == [] and aura._vistazos_dia == 0
+    # Lo pide el usuario ahora, explícitamente: parpadeo normal de la v0.1.
+    assert correr(aura.vistazo("usuario")).rostro is True and abiertos == [1]
+    # El hilo continuo existe pero aún no abrió (o está liberando): aura no abre a la vez.
+    vision.reanudar()
+    soltar = threading.Event()
+    vision._hilo_cam = threading.Thread(target=soltar.wait, args=(5.0,), daemon=True)
+    vision._hilo_cam.start()
+    reloj.t += 3600.0
+    try:
+        assert correr(aura.vistazo("presencia")).error == "ocupada" and abiertos == [1]
+    finally:
+        soltar.set()
+        vision._hilo_cam.join(1.0)
+    vision._hilo_cam = None
+    correr(aura.cerrar())
+
+
+def test_yunet_de_la_guia_con_opencv5(settings_camara: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    """OpenCV 5 de pip (sin Haar): aura encuentra el ``face_detection_yunet_2023mar.onnx`` de la guía."""
+    from lobes.vision_continua import ruta_modelo_yunet
+
+    falso = types.SimpleNamespace(__name__="cv2_simulado", __version__="5.0.0", FaceDetectorYN=object)
+    monkeypatch.setattr(aura_mod, "cv2", falso)
+    modelos = settings_camara.data_dir / "models"
+    modelos.mkdir(parents=True, exist_ok=True)
+    aura = AuraVisionPC(settings_camara)
+    assert aura._ruta_yunet() is None and aura._tipo_detector() is None
+    (modelos / "face_detection_yunet_2023mar.onnx").write_bytes(b"")
+    (modelos / "face_detection_yunet_2023mar_int8.onnx").write_bytes(b"")
+    assert aura._ruta_yunet() == modelos / "face_detection_yunet_2023mar.onnx"
+    assert aura._tipo_detector() == "yunet"
+    assert aura._ruta_yunet() == ruta_modelo_yunet(settings_camara.data_dir, mayor=5)   # misma elección
+    # settings.vision_modelo manda, como en la visión continua.
+    explicito = modelos / "mi_modelo.onnx"
+    explicito.write_bytes(b"")
+    aura_explicita = AuraVisionPC(settings_camara.con(vision_modelo=explicito))
+    assert aura_explicita._ruta_yunet() == explicito
+    # El nombre corto de la v0.1 sigue valiendo.
+    for viejo in modelos.glob("face_detection_yunet_2023mar*.onnx"):
+        viejo.unlink()
+    (modelos / "face_detection_yunet.onnx").write_bytes(b"")
+    assert aura._ruta_yunet() == modelos / "face_detection_yunet.onnx"
+    # Sin FaceDetectorYN no hay YuNet aunque esté el modelo.
+    monkeypatch.setattr(aura_mod, "cv2", types.SimpleNamespace(__name__="cv2_simulado", __version__="5.0.0"))
+    assert aura._ruta_yunet() is None
+    aura._ejecutor.shutdown(wait=False)
+    aura_explicita._ejecutor.shutdown(wait=False)

@@ -6,6 +6,13 @@ usuario: estilo, muletillas (n-gramas con *lift* frente a la línea base ajena),
 saludos y despedidas. El resultado es el **recuerdo heredado** de Amadeus: conoce al usuario
 por datos, no por haberlo vivido (como Amadeus Kurisu con Okabe).
 
+Muletillas ≠ temas: una muletilla es un **marcador discursivo**, interjección, relleno o risa
+(léxico curado del español coloquial de Colombia en :data:`MARCADORES_ES`, alargamientos como
+"hmm"/"siii"/"nooo", risas y "teclazos" tipo ``kakfkak``). Las palabras de contenido
+("dinero", "precios"…) solo pueden salir en ``temas``. Los teclazos se agrupan en una única
+entrada legible (``"risa de teclazo (kakfkak)"``) y se cuentan en ``estilo["risa_teclazo"]``
+(fuera de ``estilo.risa``, que conserva sus cuatro claves de §10.9).
+
 Privacidad (§9.6): todo se procesa en local. El perfil **no** guarda mensajes, nombres de
 archivos, nombres de participantes (tampoco el del propio usuario), nombres de personas
 mencionadas, números de 7 o más dígitos, correos ni URLs. Los mensajes ajenos solo sirven como
@@ -26,6 +33,7 @@ reintentan con ``utf-8-sig`` y luego con ``latin-1``.
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import logging
 import math
@@ -47,6 +55,10 @@ __all__ = [
     "IOS_RE",
     "STOPWORDS_ES",
     "NOMBRES_COMUNES_ES",
+    "MARCADORES_ES",
+    "EXPRESIONES_COLOQUIALES",
+    "CLAVE_RISA_TECLAZO",
+    "ETIQUETA_TECLAZO",
     "normalizar_linea",
     "parsear_lineas",
     "parsear_archivo",
@@ -79,6 +91,9 @@ IOS_RE: Final = re.compile(
 _RE_INVISIBLES: Final = re.compile("[‎‏‪-‮﻿]")
 _RE_EDITADO: Final = re.compile(r"\s*<\s*(?:se edit[óo] este mensaje|this message was edited)\.?\s*>\s*$", re.I)
 _RE_TOKEN: Final = re.compile(r"[a-záéíóúñü]+")
+# Muletillas: las cifras también son tokens (nunca admisibles) para que "ps5" no deje un "ps"
+# suelto ni "10 mm" un "mm", y para que ningún n-grama salte por encima de un número.
+_RE_TOKEN_MULETILLA: Final = re.compile(r"[a-záéíóúñü0-9]+")
 _RE_PALABRA: Final = re.compile(r"[^\W\d_]+")            # palabra con su forma original (mayúsculas)
 _RE_NOMBRE_AUTOR: Final = re.compile(r"[^\W_]+")          # tokens (letras o dígitos) de un nombre
 _RE_MENCION: Final = re.compile(r"@(\w+)")
@@ -99,14 +114,45 @@ _RE_EMOJI: Final = re.compile(
     "\U0001FA70-\U0001FAFF☀-⛿✀-➿⭐⭕‼⁉]")
 _MODIFICADORES_EMOJI: Final = frozenset(chr(c) for c in range(0x1F3FB, 0x1F400))
 
-# Risas (§10.9: ja(ja)+ → jaja, je(je)+ → jeje, (js)+ → jsjs, x+d+ → xd); se tolera una j final.
+# Risas (§10.9: ja(ja)+ → jaja, je(je)+ → jeje, (js)+ → jsjs, x+d+ → xd); se tolera una j final
+# y, en "jaja", una "a" inicial ("ajajaja"). Se comparan sin tildes ("jajajá").
 _RISAS_RE: Final = (
-    (re.compile(r"ja(?:ja)+j?"), "jaja"),
+    (re.compile(r"a?ja(?:ja)+j?"), "jaja"),
     (re.compile(r"je(?:je)+j?"), "jeje"),
     (re.compile(r"(?:js)+j?"), "jsjs"),
     (re.compile(r"x+d+"), "xd"),
 )
 RISAS: Final = ("jaja", "jeje", "jsjs", "xd")
+
+# Otras risas escritas: cuentan como muletilla, pero no tienen clave propia en ``estilo.risa``.
+_RISAS_EXTRA_RE: Final = (
+    (re.compile(r"ha(?:ha)+h?"), "haha"),
+    (re.compile(r"he(?:he)+h?"), "hehe"),
+    (re.compile(r"ji(?:ji)+j?"), "jiji"),
+    (re.compile(r"jo(?:jo)+j?"), "jojo"),
+    (re.compile(r"ju(?:ju)+j?"), "juju"),
+    (re.compile(r"(?:rs){2,}r?"), "rsrs"),
+    (re.compile(r"lo+l"), "lol"),
+    (re.compile(r"lmf?ao+"), "lmao"),
+)
+_RISAS_EXTRA: Final[frozenset[str]] = frozenset(canonico for _, canonico in _RISAS_EXTRA_RE)
+
+# Teclazo (keysmash): risa escrita aporreando el teclado ("kakfkak", "asdfgh", "skjsks").
+# Su conteo va en ``estilo["risa_teclazo"]``, fuera de ``estilo.risa`` (§10.9: solo jaja/jeje/
+# jsjs/xd): quien toma la clave mayor de ``risa`` como "risa escrita más habitual" diría si no
+# que el usuario escribe «teclazo».
+CLAVE_RISA_TECLAZO: Final = "risa_teclazo"       # clave de ``estilo`` con el conteo de teclazos
+_CLAVE_TECLAZO_EN_RISA: Final = "teclazo"        # ubicación antigua (dentro de ``estilo.risa``)
+ETIQUETA_TECLAZO: Final = "risa de teclazo"      # entrada agrupada en ``muletillas``
+_CLAVE_TECLAZO: Final = "#teclazo"               # clave interna (nunca coincide con un token)
+_MAX_EJEMPLO_TECLAZO: Final = 12                 # letras máximas del ejemplo en la etiqueta
+_MIN_VECES_EJEMPLO_TECLAZO: Final = 2            # privacidad: solo variantes repetidas
+_MIN_TECLAZOS_RESUMEN: Final = 2
+_RE_ETIQUETA_TECLAZO: Final = re.compile(r"risa de teclazo(?: \((?P<ejemplo>[a-z]{1,20})\))?")
+_RE_RACHA: Final = re.compile(r"(.)\1+")
+_RE_RACHA_LARGA: Final = re.compile(r"(.)\1{2,}")
+# Fronteras de cláusula para decidir si un marcador ambiguo ("este", "tipo", "ya") va suelto.
+_RE_CORTE_CLAUSULA: Final = re.compile(r"[\n.!?¿¡,;:…()\[\]\"«»“”]+")
 
 MARCADORES_MULTIMEDIA: Final = (
     "<multimedia omitido>", "<media omitted>", "imagen omitida", "audio omitido", "video omitido",
@@ -159,11 +205,98 @@ INTERJECCIONES: Final[frozenset[str]] = frozenset("""
 ay ayy uy uyy ah oh eh uf uff ufff ups wow ole aja mmm hmm uish ush upa epa hey bah puf ojala jum
 """.split())
 
-# n-gramas formados solo por stopwords que en es-CO sí funcionan como muletillas.
+# Marcadores discursivos, interjecciones, rellenos y vocativos coloquiales (es-CO) que cuentan
+# como muletilla en cualquier posición. Normalizados (minúsculas, sin tildes) y sin letras
+# repetidas: "hmm" → "hm", "uff" → "uf"; los alargamientos ("buenooo") caen en su base.
+MARCADORES_ES: Final[frozenset[str]] = frozenset(
+    m for m in (_RE_RACHA.sub(r"\1", p) for p in (INTERJECCIONES | frozenset("""
+bueno claro osea pues pue pos dale listo okey okay ok oki okis oka okas na nah nel nop nope sip sipi
+sisas sisa aja aha ajam obvio obviamente literal literalmente exacto exactamente efectivamente
+parce parcero parcera parcerito marica mk mka marik bro broder brother manito mijo mija mijito
+mijita pana bacano bacana chevere melo genial perfecto excelente tranqui hagale hagamosle quiubo
+quiubos quihubo porfa porfis porfi plis oye oiga ey hey ay uy ah eh oh uh uf hm pf ps pst aw agh
+argh ugh ups wow guau uau ole jum bah puf uish ush ufa uju yuju upa epa erda ombe nojoda juemadre
+jueputa hijueputa ojala
+""".split()))) if len(m) >= 2)
+
+# Marcadores ambiguos: también son palabras corrientes ("este precio", "ya llegué", "tipo de
+# cambio", "cuánto vale"). Solo cuentan como muletilla sueltos en su cláusula ("este... no sé",
+# "tipo, ni idea", "ya ya", "bueno ya"; no en "bueno, ya llegué") o alargados ("esteee"), y lo
+# mismo dentro de un n-grama.
+_MARCADORES_AMBIGUOS: Final[frozenset[str]] = frozenset("""
+este tipo nada ya va vale mira mire vea venga verdad cierto ojo pilas fijo fresco super severo
+brutal chimba hermano hermana mano socio viejo llave buena hp entonces igual total
+""".split())
+# Ambiguos que también son marcador al abrir cláusula ("entonces qué", "igual no importa",
+# "total que no fui"), salvo si los sigue una comparación o una cantidad ("igual que ayer",
+# "igual de caro", "total a pagar", "total de la cuenta") o un número ("total: 50 mil").
+_MARCADORES_DE_INICIO: Final[frozenset[str]] = frozenset({"entonces", "igual", "total"})
+_NO_SIGUEN_AL_MARCADOR_DE_INICIO: Final[Mapping[str, frozenset[str]]] = {
+    "igual": frozenset({"que", "a", "al", "de", "del"}),
+    "total": frozenset({"a", "al", "de", "del"}),
+}
+# Tras un artículo o una preposición, un marcador funciona como sustantivo o adjetivo ("el ups
+# del pc", "llegó por ups", "el pos", "dame el ok", "lo bueno es que"); tras un número, como
+# unidad ("10 mm"). Ahí no es muletilla.
+_ANTES_DE_USO_NOMINAL: Final[frozenset[str]] = frozenset(
+    "el la los las lo un una unos unas del al de en por con sin para pa".split())
+# Interjecciones que solo lo son alargadas ("grrr", "brrr", "shhh"): "gr" suelto es "gramos".
+_INTERJ_SOLO_ALARGADAS: Final[frozenset[str]] = frozenset({"gr", "br", "sh"})
+# Palabras que se alargan con solo una letra repetida ("sii", "noo", "yaa"); el resto necesita
+# una racha de 3 ("queee") para no confundir "lee" con un "le" alargado.
+_ALARGABLES_CORTOS: Final[frozenset[str]] = (_MARCADORES_AMBIGUOS | _INTERJ_SOLO_ALARGADAS
+                                             | frozenset({"si", "no"}))
+# Variantes de la duda ("hmm", "mmm", "ehm", "ammm") agrupadas en una sola muletilla.
+_ALIAS_DUDA: Final[frozenset[str]] = frozenset({"m", "mh", "hm", "hum", "uhm", "ehm"})
+_ALIAS_DUDA_ALARGADA: Final[frozenset[str]] = frozenset({"am", "em", "um"})   # solo "amm", "emm"…
+# Palabras que pueden repetirse como muletilla aunque solas sean funcionales ("sí sí", "no no").
+_REPETIBLES: Final[frozenset[str]] = frozenset({"si", "no"})
+
+# n-gramas que en es-CO funcionan como muletilla aunque lleven palabras funcionales o de
+# contenido ("o sea", "la verdad", "no sé", "qué pena"). Normalizados (sin tildes).
 EXPRESIONES_COLOQUIALES: Final[frozenset[str]] = frozenset({
-    "de una", "que mas", "no mas", "nada mas", "para nada", "por eso", "asi es", "eso si", "ya que",
+    "de una", "que mas", "no mas", "nada mas", "para nada", "por eso", "asi es", "eso si",
     "de una vez", "con todo", "si o que", "si o no",
+    "o sea", "o sea que", "osea que", "la verdad", "de verdad", "en serio", "es que", "no se",
+    "yo que se", "ni idea", "ni modo", "a ver", "vamos a ver", "en fin", "mejor dicho", "de pronto",
+    "de malas", "a lo bien", "todo bien", "a la orden", "con gusto", "mas o menos", "por fa",
+    "que pena", "que pereza", "que chimba", "que bacano", "que chevere", "que nota", "que oso",
+    "que boleta", "que mamera", "que jartera", "que vaina", "que bien", "que mas pues", "que hubo",
+    "y nada", "y bueno", "y pues", "pues si", "pues no", "no pues", "ay no", "ay si", "uy no",
+    "uy si", "ah si", "ah no", "si claro", "claro que si", "claro que no", "si senor", "no senor",
+    "como asi", "como que", "nada que ver", "no pasa nada", "no hay problema", "no joda", "eso es",
+    "ahi vamos",
 })
+
+# Expresiones que también son secuencias corrientes ("no se puede", "voy a ver la serie", "la casa
+# de una amiga", "lo que más me gusta"): solo cuentan en su contexto de muletilla. Cada regla es
+# ``(antes, después)``: las palabras admitidas justo antes y justo después dentro de la cláusula,
+# además del borde de la cláusula y de otros marcadores, risas o alargamientos; ``None`` = cualquiera.
+_INTERROGATIVOS: Final[frozenset[str]] = frozenset(
+    "que si como cuando donde quien quienes cual cuales cuanto cuanta cuantos cuantas porque pa para".split())
+_ABREN_CLAUSULA: Final[frozenset[str]] = frozenset({"y", "pero"})
+_CONTEXTO_EXPRESIONES: Final[Mapping[str, tuple[frozenset[str] | None, frozenset[str] | None]]] = {
+    # "no sé (qué/si/cómo…)", sí; "no se puede", "no se dio", "no se me ocurre" (pronombre "se"), no.
+    "no se": (None, _INTERROGATIVOS | {"nada", "bien", "ni", "mucho", "nunca"}),
+    # "a ver, ¿qué pasó?" abre la cláusula; "voy a ver la serie", "fui a ver el partido", no.
+    "a ver": (_ABREN_CLAUSULA, None),
+    "vamos a ver": (_ABREN_CLAUSULA, _INTERROGATIVOS),
+    # "de una" (claro, enseguida) cierra la cláusula o va antes de un verbo; "de una amiga", no.
+    "de una": (None, frozenset({"me", "te", "se", "nos", "le", "les", "lo", "y", "vamos", "voy"})),
+    # "¿qué más?" (saludo), sí; "lo que más me gusta", "qué más quieres", no.
+    "que mas": (_ABREN_CLAUSULA | {"hola", "buenas", "buenos", "ey"}, frozenset({"como", "y"})),
+    # "es que…", "la verdad…" al abrir; "lo malo es que", "dime la verdad", no.
+    "es que": (_ABREN_CLAUSULA | {"no", "si", "que"}, None),
+    "la verdad": (_ABREN_CLAUSULA | {"no", "si", "que"}, None),
+    # Respuestas que cierran la cláusula ("así es", "eso sí que no"); "así es la vida", no.
+    "asi es": (None, frozenset()),
+    "eso es": (None, frozenset()),
+    "eso si": (None, frozenset({"que"})),
+    "ahi vamos": (None, frozenset()),
+    "con todo": (None, frozenset()),
+}
+# Formas con tilde que deshacen la ambigüedad: "no sé" siempre es la muletilla.
+_EXPRESIONES_CON_TILDE: Final[Mapping[str, tuple[str, ...]]] = {"no se": ("no", "sé")}
 
 NOMBRES_COMUNES_ES: Final[frozenset[str]] = frozenset("""
 juan jose luis carlos jorge andres diego david daniel alejandro santiago sebastian felipe camilo julian
@@ -222,10 +355,175 @@ def _sin_tildes(texto: str) -> str:
 
 
 def _normalizar_risa(token: str) -> str:
+    """La risa canónica de :data:`RISAS` si ``token`` lo es (sin mirar tildes); si no, ``token``."""
+    base = _sin_tildes(token)
     for patron, canonico in _RISAS_RE:
-        if patron.fullmatch(token):
+        if patron.fullmatch(base):
             return canonico
     return token
+
+
+# --- Teclazos (keysmash) ---------------------------------------------------
+# Una palabra es "pronunciable" si se puede partir en sílabas (ataque + núcleo + coda) con
+# grupos consonánticos del español o del inglés de uso corriente (para no tomar "whatsapp",
+# "flash", "snacks" o "graph" por teclazos). "kakfkak" no lo es: ni "kf" ni "fk" son coda o
+# ataque posibles. El silabeo es una programación dinámica por posición (O(n·k), sin la
+# vuelta atrás exponencial de una regex con cuantificadores anidados).
+_ATAQUES: Final[frozenset[str]] = frozenset("""
+scr skr spr spl squ str shr thr chr sch bl br cl cr fl fr gl gr kl kr pl pr dr tr dw gw kw tw
+ch ll rr qu gu th sh ph wh wr kn gn ps ts tz tl kh gh dh bh zh dj sc sk sm sn sp st sw sl
+b c d f g h j k l m n p q r s t v w x y z
+""".split())
+_CODAS: Final[frozenset[str]] = frozenset([
+    *"ght tch nch rch nds nts nks rts rds rks sts rst rld ngth".split(),
+    *"ck ch sh th kh ph gn ng nk mp mb ft pt ct kt st sk sp xt pp ss ll ff tt zz cc dd gg bb mm nn rr".split(),
+    *(a + b for a in "lnr" for b in "bcdfgklmnpstvz"),               # "ld", "lk", "nt", "rk"…
+    *(a + b for a in "lnr" for b in ("sh", "ch", "th", "ph")),        # "harsh", "health", "morph"
+    *(a + "s" for a in "bcdfgkmpt"),
+    *"bcdfghjklmnprstxz",
+])
+_LARGOS_ATAQUE: Final = tuple(sorted({len(a) for a in _ATAQUES}))
+_LARGOS_CODA: Final = tuple(sorted({len(c) for c in _CODAS}))
+_VOCALES: Final[frozenset[str]] = frozenset("aeiou")
+_VOCALES_FUERA_DE_FILA: Final[frozenset[str]] = frozenset("eiou")   # la fila central solo tiene la "a"
+_FILA_CENTRAL: Final[frozenset[str]] = frozenset("asdfghjkl")       # donde caen los dedos al reír
+_FILAS_SEGUIDAS: Final = ("asdfghjkl", "lkjhgfdsa")                  # "asdf", "jkl", "lkjh"…
+_RE_TECLAZO_CORTO: Final = re.compile(r"([sdfghjkl])(?!\1)([sdfghjkl])\1\2")   # "ksks", "kdkd"
+_ABREVIATURAS: Final[frozenset[str]] = frozenset("""
+slds sldos nmms ntp tqm tkm pls plz msj msjs bss dnd xq pq tmb tbn bn hdp alv dlv ptm omg wtf lol
+lmao lmfao btw idk brb nvm thx pfvr xfa xfavor grax grx kpsa qhubo
+""".split())
+
+
+def _finales_de_silaba(palabra: str, inicio: int) -> set[int]:
+    """Posiciones donde puede acabar una sílaba (ataque? + núcleo + coda?) que empieza en ``inicio``.
+
+    Núcleo: una o más vocales con una ``w``/``y`` final opcional ("aw", "ay"), o una ``y`` sola.
+    Al final de la palabra se admite una ``s`` de plural tras la coda ("snacks", "calls", "fields").
+    """
+    n = len(palabra)
+    finales: set[int] = set()
+    ataques = [inicio] + [inicio + k for k in _LARGOS_ATAQUE
+                          if inicio + k <= n and palabra[inicio:inicio + k] in _ATAQUES]
+    for tras_ataque in ataques:
+        nucleos: list[int] = []
+        if tras_ataque < n and palabra[tras_ataque] == "y":
+            nucleos.append(tras_ataque + 1)
+        posicion = tras_ataque
+        while posicion < n and palabra[posicion] in _VOCALES:
+            posicion += 1
+            nucleos.append(posicion)
+            if posicion < n and palabra[posicion] in "wy":
+                nucleos.append(posicion + 1)
+        for tras_nucleo in nucleos:
+            finales.add(tras_nucleo)
+            for k in _LARGOS_CODA:
+                if tras_nucleo + k <= n and palabra[tras_nucleo:tras_nucleo + k] in _CODAS:
+                    finales.add(tras_nucleo + k)
+                    if tras_nucleo + k == n - 1 and palabra[-1] == "s":
+                        finales.add(n)
+    return finales
+
+
+def _silabeable(palabra: str) -> bool:
+    """``True`` si ``palabra`` se puede partir entera en sílabas (programación dinámica de derecha
+    a izquierda: ``alcanzable[i]`` dice si ``palabra[i:]`` se puede silabear)."""
+    n = len(palabra)
+    alcanzable = [False] * (n + 1)
+    alcanzable[n] = True
+    for i in range(n - 1, -1, -1):
+        alcanzable[i] = any(alcanzable[fin] for fin in _finales_de_silaba(palabra, i))
+    return alcanzable[0]
+
+
+@functools.lru_cache(maxsize=16384)
+def _es_teclazo(token: str) -> bool:
+    """``True`` si ``token`` (normalizado) es un teclazo: risa de letras sin estructura silábica.
+
+    Exige ≥ 5 letras (o 4 en patrón alterno, "ksks", o seguidas en la fila central, "asdf"),
+    ninguna vocal distinta de la "a" (la única de la fila central: "gmail", "skills" o "fields"
+    son palabras), mayoría de letras de la fila central del teclado (o muy pocas letras
+    distintas, como "wkwkwk") y que no se pueda silabear. Así "kakfkak", "asdfgh" o "skjsks"
+    son teclazos, pero "salsa", "kafka", "flash", "whatsapp", "snacks" o "calls" no.
+    """
+    n = len(token)
+    if n < 4 or not token.isascii() or not token.isalpha() or token in _ABREVIATURAS:
+        return False
+    if _VOCALES_FUERA_DE_FILA.intersection(token):
+        return False
+    if n == 4:
+        return (_RE_TECLAZO_CORTO.fullmatch(token) is not None
+                or any(token in fila for fila in _FILAS_SEGUIDAS))
+    muestra = token[:40]
+    fila = sum(c in _FILA_CENTRAL for c in muestra) / len(muestra)
+    if fila < 0.6 and not (n >= 6 and len(set(muestra)) / len(muestra) <= 0.4):
+        return False
+    return not _silabeable(muestra)
+
+
+def _sin_alargar(token: str, doble_final: bool) -> str:
+    """``token`` sin alargamientos: cada racha de 3 o más letras queda en una ("peeero" → "pero")
+    y, con ``doble_final``, también la letra doble del final ("sii" → "si"). Una doble letra en
+    mitad de palabra no es alargamiento ("valle", "pillas", "ssh")."""
+    base = _RE_RACHA_LARGA.sub(r"\1", token)
+    if doble_final and len(base) >= 2 and base[-1] == base[-2]:
+        base = base[:-1]
+    return base
+
+
+@functools.lru_cache(maxsize=16384)
+def _clave_base(token: str) -> str:
+    """Clave de muletilla de un token normalizado (minúsculas, sin tildes).
+
+    - Risas → su forma canónica ("jajajaj" → "jaja", "hahaha" → "haha").
+    - Teclazos → una clave común (todas las variantes cuentan juntas).
+    - Dudas ("hmm", "mmm", "ehm", "ammm") → ``"hm"``.
+    - Marcadores (con o sin alargar: "buenooo") → su forma de :data:`MARCADORES_ES`.
+    - Palabras funcionales o marcadores ambiguos alargados ("siii", "nooo", "esteee") → base + ``"~"``.
+      Solo es alargamiento una racha de 3 letras o, en :data:`_ALARGABLES_CORTOS`, la letra final
+      doblada ("sii", "estee"); "valle", "pillas" o "ssh" son palabras, no "vale"/"pilas"/"sh".
+    - Cualquier otra palabra → ella misma.
+    """
+    if len(token) < 2:
+        return token
+    for patron, canonico in _RISAS_RE + _RISAS_EXTRA_RE:
+        if patron.fullmatch(token):
+            return canonico
+    colapsado = _RE_RACHA.sub(r"\1", token)
+    alargado = colapsado != token
+    if colapsado in _ALIAS_DUDA or (alargado and colapsado in _ALIAS_DUDA_ALARGADA):
+        return "hm"
+    if colapsado in MARCADORES_ES:
+        return colapsado
+    if (alargado and (colapsado in STOPWORDS_ES or colapsado in _ALARGABLES_CORTOS)
+            and _sin_alargar(token, colapsado in _ALARGABLES_CORTOS) == colapsado):
+        return colapsado + "~"
+    if _es_teclazo(token):
+        return _CLAVE_TECLAZO
+    return token
+
+
+def _clase_clave(clave: str) -> str:
+    """Clase de una clave: ``T`` teclazo, ``R`` risa, ``A`` alargamiento, ``M`` marcador,
+    ``m`` marcador ambiguo, ``F`` palabra funcional, ``C`` contenido (o ambiguo fuera de contexto)."""
+    if clave == _CLAVE_TECLAZO:
+        return "T"
+    if clave in RISAS or clave in _RISAS_EXTRA:
+        return "R"
+    if clave.endswith("~"):
+        return "A"
+    if clave in MARCADORES_ES:
+        return "M"
+    if clave in _MARCADORES_AMBIGUOS:
+        return "m"
+    if clave in STOPWORDS_ES:
+        return "F"
+    return "C"
+
+
+def _es_muletilla_lexica(token: str) -> bool:
+    """``True`` si el token normalizado es risa, teclazo, alargamiento o marcador inequívoco."""
+    return _clase_clave(_clave_base(token)) in ("T", "R", "A", "M")
 
 
 def _texto_tokenizable(texto: str) -> str:
@@ -468,45 +766,180 @@ def agrupar_rafagas(mensajes: Sequence[MensajeWsp], autor: str, gap_s: float = 1
 # ---------------------------------------------------------------------------
 
 
-def _contar_ngramas(textos: Sequence[str]) -> tuple[Counter[tuple[str, ...]], dict[tuple[str, ...], Counter[str]]]:
-    """Conteo de n-gramas (1–3) por clave normalizada y sus formas de superficie."""
+def _tiene_digito(token: str) -> bool:
+    return any(c.isdigit() for c in token)
+
+
+def _es_marcador_o_risa(clave: str) -> bool:
+    """Risa, teclazo, alargamiento o marcador (también ambiguo): vecino neutro de una muletilla."""
+    return _clase_clave(clave) in ("T", "R", "A", "M", "m")
+
+
+def _marcador_en_contexto(claves: Sequence[str], i: int, siguiente: str | None) -> bool:
+    """¿Funciona como muletilla el marcador ``claves[i]`` de esta cláusula?
+
+    - Nunca en uso nominal: tras un artículo o una preposición ("el ups", "lo bueno", "por el
+      pos") o tras un número ("10 mm").
+    - Los ambiguos ("este", "tipo", "ya"…), solo sueltos en su cláusula (junto a otros
+      marcadores, risas o a sí mismos) o, "entonces"/"igual"/"total", abriéndola sin una
+      comparación o cantidad detrás. Si el siguiente token del mensaje (aunque esté tras una
+      coma o dos puntos) es un número, "igual"/"total" son cantidad: "total: 50 mil".
+    """
+    clave = claves[i]
+    if i > 0 and (_tiene_digito(claves[i - 1]) or (
+            claves[i - 1] in _ANTES_DE_USO_NOMINAL
+            and not any(" ".join(claves[i - k:i]) in EXPRESIONES_COLOQUIALES for k in (2, 3) if i >= k))):
+        return False                     # "el ups", "10 mm"; pero "de una parce" ("una" no es artículo)
+    if clave not in _MARCADORES_AMBIGUOS:
+        return True
+    if clave in _MARCADORES_DE_INICIO and siguiente is not None and _tiene_digito(siguiente):
+        return False
+    if (i == 0 and clave in _MARCADORES_DE_INICIO
+            and (len(claves) == 1 or claves[1] not in _NO_SIGUEN_AL_MARCADOR_DE_INICIO.get(clave, ()))):
+        return True
+    return all(otra == clave or _clase_clave(otra) in ("T", "R", "A", "M")
+               for j, otra in enumerate(claves) if j != i)
+
+
+def _clausulas_muletilla(texto: str, excluir: frozenset[str] | set[str]) -> list[list[tuple[str, str, bool]]]:
+    """Cláusulas del mensaje, cada una con ``(superficie, clave, en_contexto)`` por token.
+
+    ``superficie`` es el token en minúsculas (con la risa normalizada); ``clave``, la de
+    :func:`_clave_base` (los tokens de ``excluir`` y los que llevan cifras se quedan tal cual:
+    "ps5" nunca es "ps"); ``en_contexto`` dice si un marcador funciona aquí como muletilla (ver
+    :func:`_marcador_en_contexto`). Para risas, alargamientos y palabras corrientes es ``True``.
+    """
+    limpio = _texto_tokenizable(str(texto)).lower()
+    crudas = [[_normalizar_risa(t) for t in _RE_TOKEN_MULETILLA.findall(c)]
+              for c in _RE_CORTE_CLAUSULA.split(limpio)]
+    crudas = [c for c in crudas if c]
+    todas = [t for c in crudas for t in c]
+    salida: list[list[tuple[str, str, bool]]] = []
+    posicion = 0                                 # índice global del primer token de la cláusula
+    for superficies in crudas:
+        claves: list[str] = []
+        for superficie in superficies:
+            normal = _sin_tildes(superficie)
+            claves.append(normal if normal in excluir or _tiene_digito(normal) else _clave_base(normal))
+        clausula: list[tuple[str, str, bool]] = []
+        for i, (superficie, clave) in enumerate(zip(superficies, claves)):
+            contexto = True
+            if _clase_clave(clave) in ("M", "m"):
+                siguiente = todas[posicion + i + 1] if posicion + i + 1 < len(todas) else None
+                contexto = _marcador_en_contexto(claves, i, siguiente)
+            clausula.append((superficie, clave, contexto))
+        salida.append(clausula)
+        posicion += len(superficies)
+    return salida
+
+
+def _expresion_en_contexto(expresion: str, clausula: Sequence[tuple[str, str, bool]], i: int, n: int) -> bool:
+    """¿Es muletilla la expresión que ocupa ``clausula[i:i+n]``? Ver :data:`_CONTEXTO_EXPRESIONES`.
+
+    Un vecino vale si es borde de cláusula, una palabra admitida por la regla o un marcador,
+    risa o alargamiento **en su contexto** ("lo bueno es que" no abre "es que": ahí "bueno" es
+    adjetivo).
+    """
+    regla = _CONTEXTO_EXPRESIONES.get(expresion)
+    if regla is None or tuple(t[0] for t in clausula[i:i + n]) == _EXPRESIONES_CON_TILDE.get(expresion):
+        return True
+    antes, despues = regla
+    for posicion, admitidas in ((i - 1, antes), (i + n, despues)):
+        if admitidas is None or not 0 <= posicion < len(clausula):
+            continue
+        _, vecino, contexto = clausula[posicion]
+        if vecino not in admitidas and not (contexto and _es_marcador_o_risa(vecino)):
+            return False
+    return True
+
+
+def _contar_ngramas(textos: Sequence[str], excluir: frozenset[str] | set[str] = frozenset(), *,
+                    con_formas: bool = True) -> tuple[Counter[tuple[str, ...]], dict[tuple[str, ...], Counter[str]]]:
+    """Conteo de n-gramas (1–3) por clave de muletilla y, si se piden, sus formas de superficie.
+
+    Los n-gramas no cruzan fronteras de cláusula (``.,;:!?``…): "bueno, ya llegué" no forma
+    "bueno ya". Un marcador fuera de contexto lleva la clave ``"=palabra"`` (nunca admisible),
+    para que "este precio" no sume a la muletilla "este". Las :data:`EXPRESIONES_COLOQUIALES`
+    ("la verdad", "y nada") se cuentan con sus claves normales cuando están en su contexto (ver
+    :data:`_CONTEXTO_EXPRESIONES`); fuera de él ("no se puede"), con ``"="`` delante.
+    """
     conteo: Counter[tuple[str, ...]] = Counter()
     formas: dict[tuple[str, ...], Counter[str]] = {}
     for texto in textos:
-        tokens = _tokens(texto)
-        normales = [_sin_tildes(t) for t in tokens]
-        for n in (1, 2, 3):
-            for i in range(len(tokens) - n + 1):
-                clave = tuple(normales[i:i + n])
-                conteo[clave] += 1
-                formas.setdefault(clave, Counter())[" ".join(tokens[i:i + n])] += 1
+        for clausula in _clausulas_muletilla(texto, excluir):
+            superficies = [t[0] for t in clausula]
+            claves = [t[1] for t in clausula]
+            en_contexto = [clave if contexto else "=" + clave for _, clave, contexto in clausula]
+            for n in (1, 2, 3):
+                for i in range(len(clausula) - n + 1):
+                    plana = tuple(claves[i:i + n])
+                    expresion = " ".join(plana) if n > 1 else ""
+                    if expresion in EXPRESIONES_COLOQUIALES:
+                        clave_n = (plana if _expresion_en_contexto(expresion, clausula, i, n)
+                                   else ("=" + plana[0], *plana[1:]))
+                    else:
+                        clave_n = tuple(en_contexto[i:i + n])
+                    conteo[clave_n] += 1
+                    if con_formas:
+                        formas.setdefault(clave_n, Counter())[" ".join(superficies[i:i + n])] += 1
     return conteo, formas
 
 
 def _ngrama_admisible(clave: tuple[str, ...], excluir: frozenset[str] | set[str]) -> bool:
-    """Filtros de §10.9 (excluidos, dígitos, tokens < 2, solo stopwords) para un n-grama."""
-    if any(t in excluir or len(t) < 2 or any(c.isdigit() for c in t) for t in clave):
+    """¿Puede ser muletilla este n-grama? Solo marcadores discursivos, interjecciones o risas.
+
+    - Nunca con un token de ``excluir`` o con dígitos.
+    - Unigramas: risa, teclazo, alargamiento o marcador (los ambiguos, solo en contexto).
+    - n-gramas (2–3): las :data:`EXPRESIONES_COLOQUIALES`; la repetición de un marcador
+      ("bueno bueno", "ya ya", "sí sí"); o solo marcadores, alargamientos y risas con al menos
+      un marcador o alargamiento inequívoco ("bueno pues", "ah ok"). Nunca con palabras de
+      contenido ("estaba ocupado"), solo con funcionales ("de la") ni con teclazos.
+    """
+    if any(t in excluir or any(c.isdigit() for c in t) for t in clave):
         return False
     if len(clave) == 1:
-        token = clave[0]
-        return token not in STOPWORDS_ES or token in RISAS or token in INTERJECCIONES
-    if all(t in STOPWORDS_ES for t in clave):
-        return " ".join(clave) in EXPRESIONES_COLOQUIALES
-    return True
+        return len(clave[0]) >= 2 and _clase_clave(clave[0]) in ("T", "R", "A", "M", "m")
+    if " ".join(clave) in EXPRESIONES_COLOQUIALES:
+        return True
+    if any(len(t) < 2 for t in clave):
+        return False
+    clases = [_clase_clave(t) for t in clave]
+    if "T" in clases or all(c == "R" for c in clases):
+        return False
+    if len(set(clave)) == 1:
+        return clases[0] in ("A", "M", "m") or clave[0] in _REPETIBLES
+    return all(c in ("R", "A", "M", "m") for c in clases) and any(c in ("A", "M") for c in clases)
+
+
+def _etiqueta_teclazo(variantes: Counter[str] | None) -> str:
+    """``"risa de teclazo (kakfkak)"`` con la variante más frecuente si se repite (privacidad:
+    una cadena rara escrita una sola vez podría ser una clave o un código); si no, sin ejemplo."""
+    if variantes:
+        ejemplo, veces = variantes.most_common(1)[0]
+        ejemplo = _sin_tildes(ejemplo)[:_MAX_EJEMPLO_TECLAZO]
+        if veces >= _MIN_VECES_EJEMPLO_TECLAZO and ejemplo.isascii() and ejemplo.isalpha():
+            return f"{ETIQUETA_TECLAZO} ({ejemplo})"
+    return ETIQUETA_TECLAZO
 
 
 def extraer_muletillas(propios: Sequence[str], ajenos: Sequence[str], *, excluir: Iterable[str] = (),
                        top: int = 25, min_freq: int = 5) -> list[dict[str, Any]]:
     """Muletillas propias: n-gramas (1–3) frecuentes con *lift* ≥ 1,5 frente a los mensajes ajenos.
 
+    Solo cuentan marcadores discursivos, interjecciones, rellenos, alargamientos y risas (ver
+    :func:`_ngrama_admisible`); las palabras de contenido quedan para ``temas``. Las variantes
+    de un mismo marcador se agrupan ("hmm"/"mmm", "bueno"/"buenooo") y la superficie es la más
+    usada; todos los teclazos forman una sola entrada (``"risa de teclazo (kakfkak)"``) con la
+    suma de sus frecuencias.
+
     ``lift = ((c_propio+1)/(N_propio+V)) / ((c_ajeno+1)/(N_ajeno+V))``. Orden por
     ``freq·log(1+lift)``. Sin mensajes ajenos, ``lift = 1.0`` y se ordena por frecuencia.
     Devuelve ``[{"ngrama", "freq", "lift"}]``.
     """
     excluidos = {_sin_tildes(str(e)) for e in excluir if str(e).strip()}
-    c_propio, formas = _contar_ngramas(list(propios))
+    c_propio, formas = _contar_ngramas(list(propios), excluidos)
     hay_ajenos = any(str(t).strip() for t in ajenos)
-    c_ajeno, _ = _contar_ngramas(list(ajenos)) if hay_ajenos else (Counter(), {})
+    c_ajeno, _ = _contar_ngramas(list(ajenos), excluidos, con_formas=False) if hay_ajenos else (Counter(), {})
     n_propio = sum(c_propio.values())
     n_ajeno = sum(c_ajeno.values())
     vocabulario = len(set(c_propio) | set(c_ajeno)) or 1
@@ -524,7 +957,10 @@ def extraer_muletillas(propios: Sequence[str], ajenos: Sequence[str], *, excluir
         else:
             lift = 1.0
             orden = float(freq)
-        superficie = formas[clave].most_common(1)[0][0]
+        if clave == (_CLAVE_TECLAZO,):
+            superficie = _etiqueta_teclazo(formas.get(clave))
+        else:
+            superficie = formas[clave].most_common(1)[0][0]
         candidatos.append((orden, freq, superficie, lift))
     candidatos.sort(key=lambda c: (-c[0], -c[1], c[2]))
     return [{"ngrama": superficie, "freq": freq, "lift": round(lift, 2)}
@@ -567,13 +1003,31 @@ def detectar_nombres_propios(textos: Sequence[str], *, umbral: float = 0.6) -> s
     return {clave for clave, n in total.items() if n >= 2 and mayus[clave] / n >= umbral}
 
 
+# Muletillas que también pueden ser nombres, apellidos o apodos ("Melo", "Jojo"): al abrir
+# mensaje con mayúscula siguen pasando por la detección de nombres (privacidad, §9.6).
+_MULETILLAS_O_NOMBRES: Final[frozenset[str]] = frozenset({"melo", "nel", "ole", "severo", "jojo", "juju",
+                                                          "jiji"})
+
 # Palabras comunes que suelen abrir mensajes (el teclado del móvil las pone con mayúscula): nunca
 # se toman por nombres aunque casi no aparezcan en mitad de frase.
 _COMUNES_AL_INICIO: Final[frozenset[str]] = (
     STOPWORDS_ES | INTERJECCIONES | _NO_TEMAS | frozenset(RISAS)
     | frozenset(t for frase in SALUDOS_BASE + DESPEDIDAS_BASE for t in _sin_tildes(frase).split())
     | frozenset({"oye", "mira", "porfa", "perdon", "obvio", "exacto", "sisas", "nono", "amor", "bro",
-                 "mano", "hermano", "hermana", "pana", "socio", "venga", "espera", "jefe", "okey"}))
+                 "mano", "hermano", "hermana", "pana", "socio", "venga", "espera", "jefe", "okey"})
+    | ((MARCADORES_ES | _MARCADORES_AMBIGUOS) - _MULETILLAS_O_NOMBRES))
+
+
+def _es_comun_al_inicio(clave: str) -> bool:
+    """Palabra común al abrir mensaje: las de :data:`_COMUNES_AL_INICIO` y las muletillas
+    léxicas ("Buenooo", "Hmmm", "Hahaha"), salvo las que pueden ser nombres ("Melo", "Jojo").
+    De los teclazos solo los de risa (≤ 4 letras distintas, como "Kakfkak"): uno más variado
+    sigue pasando por la detección de nombres."""
+    if clave in _COMUNES_AL_INICIO:
+        return True
+    if clave in _MULETILLAS_O_NOMBRES or not _es_muletilla_lexica(clave):
+        return False
+    return _clave_base(clave) != _CLAVE_TECLAZO or len(set(clave)) <= 4
 
 
 def _nombres_al_inicio(textos: Sequence[str]) -> set[str]:
@@ -607,7 +1061,7 @@ def _nombres_al_inicio(textos: Sequence[str]) -> set[str]:
                     minuscula_en_medio[clave] += 1
     sospechosos: set[str] = set()
     for clave, n in total.items():
-        if n < 2 or clave in _COMUNES_AL_INICIO or mayus[clave] / n <= 0.4:
+        if n < 2 or _es_comun_al_inicio(clave) or mayus[clave] / n <= 0.4:
             continue
         minus = minuscula_en_medio[clave]
         if minus >= 2 and minus / en_medio[clave] >= 0.6:
@@ -621,7 +1075,10 @@ def _tokens_de_nombre(nombre: str) -> set[str]:
 
 
 def _temas(textos: Sequence[str], excluir: frozenset[str] | set[str]) -> list[dict[str, Any]]:
-    """Los 15 unigramas propios más frecuentes (≥ 4 letras) escritos en minúscula ≥ 60 % de las veces."""
+    """Los 15 unigramas propios más frecuentes (≥ 4 letras) escritos en minúscula ≥ 60 % de las veces.
+
+    Las muletillas léxicas (marcadores, risas, alargamientos y teclazos) nunca son temas.
+    """
     total_original: Counter[str] = Counter()
     minuscula: Counter[str] = Counter()
     for texto in textos:
@@ -640,7 +1097,8 @@ def _temas(textos: Sequence[str], excluir: frozenset[str] | set[str]) -> list[di
     temas: list[tuple[int, str]] = []
     for clave, freq in frecuencia.items():
         if (freq < MIN_FREQ_TEMA or len(clave) < 4 or clave in STOPWORDS_ES or clave in RISAS
-                or clave in INTERJECCIONES or clave in _NO_TEMAS or clave in excluir):
+                or clave in INTERJECCIONES or clave in _NO_TEMAS or clave in excluir
+                or _es_muletilla_lexica(clave)):
             continue
         apariciones = total_original.get(clave, 0)
         if apariciones and minuscula[clave] / apariciones < 0.6:
@@ -774,8 +1232,15 @@ def construir_perfil(mensajes: Sequence[MensajeWsp], yo: str, *, gap_s: float = 
     for texto in textos_propios:
         emojis.update(c for c in _emojis(texto) if not 0x1F1E6 <= ord(c) <= 0x1F1FF)
     risa: Counter[str] = Counter()
+    teclazos = 0
     for texto in textos_propios:
-        risa.update(t for t in _tokens(texto) if t in RISAS)
+        for token in _tokens(texto):
+            if token in RISAS:
+                risa[token] += 1
+            else:
+                normal = _sin_tildes(token)
+                if normal not in excluir_f and _clave_base(normal) == _CLAVE_TECLAZO:
+                    teclazos += 1
 
     histograma = [0] * 24
     for mensaje in propios:
@@ -786,7 +1251,11 @@ def construir_perfil(mensajes: Sequence[MensajeWsp], yo: str, *, gap_s: float = 
     saludos, despedidas = _saludos_y_despedidas(propios)
     muletillas = [m for m in extraer_muletillas(textos_propios, textos_ajenos, excluir=excluir_f)
                   if _es_texto_seguro(m["ngrama"], excluir_f)]
-    temas = [t for t in _temas(textos_propios, excluir_f) if _es_texto_seguro(t["palabra"], excluir_f)]
+    # Una palabra que ya forma parte de una muletilla ("la verdad", "tipo") no es un tema.
+    en_muletillas = {_sin_tildes(t) for m in muletillas if not _RE_ETIQUETA_TECLAZO.fullmatch(m["ngrama"])
+                     for t in _RE_TOKEN.findall(m["ngrama"].lower())}
+    temas = [t for t in _temas(textos_propios, excluir_f | en_muletillas)
+             if _es_texto_seguro(t["palabra"], excluir_f)]
     fechas = sorted(m.ts.date() for m in propios)
 
     perfil: dict[str, Any] = {
@@ -808,6 +1277,7 @@ def construir_perfil(mensajes: Sequence[MensajeWsp], yo: str, *, gap_s: float = 
             "pct_signo_apertura": proporcion(lambda t: "¿" in t or "¡" in t),
             "pct_mayuscula_inicial": proporcion(_empieza_con_mayuscula),
             "risa": {clave: risa.get(clave, 0) for clave in RISAS},
+            CLAVE_RISA_TECLAZO: teclazos,
         },
         "muletillas": muletillas,
         "horario": {
@@ -896,7 +1366,24 @@ def cargar_perfil(ruta: Path) -> dict[str, Any] | None:
     if isinstance(version, int) and version > VERSION_PERFIL:
         log.warning("Perfil heredado v%d más nuevo que este programa (v%d); se usa lo que se entienda",
                     version, VERSION_PERFIL)
+    _migrar_teclazo(datos)
     return datos
+
+
+def _migrar_teclazo(perfil: dict[str, Any]) -> None:
+    """Mueve ``estilo.risa["teclazo"]`` (perfiles de una versión anterior) a ``estilo["risa_teclazo"]``.
+
+    Así ningún consumidor que tome la clave mayor de ``estilo.risa`` como la risa más habitual
+    (``memory_engine.hechos_desde_perfil``) afirma que el usuario escribe «teclazo».
+    """
+    estilo = perfil.get("estilo")
+    risa = estilo.get("risa") if isinstance(estilo, dict) else None
+    if not isinstance(risa, dict) or _CLAVE_TECLAZO_EN_RISA not in risa:
+        return
+    antiguo = risa.pop(_CLAVE_TECLAZO_EN_RISA)
+    if CLAVE_RISA_TECLAZO not in estilo:
+        estilo[CLAVE_RISA_TECLAZO] = antiguo
+    log.debug("Perfil heredado: conteo de teclazos movido fuera de estilo.risa")
 
 
 def _item(valor: Any, maximo: int = 40) -> str:
@@ -927,12 +1414,55 @@ def _items(valores: Any, clave: str | None, maximo: int) -> list[str]:
 _FRANJA_RESUMEN: Final = {"madrugada": "madrugada", "manana": "mañana", "tarde": "tarde", "noche": "noche"}
 
 
+def _frase_risa(estilo: Mapping[str, Any], muletillas: Any) -> tuple[str, set[str]]:
+    """Frase de risa del resumen y las muletillas (normalizadas) que ya cubre.
+
+    ``"Ríe con «jaja» y a teclazos («kakfkak»)."``; si los teclazos son más que la risa
+    principal, van primero. El conteo de teclazos es ``estilo["risa_teclazo"]`` (o, en
+    perfiles de una versión anterior, ``estilo.risa["teclazo"]``) y el ejemplo sale de la
+    entrada agrupada de ``muletillas`` (``"risa de teclazo (kakfkak)"``). Los perfiles sin
+    teclazos siguen funcionando como antes.
+    """
+    risa = estilo.get("risa") if isinstance(estilo.get("risa"), Mapping) else {}
+    conteos = [(k, _real(v) or 0.0) for k, v in risa.items()
+               if isinstance(k, str) and k != _CLAVE_TECLAZO_EN_RISA and _item(k)]
+    conteos = [par for par in conteos if par[1] > 0]
+    principal = max(conteos, key=lambda par: par[1]) if conteos else None
+    teclazos = _real(estilo.get(CLAVE_RISA_TECLAZO))
+    if teclazos is None:
+        teclazos = _real(risa.get(_CLAVE_TECLAZO_EN_RISA))
+    teclazos = teclazos or 0.0
+    cubiertas: set[str] = set()
+    con_risa = f"con «{_item(principal[0])}»" if principal else ""
+    if principal:
+        cubiertas.add(_sin_tildes(_item(principal[0])))
+    a_teclazos = ""
+    if teclazos >= _MIN_TECLAZOS_RESUMEN:
+        ejemplo = ""
+        for muletilla in _items(muletillas, "ngrama", 25):
+            coincidencia = _RE_ETIQUETA_TECLAZO.fullmatch(muletilla)
+            if coincidencia:
+                cubiertas.add(_sin_tildes(muletilla))
+                ejemplo = ejemplo or (coincidencia.group("ejemplo") or "")
+        a_teclazos = f"a teclazos («{ejemplo}»)" if ejemplo else "a teclazos"
+    if con_risa and a_teclazos:
+        primero, segundo = ((a_teclazos, con_risa) if principal and teclazos > principal[1]
+                            else (con_risa, a_teclazos))
+        return f"Ríe {primero} y {segundo}.", cubiertas
+    if con_risa or a_teclazos:
+        return f"Ríe {con_risa or a_teclazos}.", cubiertas
+    return "", set()
+
+
 def resumen_perfil(perfil: Mapping[str, Any], max_chars: int = 600) -> str:
     """Resumen en español del perfil (≤ ``max_chars``) para ``<perfil_usuario>`` del system prompt.
 
     Ejemplo: ``"Escribe en ráfagas cortas (~7 palabras; 2,4 mensajes por ráfaga). Muletillas:
-    «de una», «parce», «jaja». Más activo hacia las 22 h (noche). Emojis en el 18 % de sus
-    mensajes. Temas: código, música, fútbol."``
+    «de una», «parce», «bueno bueno». Ríe con «jaja» y a teclazos («kakfkak»). Más activo hacia
+    las 22 h (noche). Emojis en el 18 % de sus mensajes. Temas: código, música, fútbol."``
+
+    La risa va en su propia frase, justo detrás de las muletillas; las risas que esa frase ya
+    menciona (la principal y el teclazo agrupado) no se repiten en la lista de muletillas.
     """
     limite = max(1, int(max_chars))
     if not isinstance(perfil, Mapping):
@@ -954,9 +1484,13 @@ def resumen_perfil(perfil: Mapping[str, Any], max_chars: int = 600) -> str:
         else:
             frases.append(f"Escribe mensajes largos ({detalle}).")
 
-    muletillas = _items(perfil.get("muletillas"), "ngrama", 5)
+    frase_risa, cubiertas = _frase_risa(estilo, perfil.get("muletillas"))
+    muletillas = [m for m in _items(perfil.get("muletillas"), "ngrama", 25)
+                  if _sin_tildes(m) not in cubiertas][:5]
     if muletillas:
         frases.append("Muletillas: " + ", ".join(f"«{m}»" for m in muletillas) + ".")
+    if frase_risa:
+        frases.append(frase_risa)
 
     hora = horario.get("hora_pico")
     if isinstance(hora, (int, float)) and not isinstance(hora, bool) and 0 <= int(hora) <= 23:
@@ -981,13 +1515,6 @@ def resumen_perfil(perfil: Mapping[str, Any], max_chars: int = 600) -> str:
             partes.append("se despide con " + " o ".join(f"«{d}»" for d in despedidas))
         texto = "; ".join(partes)
         frases.append(texto[0].upper() + texto[1:] + ".")
-
-    risa = estilo.get("risa")
-    if isinstance(risa, Mapping):
-        conteos = [(k, _real(v) or 0.0) for k, v in risa.items() if isinstance(k, str) and _item(k)]
-        conteos = [par for par in conteos if par[1] > 0]
-        if conteos:
-            frases.append(f"Ríe con «{_item(max(conteos, key=lambda par: par[1])[0])}».")
 
     pct_preg = _real(estilo.get("pct_preguntas"))
     if pct_preg is not None and pct_preg > 0:

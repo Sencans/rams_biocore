@@ -37,7 +37,7 @@
 2. Si necesitas algo de otro grupo, usa **solo** la API pública documentada aquí. No inventes métodos ajenos. Si un contrato te parece insuficiente, implementa la parte local de forma defensiva (por ejemplo, `getattr(obj, "metodo", None)`) y deja un comentario `# CONTRATO:`.
 3. El grupo **config-bus** (`core/config.py`, `core/bus.py`, `core/contracts.py`, `core/etiquetas.py`) es la base de todos. Sus contratos están 100 % definidos en §4 y §5, y los demás grupos pueden programar contra ellos desde el primer minuto.
 4. Las palabras **DEBE**, **NO DEBE** y **PUEDE** son normativas.
-5. Cada archivo DEBE poder **importarse** sin hardware, sin claves, sin red y en Windows. Toda dependencia opcional (cv2, numpy, psutil, websockets, httpx, edge_tts, ddgs, sounddevice, prompt_toolkit) se importa dentro de `try/except ImportError` y queda un *flag* de capacidad. Excepción: `core/config.py`, `core/bus.py`, `core/contracts.py` y `core/etiquetas.py` usan **solo la biblioteca estándar** (python-dotenv es opcional dentro de `config.py`).
+5. Cada archivo DEBE poder **importarse** sin hardware, sin claves, sin red y en Windows. Toda dependencia opcional (cv2, numpy, psutil, websockets, httpx, edge_tts, ddgs, sounddevice, soundfile, prompt_toolkit) se importa dentro de `try/except ImportError` y queda un *flag* de capacidad. Excepción: `core/config.py`, `core/bus.py`, `core/contracts.py` y `core/etiquetas.py` usan **solo la biblioteca estándar** (python-dotenv es opcional dentro de `config.py`).
 6. Versión de Python: **≥ 3.11** (recomendado 3.12+). Se pueden usar `match`, `X | Y` en anotaciones, `asyncio.TaskGroup`, `datetime.UTC` y `tomllib`. Todos los módulos empiezan con `from __future__ import annotations`.
 
 ---
@@ -102,6 +102,8 @@ rams_biocore/
 │   ├── web_researcher.py        # Brave Search API → fallback ddgs (DuckDuckGo)
 │   ├── broca_llm.py             # Área de Broca: Gemini vía httpx + banco local de frases
 │   ├── vtube_bridge.py          # VTube Studio WebSocket :8001 (expresiones, movimientos, boca)
+│   ├── vtuber_ai_bridge.py      # VTuber AI Studio HTTP :3939 (avatar 3D VRM: caras, gestos, habla)
+│   ├── corteza_motora.py        # el conectoma mueve el avatar 3D (paseo, mirada, posturas, gestos, caras; sin LLM)
 │   └── riko_megumin_io.py       # despachador de salida: voz+avatar (presente) / Telegram (ausente)
 ├── persona/
 │   ├── AMADEUS.md               # biblia del personaje (legible por humanos; pegable en AIRI de Nexus)
@@ -127,6 +129,8 @@ rams_biocore/
 │   ├── test_web_researcher.py
 │   ├── test_broca_llm.py
 │   ├── test_vtube_bridge.py
+│   ├── test_vtuber_ai_bridge.py
+│   ├── test_corteza_motora.py
 │   ├── test_presence.py
 │   ├── test_riko_megumin_io.py
 │   ├── test_hud_server.py
@@ -182,11 +186,12 @@ Lo que **no** se añade a propósito: no hay ORM, ni framework web, ni pydantic,
 | **web** | P1 | `lobes/web_researcher.py`, `tests/test_web_researcher.py` | config-bus |
 | **hud** | P2 | `interface/__init__.py`, `interface/hud_server.py`, `interface/amadeus_hud.html`, `tests/test_hud_server.py` | config-bus |
 | **nexus** | P2 | `lobes/nexus_link.py`, `lobes/nexus_mcp_bridge.py`, `core/control_server.py`, `tests/test_nexus.py` | config-bus |
+| **avatar3d-motor** | P1 (puente) · P2 (corteza motora) | `lobes/vtuber_ai_bridge.py`, `lobes/corteza_motora.py`, `tests/test_vtuber_ai_bridge.py`, `tests/test_corteza_motora.py` | config-bus (`core.etiquetas` incluido); la corteza usa el puente solo por su API pública (§10.25) y main los construye en el paso 8 (§10.26) |
 
 **Fases.** Todos los grupos trabajan en paralelo, pero la fase marca el **camino crítico** y el orden de integración:
 - **P0** (sistema mínimo usable): config-bus, conectoma reducido + stub, memoria, Broca, salida por voz y terminal, main. Con solo P0 el sistema arranca, conversa, siente y recuerda.
-- **P1**: VTube Studio, Telegram (dentro de io-dispatch), visión y control del PC, búsqueda web.
-- **P2**: HUD y Nexus IDE.
+- **P1**: VTube Studio, avatar 3D (VTuber AI Studio), Telegram (dentro de io-dispatch), visión y control del PC, búsqueda web.
+- **P2**: HUD, Nexus IDE y corteza motora (autonomía corporal del avatar 3D).
 - `main.py` DEBE funcionar con cualquier módulo P1/P2 ausente o roto: lo construye dentro de `try/except` (también el `import`) y deja el atributo en `None` (§10.21, Degradación).
 
 ---
@@ -208,7 +213,7 @@ Lo que **no** se añade a propósito: no hay ORM, ni framework web, ni pydantic,
       cv2 = None
   ```
 - Imports absolutos desde la raíz del proyecto: `from core.config import Settings`, `from lobes.vtube_bridge import VTubeBridge`. `main.py` está en la raíz, así que la raíz queda en `sys.path`; los tests lo consiguen con `pytest.ini` (`pythonpath = .`).
-- Nombres de clases públicas: `Settings`, `BusEventos`, `SincanConnectome`, `MemoryEngine`, `AuraVisionPC`, `ControlHyprland`, `NexusLink`, `ServidorControl`, `WebResearcher`, `BrocaLLM`, `VTubeBridge`, `RikoMeguminIO`, `RastreadorPresencia`, `CompuertaPermisos`, `ServidorHUD`, `Consola` (en `main.py`).
+- Nombres de clases públicas: `Settings`, `BusEventos`, `SincanConnectome`, `MemoryEngine`, `AuraVisionPC`, `ControlHyprland`, `NexusLink`, `ServidorControl`, `WebResearcher`, `BrocaLLM`, `VTubeBridge`, `VTuberAIBridge`, `CortezaMotora`, `RikoMeguminIO`, `RastreadorPresencia`, `CompuertaPermisos`, `ServidorHUD`, `Consola` (en `main.py`).
 
 ### 3.2 Tiempo
 
@@ -231,6 +236,7 @@ Lo que **no** se añade a propósito: no hay ORM, ni framework web, ni pydantic,
   | permisos | `rams.permisos` | riko_megumin_io | `rams.salida` |
   | presence | `rams.presencia` | hud_server | `rams.hud` |
   | intenciones | `rams.intenciones` | main | `rams.main` |
+  | vtuber_ai_bridge | `rams.vtuber_ai` | corteza_motora | `rams.motor` |
 
 - Los mensajes son frases en español, sin secretos y sin contenido sensible: no se registran textos completos del usuario a nivel INFO, solo su longitud. A nivel DEBUG sí, truncados a 200 caracteres.
 - La configuración la hace **solo** `core.config.configurar_logging(settings, consola_nivel=...)` (§4.1). Ningún otro módulo llama a `logging.basicConfig`.
@@ -996,11 +1002,11 @@ Todos los payloads son dicts JSON-serializables. **Las claves son exactas.** `or
 |---|---|---|---|---|
 | `sistema.arranque` | main | `{"version": str, "offline": bool, "inicio_ts": float}` | 1 vez | hud (`hola.inicio_ts`) |
 | `sistema.modulo` | main, cualquier lóbulo al cambiar de estado | `DiagnosticoModulo.a_dict()` → `{"clave","nombre","estado","detalle","latencia_ms"}` | por cambio | hud |
-| `sistema.apagado` | main | `{"motivo": str}` (`"usuario"`, `"señal"`, `"eof"`, `"error"`) | 1 vez | hud ("LLAMADA FINALIZADA") |
-| `homeostasis.estado` | main (callback de `latir`) | `{"estado": HomeostaticState.a_dict(), "bump": list(estado.bump)}` | 2 Hz + flancos | hud; main (`vtube.aplicar_estado`) |
+| `sistema.apagado` | main | `{"motivo": str}` (`"usuario"`, `"señal"`, `"eof"`, `"error"`) | 1 vez | hud ("LLAMADA FINALIZADA"); avatar3d (reverencia); motor (deja de iniciar conductas) |
+| `homeostasis.estado` | main (callback de `latir`) | `{"estado": HomeostaticState.a_dict(), "bump": list(estado.bump)}` | 2 Hz + flancos | hud; main (`vtube.aplicar_estado`); avatar3d (cara de reposo si no hay corteza motora); motor (decide las conductas, §10.26) |
 | `homeostasis.iniciativa` | main | `{"tipo": str ∈ INICIATIVAS, "motivo": str, "estado": HomeostaticState.a_dict(), "antes": str \| None, "despues": str \| None}` (`antes`/`despues` ∈ CAMPOS, solo en `cambio_linea`; salen de `estado.linea_antes/linea_despues`) | por flanco | main (`_al_iniciativa`) |
-| `homeostasis.cambio_linea` | main | `{"antes": str, "despues": str, "divergencia": float}` (campos **confirmados** ∈ CAMPOS; la histéresis de 5 s y el refractario de 60 s ya los aplica el medidor, §10.6) | por cambio confirmado | hud (`linea_mundo`, "Reading Steiner") |
-| `usuario.entrada` | main | `{"texto": str, "canal": str ∈ CANALES_ENTRADA}` | por mensaje | main (→ conectoma) |
+| `homeostasis.cambio_linea` | main | `{"antes": str, "despues": str, "divergencia": float}` (campos **confirmados** ∈ CAMPOS; la histéresis de 5 s y el refractario de 60 s ya los aplica el medidor, §10.6) | por cambio confirmado | hud (`linea_mundo`, "Reading Steiner"); motor (reacción Reading Steiner del avatar 3D) |
+| `usuario.entrada` | main | `{"texto": str, "canal": str ∈ CANALES_ENTRADA}` | por mensaje | main (→ conectoma); motor (atención solo con canal `terminal` o `nexus`: mirar a cámara y acercarse) |
 | `usuario.presencia` | main | `EstadoPresencia.a_dict()` | por cambio de `presente` | hud; main (→ conectoma) |
 | `vision.camara` | aura_vision_pc | `{"activa": bool, "habilitada": bool, "duracion_ms": int}` (`duracion_ms` = 0 al encender; al liberar lo publica el *done callback* del hilo de cámara, §10.17) | al abrir y al liberar | main (indicador de consola); hud (LED) |
 | `vision.vistazo` | aura_vision_pc | `ResultadoVistazo.a_dict()` | por vistazo (también los fallidos con `error`) | main (→ conectoma, vistazos pendientes) |
@@ -1009,9 +1015,9 @@ Todos los payloads son dicts JSON-serializables. **Las claves son exactas.** `or
 | `pc.ventana` | aura_vision_pc | `{"clase": str, "titulo": str, "direccion": str \| None, "pid": int \| None}` | por evento `activewindow` de Hyprland (≤ 1 cada 300 ms) | main (→ conectoma; `ventana_previa`) |
 | `nexus.estado` | nexus_link | `EstadoNexus.a_dict()` → `{"corriendo","pids","ventana","enfocado","workspace","trabajos","rss_mb","cpu_pct","colab_conectado","riesgo_9090"}` (`trabajos[]` sin cmd completo, §10.14) | cada 10 s | main (guarda el último para `resumen_nexus`) |
 | `nexus.evento` | nexus_link | `{"tipo": "foco"\|"trabajo_terminado"\|"trabajo_fallido_rapido"\|"colab_chat"\|"riesgo", ...}` (campos adicionales en §10.14) | por evento (con límites de frecuencia en el productor) | main |
-| `salida.subtitulo` | riko | `{"texto": str, "exp": str, "motion": str, "tone": str, "canal": "voz"\|"terminal"\|"telegram", "origen": str}` | por segmento | hud |
-| `voz.inicio` | riko | `{"motor": "elevenlabs"\|"edge"\|"texto", "tone": str, "utterance_id": str}` | por utterance | hud |
-| `voz.fin` | riko | `{"utterance_id": str, "duracion_s": float, "motor": str}` | por utterance | hud |
+| `salida.subtitulo` | riko | `{"texto": str, "exp": str, "motion": str, "tone": str, "canal": "voz"\|"terminal"\|"telegram", "origen": str}` | por segmento | hud; avatar3d (expresión, gesto y habla, §10.25); motor (habla inminente: calla) |
+| `voz.inicio` | riko | `{"motor": "elevenlabs"\|"edge"\|"texto", "tone": str, "utterance_id": str}` | por utterance | hud; motor (no se mueve mientras habla) |
+| `voz.fin` | riko | `{"utterance_id": str, "duracion_s": float, "motor": str}` | por utterance | hud; motor |
 | `voz.nivel_boca` | riko | `{"valor": float}` (0..1) | ≤ 15 Hz mientras habla | hud |
 | `telegram.enviado` | riko | `{"tipo": "llamada"\|"megumin"\|"critico"\|"respuesta"\|"recordatorio", "nivel": int, "texto": str}` (`texto` ≤ 200 caracteres) | por envío | hud |
 | `telegram.respuesta_llamada` | riko | `{"llamada_id": int, "contestada": bool}` | por botón | hud (`llamada` devuelta/rechazada) |
@@ -1095,6 +1101,8 @@ async def supervisar(nombre: str, fabrica: Callable[[], Awaitable[None]], parar:
 | `hyprland` | `aura.bucle_eventos_hypr(parar)` | `aura.hypr.disponible` |
 | `nexus` | `aura.nexus.bucle_vigilancia(parar, bus)` | `aura` y `aura.nexus` no son `None` (se degrada solo) |
 | `vts` | `vtube.bucle_reconexion(parar)` | `settings.vts_habilitado` |
+| `avatar3d` | `avatar3d.bucle(parar)` (sondeo de `/api/state`, §10.25) | `avatar3d` construido (`VTUBER_AI_ENABLED`) |
+| `motor` | `corteza.bucle(parar)` (un tic cada 250 ms, §10.26) | `corteza` construida (`avatar3d` y `RAMS_AVATAR_AUTONOMO`) |
 | `telegram_entrada` | `riko.bucle_telegram_entrada(parar, _manejar_telegram)` | `settings.tiene_telegram and settings.telegram_polling` |
 | `salieri` | `memoria.bucle_compresor(parar, presente=...)` | siempre |
 | `agenda` | `_bucle_agenda()` (cada 30 s) | siempre |
@@ -2877,8 +2885,12 @@ class RikoMeguminIO:
 
 - **edge-tts:** `edge_tts.Communicate(texto, voz, rate=..., pitch=...)` con `prosodia_edge(tone)`.
   - Voz según `lang`: `es` → `settings.edge_tts_voz`, `en` → `"en-US-AriaNeural"` y `ja` → `"ja-JP-NanamiNeural"`.
-  - Produce MP3 a 24 kHz y se decodifica a PCM s16le mono a 24 kHz con `ffmpeg -loglevel error -i pipe:0 -f s16le -ac 1 -ar 24000 pipe:1`, si `ffmpeg` existe. La escritura en stdin y la lectura de stdout van en tareas concurrentes.
-  - Sin ffmpeg: se reproduce el MP3 con `mpv --no-video --really-quiet -` o `ffplay -nodisp -autoexit -loglevel error -i -`, y la boca se **simula** con una senoide de 4 Hz entre 0,2 y 0,7 durante `palabras/2,6` s.
+  - Produce MP3 a 24 kHz. Tres caminos, en este orden de preferencia:
+    1. **ffmpeg en streaming** (si `ffmpeg` existe y hay reproductor PCM): se decodifica a PCM s16le mono a 24 kHz con `ffmpeg -loglevel error -i pipe:0 -f s16le -ac 1 -ar 24000 pipe:1`. La escritura en stdin y la lectura de stdout van en tareas concurrentes.
+    2. **soundfile** (sin ffmpeg, con reproductor PCM y `soundfile` instalado): se descarga el MP3 completo (`TIMEOUT_EDGE_MP3_S` = 45 s), se decodifica a int16 mono con su frecuencia real en el executor `rams-audio` (nunca en el event loop, tope 20 s) y se reproduce por bloques de 100 ms con el lip-sync RMS normal. `iniciar()` comprueba una vez, en el mismo executor y con tope de 2 s, que libsndfile lee MP3 (`'MP3' in sf.available_formats()`); si no se importa, no lee MP3 o falla 3 veces seguidas (`MAX_FALLOS_SOUNDFILE`), soundfile se descarta para la sesión, se publica el diagnóstico nuevo y ese MP3 se reproduce por mpv/ffplay si existen.
+    3. **mpv/ffplay**: se reproduce el MP3 con `mpv --no-video --really-quiet -` o `ffplay -nodisp -autoexit -loglevel error -i -`, y la boca se **simula** con una senoide de 4 Hz entre 0,2 y 0,7 durante `palabras/2,6` s.
+  - Con MP3 completo (caminos 2 y 3), el MP3 del segmento siguiente se descarga mientras suena el actual; los cortes de voz se atienden cada 0,1 s durante la descarga.
+- **Subtítulos de voz:** cada segmento hablado se publica en `salida.subtitulo` (`canal == "voz"`) cuando su audio **empieza** (al abrir el reproductor PCM o al lanzar mpv/ffplay), no antes de sintetizarlo, para que la boca del avatar 3D no se adelante a la voz. Al terminar se publican los que no sonaron: con `canal == "terminal"` si no sonó nada y nadie cortó la voz (la entrega real fue por la terminal), y con `"voz"` si algo sonó o hubo corte.
 - **Reproductores** (`_Reproductor`, con `async abrir(sr)`, `async escribir(pcm)` y `async cerrar()`):
   - **Linux:** `pw-play --raw --rate {sr} --channels 1 --format s16 --latency 40ms -`, luego `paplay --raw --rate={sr} --channels=1 --format=s16le` y luego `aplay -q -t raw -f S16_LE -r {sr} -c 1`.
   - **Windows:** `sounddevice.RawOutputStream(samplerate=sr, channels=1, dtype="int16")` y `write` en el executor propio `ThreadPoolExecutor(1, "rams-audio")` por bloques de 100 ms.
@@ -2894,7 +2906,7 @@ class RikoMeguminIO:
 **Diagnóstico (`iniciar`):**
 - `"voz"`:
   - `OK (ElevenLabs)` tras `GET https://api.elevenlabs.io/v1/voices/{voice_id}` → 200 (timeout 4 s, sin coste).
-  - Si no, `DEGRADADO (edge-tts)` si `edge_tts` se importa y `tiene_edge_tts`.
+  - Si no, `DEGRADADO` con edge-tts si `edge_tts` se importa, `tiene_edge_tts` y hay un camino para su MP3. El detalle nombra la voz y el camino: `"edge-tts <voz> · ffmpeg + pw-play"`, `"edge-tts <voz> · soundfile + sounddevice"` o `"edge-tts <voz> · mpv"`; sin ninguno, `"edge-tts necesita soundfile, ffmpeg, mpv o ffplay"`.
   - `DEGRADADO ("sin reproductor de audio")`.
   - `OFF` si offline o con `--sin-voz`.
 - `"telegram"`: `OK ("@nombre_bot")` tras `getMe`; `OFF ("sin clave")`; `SIN CONEXIÓN` si hay error de red.
@@ -3249,7 +3261,7 @@ Broca recorta según `modo_salida` (vía `ContextoBroca`) y riko recibe el `cana
 10. Permisos: `cerrar_ventana` con dirección y pid ajeno → confirmar; tipo `comando` → denegada.
 11. Presencia: `actualizar()`.
 12. `persona/system_prompt.txt`, `persona/frases.json` (JSON válido con las categorías obligatorias del Anexo C) e `interface/amadeus_hud.html` existen (este último solo si el grupo hud está instalado).
-13. **INFO:** dependencias opcionales (numpy, cv2 + `CascadeClassifier`, psutil, httpx, websockets, edge_tts, ddgs, sounddevice, prompt_toolkit) y binarios (`hyprctl`, `grim`, `pw-play`, `paplay`, `aplay`, `ffmpeg`, `mpv`, `notify-send`, `playerctl`, `wpctl`, `nvidia-smi`).
+13. **INFO:** dependencias opcionales (numpy, cv2 + `CascadeClassifier`, psutil, httpx, websockets, edge_tts, ddgs, sounddevice, soundfile, prompt_toolkit) y binarios (`hyprctl`, `grim`, `pw-play`, `paplay`, `aplay`, `ffmpeg`, `mpv`, `ffplay`, `notify-send`, `playerctl`, `wpctl`, `nvidia-smi`).
 
 Devuelve 0 si las comprobaciones 1–12 pasan y 1 si no.
 
@@ -3596,6 +3608,191 @@ addopts = -q
 12. **Tests:** `pip install -r requirements-dev.txt` y luego `pytest`.
 13. **Créditos y aviso legal:** proyecto de fan; Steins;Gate © MAGES./Nitroplus y KonoSuba © sus autores; sin assets oficiales; confirmar los derechos de la voz de ElevenLabs. Citas científicas (Shiu 2024, Dorkenwald 2024, Hulse 2021, Hattori 2017).
 
+### 10.25 `lobes/vtuber_ai_bridge.py` (puente con VTuber AI Studio)
+
+**Propósito.** Avatar 3D VRM (three-vrm) en **VTuber AI Studio**, controlado por HTTP local (`VTUBER_AI_URL`, por defecto `http://127.0.0.1:3939`). Es una alternativa o un complemento de VTube Studio: **no** se inyecta en el despachador de salida, escucha el bus y traduce lo que ya publican los demás módulos a comandos `POST /api/command`. Solo acepta `127.0.0.1`/`localhost`/`[::1]` (una URL no local deja el módulo en `OFF`).
+
+**Protocolo del visor** (fuente de verdad: `lib/protocol.js` de VTuber AI Studio). `POST /api/command` recibe un comando, una lista (se ejecuta en orden sin esperar a que termine cada uno: en la práctica, en paralelo) o una `sequence` (en orden; `await: false` en un paso para no esperarlo). Cada `speak` nuevo interrumpe al anterior y **cada `sequence` nueva cancela la anterior**. `GET /api/state` devuelve `viewers`, `ready`, `model`, `expressionsAvailable`, `bonesAvailable` y `current` (`pose`, `look`, `position {x, z}`, `rotation`, `camera`, `speaking`…); el visor lo actualiza 250 ms después de ejecutar cada comando. Ejes vistos desde el avatar: x+ inclinar adelante, y+ girar hacia SU izquierda, z+ ladear hacia SU derecha; en el escenario, x+ = derecha del espectador y z+ = hacia la cámara.
+
+**Configuración** (§4.1): `VTUBER_AI_ENABLED` (1), `VTUBER_AI_URL`, `VTUBER_AI_TTS` (1 = si no hay voz propia, habla la voz del navegador), `VTUBER_AI_LANG` (`es-MX`) y `VTUBER_AI_VOICE` (`female` por defecto, es decir, voz femenina del navegador; también admite nombres separados por comas, p. ej. `"Sabina,Helena"`).
+
+**Eventos que consume** (§5):
+
+| Evento | Traducción |
+|---|---|
+| `salida.subtitulo` (canal ≠ `telegram`) | `sequence`: por cada segmento, expresión mezclada (`EXP_A_MEZCLA`, `await: false`), pasos del `MOTION` (`MOTION_A_PASOS`, `await: false`) y `speak` con `voice = vtuber_ai_voz`, `rate`/`pitch` del `TONE` (`TONO_A_PROSODIA`) y `tts = vtuber_ai_tts and canal != "voz"`. Al final deshace las poses (`relaxed`) y las miradas (`camera`). Los segmentos de terminal que llegan en ≤ 0,25 s se agrupan en una sola `sequence`; los de `canal == "voz"` salen en cuanto riko empieza su audio. |
+| `homeostasis.estado` | Expresión de reposo (`sugerir_etiquetas(estado).exp`), como mucho cada 8 s, si no está hablando **y** `reposo_externo` es `False`. |
+| `sistema.apagado` | Reverencia (`bow`). |
+
+**API pública:**
+
+```python
+CLAVE = "avatar3d"; NOMBRE = "Avatar 3D (VTuber AI Studio)"
+EMOCIONES_VISOR, GESTOS_VISOR, POSES_VISOR, MIRADAS_VISOR, MANOS_VISOR, CAMARAS_VISOR   # vocabulario del protocolo
+EXP_A_MEZCLA, MOTION_A_PASOS, TONO_A_PROSODIA
+def url_es_local(url: str) -> bool
+def mezcla_para(exp: str, disponibles: frozenset[str] | None = None) -> dict[str, float]
+def comando_expresion(exp: str, disponibles: frozenset[str] | None = None, *, duracion: float = 0.4) -> dict
+def pasos_motion(motion: str) -> tuple[list[dict], list[dict]]          # (durante el habla, para deshacer)
+def duracion_estimada(texto: str, rate: float = 1.0) -> float
+
+class VTuberAIBridge:
+    def __init__(self, settings: Settings, bus: BusEventos | None = None, *, cliente: httpx.AsyncClient | None = None) -> None
+    en_linea: bool; visores: int; modelo: str | None; voz: str
+    reposo_externo: bool                     # True = otro módulo (la corteza motora) gobierna la cara en reposo
+    hablando: bool                           # (property) el visor sigue "diciendo" la última respuesta (estimado)
+    expresiones_disponibles: frozenset[str] | None    # (property) None hasta el primer sondeo
+    huesos_disponibles: frozenset[str] | None         # (property)
+    estado_visor: dict | None                # (property) copia de "current" del último /api/state
+    posicion: tuple[float, float, float] | None       # (property) (x, z, rotación °) según el último sondeo
+    ts_estado: float | None                  # (property) time.monotonic() de ese sondeo
+    def encolar(self, comando: dict | list) -> None   # no bloquea; el worker envía en orden
+    def secuencia_para(self, segmentos: list[Mapping]) -> dict
+    def diagnostico(self) -> DiagnosticoModulo
+    async def consultar_estado(self) -> bool  # GET /api/state
+    async def enviar(self, comando: dict | list) -> bool   # POST /api/command (True si el visor lo aceptó)
+    async def iniciar(self) -> DiagnosticoModulo            # primer sondeo; nunca lanza
+    async def bucle(self, parar: asyncio.Event) -> None     # sondeo: cada 15 s en línea, cada 5 s fuera
+    async def cerrar(self, timeout: float = 2.5) -> None    # entrega lo pendiente (despedida) y suelta el cliente propio
+```
+
+**Concurrencia.** Los manejadores del bus solo encolan; un *worker* propio (`asyncio.Queue(maxsize=32)`, que descarta el más antiguo si se llena) hace los `POST` en orden. Usa el `httpx.AsyncClient` compartido de main o uno propio (timeout 4 s, connect 1,5 s), que cierra en `cerrar()`.
+
+**Estados.** `OK` (`"N visor(es) · modelo"`), `EN ESPERA` (servidor caído, sin visores abiertos o modelo cargando; los comandos se descartan sin ruido) y `OFF` (URL no local o falta httpx). Cada cambio se publica como `sistema.modulo` (clave `avatar3d`). main lo construye en el paso 8 si `vtuber_ai_habilitado`, lo diagnostica en paralelo, lanza la tarea supervisada `avatar3d` y lo cierra **después** de la corteza motora.
+
+**Tests** (`tests/test_vtuber_ai_bridge.py`, servidor simulado con `httpx.MockTransport`): traducciones puras, agrupado de segmentos, despedida entregada al cerrar, sin visores o con el servidor caído (EN ESPERA sin lanzar), expresión de reposo y `reposo_externo`, inventario (`huesos_disponibles`, `posicion`, `estado_visor`), `encolar` en orden, `hablando` estimado, URL no local y settings.
+
+### 10.26 `lobes/corteza_motora.py` (corteza motora: autonomía corporal del avatar 3D)
+
+**Propósito.** Dar al avatar de VTuber AI Studio control libre de su cuerpo (moverse por el escenario cuando quiera y como quiera, gesticular y poner caras) **sin LLM**: quien decide cuándo y cómo es el estado del conectoma. Es la "corteza motora" de Amadeus: el conectoma CX+MB produce la homeostasis (§10.6) y este módulo la convierte en conducta motora; Gemini no interviene (§8).
+
+**API pública:**
+
+```python
+CLAVE = "motor"; NOMBRE = "Corteza motora (avatar 3D)"
+@dataclass(frozen=True) class Rumbo: angulo: float; coherencia: float       # 0° = hacia la cámara, 90° = derecha del espectador
+@dataclass(frozen=True) class Brujula: angulo: float; coherencia: float; bump: float; deriva: float = 0.0   # rumbo de marcha propuesto
+@dataclass(frozen=True) class Paso: t: float; comandos: tuple[dict, ...]; final: bool = False; reposo: str | None = None
+@dataclass(frozen=True) class Plan: conducta: str; pasos: tuple[Paso, ...]; duracion: float; rumbo: float | None = None
+    # .comandos(), .tipos(); rumbo = dirección en la que camina (si camina)
+@dataclass(frozen=True) class ContextoMotor:
+    hablando: bool = False; en_linea: bool = True; huesos: frozenset[str] | None = None
+    expresiones: frozenset[str] | None = None; posicion: tuple[float, float] = (0.0, 0.0); rotacion: float = 0.0
+    pose: str = "relaxed"; camara: str = "full"; desde_usuario_s: float = inf; presupuesto: int = 40
+@dataclass(frozen=True) class MemoriaMotora:
+    semilla: int = 0; n: int = 0; ultima: str | None = None; usos: tuple[tuple[str, float], ...] = ()
+    proxima: float = -inf; plan_hasta: float = -inf; rumbo_marcha: float | None = None; bump_ref: float | None = None
+    def uso(self, conducta) -> float; def con_uso(self, conducta, ahora) -> MemoriaMotora
+    def azar(self) -> random.Random                  # Random sembrado con (semilla, n)
+@dataclass(frozen=True) class Decision: plan: Plan | None; memoria: MemoriaMotora
+def rumbo_del_bump(bump: Sequence[float], defecto_deg: float = 0.0) -> Rumbo
+def tramo_en_escenario(origen, rumbo_deg, distancia, limites, *, margen=0.05, minimo=0.35) -> ((x, z), rumbo) | None
+def sanear_comando(cmd, *, huesos=None, expresiones=None, caminar=True, camara=False) -> dict | None
+def limites_escenario(camara: str | None) -> tuple[float, float, float] | None
+
+class CortezaMotora:
+    def __init__(self, settings: Settings, bus: BusEventos | None, avatar: VTuberAIBridge, *,
+                 semilla: int | None = None, reloj: Callable[[], float] | None = None) -> None
+    activa: bool                                     # hay avatar, actividad > 0 y no se cerró
+    memoria: MemoriaMotora                           # (property) memoria de decisión actual
+    def decidir(self, estado: HomeostaticState, ahora: float, ctx: ContextoMotor,
+                memoria: MemoriaMotora | None = None) -> Decision          # núcleo puro
+    def rumbo(estado) -> Rumbo                       # (staticmethod) lectura del bump, sin ruido
+    def brujula(self, estado, memoria=None, rng=None) -> Brujula           # no modifica la memoria
+    def construir(self, conducta: str, estado, ctx, *, brujula: Brujula | None = None,
+                  rng: random.Random | None = None) -> Plan | None
+    def plan_atencion(self, estado, ctx) -> Plan | None
+    def plan_reading_steiner(self, estado, ctx) -> Plan | None
+    def pesos_base(self, estado, ctx) -> dict[str, float]          # pura: peso de cada conducta
+    def preferidas(self, estado, ctx=None, n=3) -> list[str]
+    def intervalo_medio(self, estado) -> float; def tasa_conductas(self, estado) -> float
+    def intensidad_idle(self, estado) -> float; def exp_reposo(self, estado) -> str
+    def contexto(self, ahora: float) -> ContextoMotor
+    def presupuesto(self, ahora: float) -> int                      # comandos que aún caben en el último minuto
+    def ejecutar(self, plan: Plan, ahora: float | None = None) -> int
+    def tick(self, ahora: float | None = None) -> int              # E/S: no bloquea; devuelve los comandos encolados
+    def diagnostico(self) -> DiagnosticoModulo
+    async def bucle(self, parar: asyncio.Event) -> None             # tick cada 250 ms; cancelable
+    async def cerrar(self) -> None                                  # idempotente
+```
+
+**Separación decisión / E/S.** `decidir(estado, ahora, ctx, memoria)` es el **núcleo puro**: no hace E/S, no lee el avatar (funciona igual con `avatar=None`) y no modifica la corteza; solo usa sus ajustes fijos (actividad, caminar, cámara) y lo que recibe. Devuelve una `Decision` con el `Plan` ya **saneado** (o `None`) y la `MemoriaMotora` siguiente, que registra la decisión: enfriamiento, "última conducta", próxima decisión, fin del plan y, si camina, el rumbo de marcha. El azar sale de `memoria.azar()` (`random.Random` sembrado con la semilla y el número de decisión), así que las mismas entradas dan siempre la misma `Decision`. El tope de comandos llega en `ctx.presupuesto`. `tick()` arma el `ContextoMotor` leyendo el avatar, llama a `decidir` con la memoria actual y guarda la nueva, envía con `avatar.encolar` los pasos vencidos (los que vencen juntos salen como una lista, es decir, en paralelo en el visor), mantiene la cara de reposo y el *idle* y atiende al habla, al usuario y a los cambios de línea. **Nunca** envía `sequence`, `speak`, `reset`, `load_model` ni `background`, ni `stop` de la secuencia o del habla: una `sequence` suya cancelaría el habla del puente. La única excepción es `{"type": "stop", "what": "gestures"}` al empezar el habla (corta un gesto largo suyo sin tocar la `sequence`). Las conductas de varios pasos se agendan en la propia corteza.
+
+**Configuración** (§4.1): `RAMS_AVATAR_AUTONOMO` (1; con 0 no se construye), `RAMS_AVATAR_ACTIVIDAD` (1,0; rango 0..3, multiplica la tasa; 0 = quieta), `RAMS_AVATAR_CAMINAR` (1; con 0 solo gira en el sitio) y `RAMS_AVATAR_CAMARA` (0; con 1 puede cambiar el encuadre).
+
+**Eventos** (§5; no publica eventos nuevos):
+
+| Evento | Uso |
+|---|---|
+| `homeostasis.estado` | Último `HomeostaticState` (toma el `bump` del payload si el estado viene sin él). |
+| `homeostasis.cambio_linea` | Reacción "Reading Steiner" (refractario 30 s; si está hablando, espera hasta 20 s). |
+| `usuario.entrada` | Atención (no guarda el texto) solo con canal `terminal` o `nexus`: por Telegram el usuario no está frente a la cámara, así que ni mira, ni se acerca, ni deja de pasear. |
+| `salida.subtitulo` (canal ≠ `telegram`) | Habla inminente: calla 1,2 s aunque el puente aún esté agrupando. Recuerda qué tipos trae el `MOTION` (pose, mirada, gesto) para no pisarlos al cortar la conducta; si trae pose, tras el habla la pose es `relaxed`. |
+| `voz.inicio` / `voz.fin` | Mientras riko habla con su voz (caduca a los 90 s sin `voz.fin`). |
+| `sistema.apagado` | Deja de iniciar conductas; los pasos de cierre se envían en `cerrar()`. |
+| publica `sistema.modulo` | `diagnostico().a_dict()` por cambio de estado: `OK` ("autónoma · actividad ×1,0 · camina"), `EN ESPERA` ("esperando al avatar 3D") u `OFF` ("actividad 0 (quieta)"). |
+
+**Mapeo homeostasis → cuerpo.**
+
+| Variable | Efecto |
+|---|---|
+| arousal | Tasa de conductas (intervalo ∝ 1 / (actividad × (0,3 + 1,2·arousal))), velocidad al caminar (0,45–0,85 m/s), intensidad del *idle* (`0,35 + 1,1·arousal − 0,35·fatiga`, acotada a 0,2..1,6) y peso de seguir el ratón y de la alegría. |
+| boredom | Pasear (y longitud del paseo), ruido de exploración del rumbo de marcha, encogerse de hombros, mirar alrededor, apoyar el peso y girar. |
+| fatiga | Estirarse, bostezar (boca `aa` y párpados `blink`, que se cierran explícitamente porque el visor no los limpia) y dormitar con cabeceo; alarga el intervalo (×(1 + 0,8·fatiga)) y resta al paseo. |
+| focus | Alto (> 0,7): pose pensativa (mano al mentón, mirada arriba), brazos cruzados, sin pasear e intervalo más largo. Con foco ≥ 0,75 y lejos del centro (> 0,45 m) **vuelve al centro y queda de frente mirando a cámara** (prioridad). |
+| curiosidad | Mirar alrededor (`look_around` con cara curiosa), ladear la cabeza, sacádicas hacia arriba, pasear y ruido de exploración del rumbo de marcha. |
+| valencia | Positiva con arousal: alegría contenida, sonrojo y mirada esquiva (tsundere), manos en la cadera (smug) y asentir. Negativa: brazos cruzados con cara molesta, puño apretado y cabeza baja. |
+| modo `reposo` | Cara somnolienta, *idle* 0,3, solo dormitar, bostezar, mirada, micro-posturas y microexpresiones (el resto ×0,15) e intervalo ×2,5. |
+| bump E-PG | **Brújula por integración de trayectoria** (el bump es un rumbo **relativo**, no un punto del escenario). Fase del bump: ángulo del vector poblacional `atan2(Σ b_k·sin θ_k, Σ b_k·cos θ_k)`, con θ_k = 2πk/16 (igual que el conectoma); coherencia `|Σ b·e^{iθ}| / Σ b` (sin bump, `rumbo_deg` con coherencia = focus). Rumbo de marcha propuesto = rumbo recordado + **deriva** del bump desde que se fijó (ganancia 1) + atracción suave hacia la fase (0,2 × coherencia × diferencia) + ruido gaussiano de σ = 10° + 60°·boredom + 40°·curiosidad + 25°·(1 − coherencia). Sin rumbo recordado parte de la fase del bump. Convenio: 0° hacia la cámara, 90° a la derecha del espectador (izquierda de ella). Con ese rumbo camina **desde donde está** (0,45–1,3 m según aburrimiento, curiosidad y arousal), gira en el sitio (`0,6·rumbo`, ±35°; si ya mira hacia ahí, sigue 12–30° más), mira y ladea la cabeza. Al caminar, la dirección real del paseo pasa a ser el rumbo recordado (y la fase del bump, la referencia de la deriva). Así, con un bump casi quieto (Windows sin Hyprland ni eventos) recorre igualmente el escenario, y cuando un evento desplaza el bump ella gira lo mismo. |
+
+**Repertorio** (cada conducta tiene peso por estado, enfriamiento y pasos finales que la deshacen):
+
+| Conducta | Qué hace (comandos del visor) | Enfriamiento |
+|---|---|---|
+| `pasear` | Tramo recto desde la posición actual en el rumbo de marcha (`tramo_en_escenario`: si cabe al menos medio paseo camina hasta el borde con 5 cm de margen; si no, **rebota** como una bola de billar, primero en la pared que alcanzaría antes; arrinconada, sale hacia el centro). Mira hacia el lado, gira hacia el destino (`move rotation`), camina (`move x,z walk`, mirada al frente) y vuelve a quedar de frente (a veces algo girada) mirando a cámara | 18 s |
+| `volver_al_centro` | Igual, hasta (0, 0) | 10 s |
+| `girar` | Gira en el sitio hacia el rumbo de marcha (±35°), sostiene 2,5–6 s y vuelve de frente | 12 s |
+| `mirada` | Sacádica a una dirección (`left`, `up_right`, `down_left`…) o a un punto 3D según el rumbo de marcha, y vuelta a cámara | 5 s |
+| `seguir_raton` | `look mouse` durante 4–10 s | 30 s |
+| `mirar_alrededor` | Gesto `look_around` (con cara curiosa) | 25 s |
+| `ladear_cabeza` | Gesto `tilt_head` hacia el lado del rumbo, o micro-postura de cabeza y cuello | 12 s |
+| `pensativa` | Pose `thinking` (mano al mentón) mirando arriba, o gesto `think` | 25 s |
+| `brazos_cruzados` | Pose `arms_crossed`, a veces con cara molesta y mirada esquiva | 25 s |
+| `estirarse` | Pose `arms_up`, mirada arriba y cara somnolienta | 50 s |
+| `bostezar` | Cabeza atrás (`bones`), boca `aa` y párpados `blink` | 45 s |
+| `dormitar` | *Idle* 0,3, párpados a media asta, la cabeza cae y se despierta de golpe | 30 s |
+| `encogerse` | Gesto `shrug`, a veces con cara aburrida y mirada abajo | 30 s |
+| `asentir` | Gesto `nod` | 40 s |
+| `alegria` | Sonrisa contenida con `tilt_head`/`nod`. `laugh` (≈ 12 %) y `cheer` (≈ 3 %, solo con valencia > 0,7 y arousal > 0,8) son raros; suele rematar apartando la mirada sonrojada | 45 s |
+| `tsundere` | Sonrojo, mirada esquiva y a veces `shy` o `arms_crossed` | 35 s |
+| `postura` | `hands_on_hips` (smug) | 40 s |
+| `micro_postura` | `bones` de pocos grados sobre la base de la pose actual: apoyar el peso (hips/spine), inclinarse o erguirse (spine), ladear la cabeza, subir los hombros o bajar la cabeza | 10 s |
+| `microexpresion` | Mezcla breve (smug, curiosa, pensativa, molesta…) al 45–80 % y vuelta a la cara de reposo | 8 s |
+| `manos` | Forma de una mano (`open`, `fist`; `peace`/`thumbs_up` rarísimos) y vuelta a la de la pose | 15 s |
+| `camara` | Solo con `RAMS_AVATAR_CAMARA=1`: `bust` con foco alto; `full`/`wide` con aburrimiento o curiosidad | 60 s |
+
+Kurisu no baila, no salta, no aplaude ni hace reverencias por su cuenta (`dance`, `jump`, `clap` y `bow` están vetados; `bow` es la despedida del puente) y nunca usa `tpose`/`apose`.
+
+**Planes prioritarios** (usan la reserva del tope de comandos):
+- **Atención** (`usuario.entrada` por `terminal` o `nexus`, si no está hablando): corta la conducta en curso, mira a cámara y suelta las poses que ocupan las manos. Si camina y está a más de 0,25 m, se acerca a (x·0,35, z = 0,25) girando de frente; si no, solo gira de frente. Durante 20 s no pasea, no gira, no se estira ni se encoge.
+- **Reading Steiner** (`homeostasis.cambio_linea`): sorpresa (`surprised` 0,9 y gesto `surprise`), mano derecha a la sien (`bones` de rightUpperArm/rightLowerArm/rightHand si existen; si no, pose `thinking`), `look_around`, cara inquieta (`surprised` 0,35 + `sad` 0,25) y vuelta a `relaxed` mirando a cámara.
+
+**Cuándo.** El intervalo medio entre conductas es `7 s / (actividad × (0,3 + 1,2·arousal)) × (1 + 0,8·fatiga) × (1 + max(0, focus − 0,7)) × (2,5 si reposo)`, acotado a 2,5..60 s y multiplicado por un factor uniforme 0,6..1,4. El plan siguiente no empieza hasta que termina el anterior. La elección es una ruleta de pesos que excluye la conducta anterior (sin repeticiones seguidas) y las que están en enfriamiento. **Nunca inicia conductas mientras habla** (`avatar.hablando`, entre `voz.inicio` y `voz.fin` o tras un subtítulo reciente). Al empezar el habla corta la conducta y devuelve el cuerpo **en ese mismo momento**, en una sola lista paralela: giro de frente (detiene el paseo; también si estaba algo girada), los pasos finales de la conducta (pose `relaxed`, mirada a cámara, `aa`/`blink` a 0 —el visor no los limpia y el lip-sync usa `max(expresión, visema)`—, huesos, manos e *idle* restaurados) y, si sigue un gesto largo suyo, `stop` de gestos. No pisa lo que trae el `MOTION` del habla: si trae pose no envía pose ni huesos (la pose del visor reinicia los huesos tocados), si trae mirada no envía mirada y si trae gesto no envía `stop`; el puente lo deshace al terminar. Los pasos finales ya contaban como pendientes; el giro y el `stop` solo salen si caben en el tope. **Solo la cara de reposo espera**: después de hablar espera 2,5 s y repone una cara de reposo nueva. Con `actividad = 0` no hace nada y deja la cara al puente.
+
+**Límites y saneado** (`sanear_comando`, aplicado a todo lo que sale):
+- Escenario según el encuadre: `full` |x| ≤ 1,0 y −0,7 ≤ z ≤ 0,4; `wide` |x| ≤ 1,5 y −1,0 ≤ z ≤ 0,6; con `bust`/`face` no camina. Tope absoluto: |x| ≤ 1,6, −1,0 ≤ z ≤ 0,6 y |rotación| ≤ 180°. `move` siempre absoluto (nunca `relative`); sin `RAMS_AVATAR_CAMINAR` se quitan x/z y `walk`.
+- `bones` solo con huesos de `LIMITES_HUESO` presentes en `huesos_disponibles` (sin inventario, ninguno) y con rango por eje (p. ej. head ±14/±18/±12°, hips ±3/±8/±5°); los brazos solo se usan para la mano a la sien. Siempre absolutos.
+- Expresiones solo del modelo (o las estándar de VRM hasta el primer sondeo); gestos, poses, miradas, manos y encuadres del protocolo y de la personalidad.
+- **Tope global: 40 comandos por minuto** (todas las fuentes, ventana deslizante), de los que 8 se reservan para la atención y el Reading Steiner. Una conducta solo se elige si todos sus comandos caben, contando los ya agendados y aplazados.
+
+**Modelo del cuerpo.** La corteza recuerda posición (interpolada durante el paseo con la misma curva que el visor), rotación, pose, encuadre e intensidad del *idle*. Adopta la posición de `avatar.posicion` (el usuario pudo moverla a mano) solo si la foto del visor es posterior al primer comando enviado después del último movimiento.
+
+**Robustez.** Sin avatar en línea no envía nada y olvida el plan (`EN ESPERA`); al reconectar repone la cara y el *idle*. Los manejadores del bus nunca lanzan (los payloads basura se ignoran con `log.debug`). `bucle(parar)` es cancelable y un tic que falla no la detiene. Mientras está activa fija `avatar.reposo_externo = True`; `cerrar()` (idempotente) envía los pasos finales pendientes (pose `relaxed`, mirar a cámara, giro de frente), se desuscribe y lo devuelve a `False`.
+
+**Cableado en main.py.** Se construye en el paso 8, justo después del avatar 3D, solo si `self.avatar3d` existe y `avatar_autonomo` es verdadero (import opcional con `_construir_opcional`, clave `motor`): `CortezaMotora(settings, bus, self.avatar3d)`. La línea de arranque "Corteza motora (avatar 3D)" va tras la del avatar 3D (`OFF (deshabilitado)` con `RAMS_AVATAR_AUTONOMO=0`, `OFF (sin avatar 3D)` sin avatar). Tarea supervisada `motor` → `corteza.bucle(parar)`. En `apagar()` se cierra **antes** que `avatar3d`, así sus pasos finales salen por el worker del puente antes de que este se cierre.
+
+**Tests** (`tests/test_corteza_motora.py`, con avatar, visor lógico —misma semántica que `app.js` para poses, huesos, expresiones, gestos y paseo— y reloj falsos, sin red ni visor real): brújula por integración de trayectoria (deriva, atracción a la fase y ruido por aburrimiento y curiosidad); `tramo_en_escenario` (desde la posición actual, dentro del escenario y con rebote en bordes y esquinas); el rumbo de marcha decide hacia dónde camina y gira y se recuerda al ejecutarse; con el bump **real** del conectoma (stub y reducido, casi quieto en ≈ 0°) hace varias caminatas a destinos distintos en 30 minutos simulados; `decidir` es un núcleo puro (misma entrada → misma `Decision`, sin tocar la corteza y sin avatar); al empezar el habla a mitad de 14 conductas el cuerpo vuelve ya (de frente, mirando a cámara, huesos en reposo, `aa`/`blink` a 0, *idle* restaurado, sin gestos suyos en curso) y la cara espera; no pisa el `MOTION` del habla; tras la atención y la latencia del LLM siempre responde de frente mirando a cámara; atención solo por `terminal`/`nexus` (no por Telegram); decisiones por estado (aburrida → explora o se encoge de hombros; fatiga → estirarse o bostezar y menos actividad; foco alto → pensativa o brazos cruzados, sin pasear y vuelta al centro mirando a cámara; curiosidad → mirar alrededor o ladear; valencia + arousal → alegría contenida con risas raras); Reading Steiner; determinismo por semilla; sin repeticiones y con enfriamientos; límites de posición, ángulos, huesos y expresiones; `sanear_comando`; sin caminar y con encuadre cerrado; actividad 0; tope de 40 comandos/minuto en 15 min simulados; silencio mientras habla (también con el habla anunciada por subtítulo y `voz.*`); atención; adopción de la posición del visor; integración con el bus, con el puente real sobre `httpx.MockTransport` y con main (línea de arranque, tarea `motor` y orden de cierre).
+
 ---
 
 ## §11. `requirements.txt` final
@@ -3615,6 +3812,7 @@ ddgs>=9.0                            # DuckDuckGo: sucesor de duckduckgo-search 
 tzdata>=2024.1                       # base de zonas horarias para zoneinfo (Windows y Linux mínimos/contenedores)
 prompt_toolkit>=3.0.43               # consola: Amadeus imprime sin borrar lo que estás escribiendo
 sounddevice>=0.5 ; sys_platform == "win32"   # reproducción PCM en Windows (modo degradado)
+soundfile>=0.12                      # decodifica el MP3 de edge-tts sin ffmpeg (la wheel trae libsndfile con MP3)
 
 # --- Opcionales (descomenta según tu caso; NUNCA instales dos variantes de OpenCV a la vez) ---
 # opencv-contrib-python-headless>=4.10,<5   # EN LUGAR de opencv-python-headless si quieres los módulos contrib
@@ -3632,6 +3830,7 @@ Justificación de los cambios respecto a la lista pedida por el usuario:
 | `tzdata` (sin marcador de plataforma) | `zoneinfo` necesita la base de zonas; Windows no la trae y algunos Linux mínimos o contenedores tampoco. Sin ella, se usa el *fallback* UTC−5. |
 | `prompt_toolkit` (añadido) | La consola imprime los mensajes asíncronos de Amadeus sin borrar lo que el usuario está escribiendo (§6.5). Es Python puro; si falta, hay *fallback* ANSI. |
 | `sounddevice` solo en Windows | En Linux se usa `pw-play`/`paplay`/`aplay` por subproceso, sin dependencias nativas. |
+| `soundfile` (añadido) | Decodifica en proceso el MP3 de edge-tts (libsndfile ≥ 1.1, incluida en la wheel) para tener lip-sync real sin `ffmpeg` (sobre todo en Windows). Si falta, no lee MP3 o falla, se usa `mpv`/`ffplay`. |
 | RMS sin `audioop` | `audioop` desapareció en Python 3.13: el RMS del lip-sync se calcula con numpy o con `array('h')` + `math` (§10.19). |
 
 No se añaden `pygame`, `pyaudio`, `Pillow`, `pandas`, `pydantic` ni el SDK de Gemini.
@@ -3715,6 +3914,8 @@ def consola_capturada(settings_prueba) -> "Consola":
 | `test_hud_server.py` | hud | §10.23. |
 | `test_intenciones.py` | main-docs-tests | §10.12 (incluye cortes de `programar`, media anclada y capacidades por canal). |
 | `test_main.py` | main-docs-tests | §10.21 (10 casos) y §6.6. |
+| `test_vtuber_ai_bridge.py` | avatar3d-motor | §10.25 (servidor simulado con `httpx.MockTransport`). |
+| `test_corteza_motora.py` | avatar3d-motor | §10.26 (avatar, visor lógico y reloj falsos; bump real del conectoma stub y reducido). |
 
 ### 12.4 Garantías de importabilidad
 

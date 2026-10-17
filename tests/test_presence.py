@@ -120,6 +120,24 @@ def test_regla_2_rostro(tmp_path: Path) -> None:
     assert rastreador.actualizar().motivo == "sin_datos"
 
 
+def test_regla_2_rostro_fresco_gana_a_la_inactividad(tmp_path: Path) -> None:
+    """Visión continua (v0.2): main refresca el rostro cada 30 s; un vídeo largo sin tocar nada
+    no es ausencia. Una salida posterior (rostro False) anula el rostro fresco."""
+    rastreador, reloj, fuente = _rastreador(tmp_path, 1800.0, "win32")   # 30 min sin input
+    for _ in range(4):                         # 2 min de refrescos cada 30 s
+        rastreador.registrar_rostro(True)
+        reloj.avanzar(30)
+        estado = rastreador.actualizar()
+        assert (estado.presente, estado.confianza, estado.motivo) == (True, 0.90, "rostro")
+    reloj.avanzar(31)                          # último rostro hace 61 s: vuelve a mandar la inactividad
+    assert rastreador.actualizar().motivo == "inactividad"
+    rastreador.registrar_rostro(True)
+    reloj.avanzar(5)
+    rastreador.registrar_rostro(False)         # vision.estimulo{salida}
+    estado = rastreador.actualizar()
+    assert estado.presente is False and estado.motivo == "sin_rostro"
+
+
 def test_regla_3_sin_rostro(tmp_path: Path) -> None:
     rastreador, reloj, fuente = _rastreador(tmp_path, 200.0, "hypridle")
     rastreador.registrar_rostro(False)
@@ -379,3 +397,128 @@ def test_windows_get_last_input_info(tmp_path: Path) -> None:
         assert segundos is not None and segundos >= 0.0
     else:   # sesión sin escritorio (servicio/CI)
         assert (segundos, fuente) == (None, "ninguna")
+
+
+# ---------------------------------------------------------------------------
+# v0.2 (docs/COMPANION.md §C3 "Grupo orquestacion"): escritorio, ControlPC e inyecciones
+# ---------------------------------------------------------------------------
+
+
+class PCFalso:
+    """``ControlPC`` mínimo: inactividad de Windows e instante de la última inyección propia."""
+
+    def __init__(self, reloj: Reloj) -> None:
+        self.reloj = reloj
+        self.ultimo_input: float | None = reloj.t     # instante del último input (cualquiera)
+        self.inyeccion: float | None = None
+
+    def inactividad_s(self) -> float | None:
+        return None if self.ultimo_input is None else max(0.0, self.reloj.t - self.ultimo_input)
+
+    def ts_ultima_inyeccion(self) -> float | None:
+        return self.inyeccion
+
+    def inyectar(self) -> None:          # Amadeus mueve el cursor o teclea: Windows reinicia la inactividad
+        self.inyeccion = self.reloj.t
+        self.ultimo_input = self.reloj.t
+
+    def usuario(self) -> None:           # el usuario de verdad toca el teclado o el ratón
+        self.ultimo_input = self.reloj.t
+
+
+def test_escritorio_cuenta_como_entrada_local(tmp_path: Path) -> None:
+    rastreador, reloj, _ = _rastreador(tmp_path)
+    rastreador.registrar_entrada("escritorio")
+    assert rastreador.segundos_desde_entrada_local() == pytest.approx(0.0)
+    reloj.avanzar(30)
+    estado = rastreador.actualizar()
+    assert estado.presente is True and estado.motivo == "terminal_reciente"
+    assert rastreador.ultima_entrada_remota_ts is None
+
+
+def test_inactividad_de_control_pc_manda_sobre_la_fuente(tmp_path: Path) -> None:
+    reloj = Reloj()
+    fuente = Fuente(9999.0, "win32")
+    pc = PCFalso(reloj)
+    rastreador = RastreadorPresencia(_settings(tmp_path), reloj=reloj, fuente_inactividad=fuente,
+                                     inactividad_pc=pc.inactividad_s)
+    reloj.avanzar(42)
+    estado = rastreador.actualizar()
+    assert estado.segundos_inactivo == pytest.approx(42.0) and estado.fuente_inactividad == "win32"
+    assert estado.presente is True and estado.motivo == "sistema_activo"
+    # Hyprland: ControlPC no sabe la inactividad (None) → la fuente normal (archivo-bandera de hypridle).
+    pc.ultimo_input = None
+    fuente.valor = (12.0, "hypridle")
+    estado = rastreador.actualizar()
+    assert estado.segundos_inactivo == pytest.approx(12.0) and estado.fuente_inactividad == "hypridle"
+
+
+def test_conectar_control_pc_despues_y_callbacks_rotos(tmp_path: Path) -> None:
+    rastreador, reloj, fuente = _rastreador(tmp_path, 7.0, "hypridle")
+
+    def roto() -> float:
+        raise OSError("sin sesión de escritorio")
+
+    rastreador.conectar_control_pc(inactividad_pc=roto, ts_ultima_inyeccion=roto)
+    estado = rastreador.actualizar()                       # nunca lanza: usa la fuente normal
+    assert estado.segundos_inactivo == pytest.approx(7.0) and estado.fuente_inactividad == "hypridle"
+    pc = PCFalso(reloj)
+    rastreador.conectar_control_pc(inactividad_pc=pc.inactividad_s, ts_ultima_inyeccion=pc.ts_ultima_inyeccion,
+                                   reloj_inyeccion=reloj)
+    reloj.avanzar(3)
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(3.0)
+    rastreador.conectar_control_pc()                        # desconectar
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(7.0)
+
+
+def test_reinicio_por_inyeccion_propia_se_ignora(tmp_path: Path) -> None:
+    reloj = Reloj()
+    pc = PCFalso(reloj)
+    ajustes = _settings(tmp_path, RAMS_AWAY_MINUTES="10")
+    rastreador = RastreadorPresencia(ajustes, reloj=reloj, fuente_inactividad=Fuente(None),
+                                     inactividad_pc=pc.inactividad_s, ts_ultima_inyeccion=pc.ts_ultima_inyeccion,
+                                     reloj_inyeccion=reloj)
+    reloj.avanzar(500)
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(500.0)
+    pc.inyectar()                                          # travesura: Windows marca actividad
+    reloj.avanzar(0.5)
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(500.5)
+    reloj.avanzar(200)
+    estado = rastreador.actualizar()
+    assert estado.segundos_inactivo == pytest.approx(700.5)      # sigue contando desde el input real
+    assert estado.presente is False and estado.motivo == "inactividad"
+    # El usuario mueve el ratón de verdad (lejos de la inyección): actividad real.
+    reloj.avanzar(10)
+    pc.usuario()
+    estado = rastreador.actualizar()
+    assert estado.segundos_inactivo == pytest.approx(0.0) and estado.presente is True
+
+
+def test_input_real_cerca_de_la_inyeccion_tambien_se_ignora(tmp_path: Path) -> None:
+    reloj = Reloj()
+    pc = PCFalso(reloj)
+    rastreador = RastreadorPresencia(_settings(tmp_path), reloj=reloj, fuente_inactividad=Fuente(None),
+                                     inactividad_pc=pc.inactividad_s, ts_ultima_inyeccion=pc.ts_ultima_inyeccion,
+                                     reloj_inyeccion=reloj)
+    reloj.avanzar(60)
+    rastreador.actualizar()
+    pc.inyectar()
+    reloj.avanzar(0.8)
+    pc.usuario()                                           # a ±1 s de la inyección: no se distingue
+    reloj.avanzar(1)
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(61.8)
+    reloj.avanzar(5)
+    pc.usuario()                                           # 6,8 s después: es del usuario
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(0.0)
+
+
+def test_sin_ts_de_inyeccion_no_filtra(tmp_path: Path) -> None:
+    reloj = Reloj()
+    pc = PCFalso(reloj)
+    rastreador = RastreadorPresencia(_settings(tmp_path), reloj=reloj, fuente_inactividad=Fuente(None),
+                                     inactividad_pc=pc.inactividad_s)
+    reloj.avanzar(100)
+    rastreador.actualizar()
+    pc.inyectar()
+    reloj.avanzar(1)
+    assert rastreador.actualizar().segundos_inactivo == pytest.approx(1.0)

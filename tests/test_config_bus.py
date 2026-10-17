@@ -11,6 +11,8 @@ import json
 import logging
 import math
 import os
+import subprocess
+import sys
 import threading
 import time
 import types
@@ -30,16 +32,35 @@ from core.config import (
     configurar_logging,
     en_horario_silencioso,
     leer_env_archivo,
+    normalizar_titulo,
+    parece_secreto,
     parsear_env_texto,
     redactar,
+    titulo_sensible,
     zona_local,
 )
 from core.contracts import (
+    ACCIONES_ORDEN_ESCRITORIO,
     CANALES_ENTRADA,
+    CANALES_LOCALES,
+    CANALES_SALIDA,
+    CONDUCTAS_SOLICITUD,
+    CONTROLES_ESCRITORIO,
+    DESTINOS_BASE,
     DIVERGENCIA_STEINS_GATE,
+    ESTADOS_VISION,
+    EVENTOS_ESCRITORIO,
+    INICIATIVAS,
+    MODOS_PANTALLA,
     MODOS_SALIDA,
+    ORIGENES_ACCION,
+    PATRON_TITULO_SENSIBLE,
+    PATRONES_TRAVESURA,
+    SAFE_ALIAS_RE,
     TIPOS_ACCION,
+    TIPOS_ACCION_V02,
     BrocaReply,
+    ContextoBroca,
     DiagnosticoModulo,
     EstadoModulo,
     EstadoPresencia,
@@ -914,8 +935,8 @@ def test_resumen_nexus_payload_roto_se_registra(caplog: pytest.LogCaptureFixture
 
 def test_constantes_contrato() -> None:
     assert "terminal_largo" in MODOS_SALIDA
-    assert CANALES_ENTRADA == ("terminal", "telegram", "nexus")
-    assert "comando" not in TIPOS_ACCION and len(TIPOS_ACCION) == 8
+    assert CANALES_ENTRADA == ("terminal", "telegram", "nexus", "escritorio")
+    assert "comando" not in TIPOS_ACCION and len(TIPOS_ACCION) == 13
 
 
 def test_broca_reply_y_utterance() -> None:
@@ -986,3 +1007,445 @@ def test_protocolos_runtime_checkable() -> None:
     assert not isinstance(HyprFalso(), RegistroLlamadas)
     assert not isinstance(object(), SalidaAvatar)
     assert math.isfinite(HomeostaticState().ts)
+
+
+# ---------------------------------------------------------------------------
+# v0.2 "Amadeus Companion" (docs/COMPANION.md §C2.1, §C2.2, §C3 "Grupo base")
+# ---------------------------------------------------------------------------
+
+RAIZ_PROYECTO = Path(__file__).resolve().parents[1]
+
+# Defectos exactos de §C2.1 (salvo la ruta del token, que depende del sistema).
+DEFECTOS_V02 = {
+    "escritorio_habilitado": True,
+    "escritorio_voz": False,
+    "hud_chat": True,
+    "travesuras_habilitadas": False,
+    "travesura_amplitud_max_px": 40,
+    "destinos_items": (),
+    "vtuber_ai_tema": "amadeus",
+    "vision_continua": False,
+    "vision_fps": 3.0,
+    "vision_detector": "auto",
+    "vision_modelo": None,
+    "vision_hfov": 70.0,
+    "vision_espejo": False,
+    "vision_apps_pausa": ("zoom", "teams", "ms-teams", "discord", "obs64", "obs"),
+    "pantalla_modo": "off",
+    "pantalla_fps": 1.0,
+    "pantalla_excluir": (),
+    "pantalla_excluir_avatar": True,
+}
+
+
+def test_v02_valores_por_defecto() -> None:
+    s = cargar_settings(entorno={})
+    for campo, esperado in DEFECTOS_V02.items():
+        assert getattr(s, campo) == esperado, campo
+    assert isinstance(s.travesura_amplitud_max_px, int) and isinstance(s.vision_fps, float)
+    # Con un entorno explícito sin LOCALAPPDATA ni XDG_RUNTIME_DIR: data_dir/escritorio.json.
+    assert s.escritorio_token_file == s.data_dir / "escritorio.json"
+    assert s.tiene_escritorio is True and s.tiene_vision_continua is False
+    directo = Settings()
+    for campo, esperado in DEFECTOS_V02.items():
+        assert getattr(directo, campo) == esperado, campo
+    assert directo.escritorio_token_file.name == "escritorio.json"
+
+
+def test_v02_fixture_settings_prueba_aislada(settings_prueba: Settings, tmp_path: Path) -> None:
+    assert settings_prueba.escritorio_token_file == tmp_path / "escritorio.json"
+    assert settings_prueba.travesuras_habilitadas is False
+    assert settings_prueba.vision_continua is False and settings_prueba.tiene_vision_continua is False
+    assert settings_prueba.pantalla_modo == "off"
+
+
+def test_v02_ruta_token_escritorio_por_plataforma(tmp_path: Path) -> None:
+    ruta = config._ruta_token_escritorio
+    datos = tmp_path / "data"
+    local = str(tmp_path / "AppData" / "Local")
+    assert ruta({"LOCALAPPDATA": local}.get, datos, plataforma="win32") == \
+        Path(local) / "rams" / "escritorio.json"
+    assert ruta({}.get, datos, plataforma="win32") == datos / "escritorio.json"
+    assert ruta({"XDG_RUNTIME_DIR": "/run/user/1000"}.get, datos, plataforma="linux") == \
+        Path("/run/user/1000") / "rams" / "escritorio.json"
+    assert ruta({"XDG_RUNTIME_DIR": "  "}.get, datos, plataforma="linux") == datos / "escritorio.json"
+    assert ruta({"XDG_RUNTIME_DIR": "relativa/x"}.get, datos, plataforma="linux") == \
+        datos / "escritorio.json"                                    # nunca relativa a os.getcwd()
+    # En Linux no se mira LOCALAPPDATA ni en Windows XDG_RUNTIME_DIR.
+    assert ruta({"LOCALAPPDATA": local}.get, datos, plataforma="linux") == datos / "escritorio.json"
+    assert ruta({"XDG_RUNTIME_DIR": "/run/user/1000"}.get, datos, plataforma="win32") == \
+        datos / "escritorio.json"
+    # cargar_settings lee la variable del sistema actual desde el MISMO entorno explícito.
+    var = "LOCALAPPDATA" if sys.platform == "win32" else "XDG_RUNTIME_DIR"
+    base_sistema = local if sys.platform == "win32" else "/run/user/1000"
+    s = cargar_settings(entorno={var: base_sistema, "RAMS_DATA_DIR": str(datos)})
+    assert s.escritorio_token_file == Path(base_sistema) / "rams" / "escritorio.json"
+    hogar = tmp_path / "hogar"
+    explicita = cargar_settings(entorno={"HOME": str(hogar),
+                                         "RAMS_ESCRITORIO_TOKEN_FILE": "~/rams/escritorio.json"})
+    assert explicita.escritorio_token_file == hogar / "rams" / "escritorio.json"
+
+
+def test_v02_rangos_y_opciones(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        malo = cargar_settings(entorno={
+            "RAMS_PANTALLA_FPS": "0.1", "RAMS_VISION_FPS": "6", "RAMS_TRAVESURA_AMPLITUD": "81",
+            "RAMS_VISION_HFOV": "29", "RAMS_PANTALLA_MODO": "todo", "RAMS_VISION_DETECTOR": "dlib",
+            "VTUBER_AI_TEMA": "otro-tema-raro", "RAMS_TRAVESURAS": "a-veces", "RAMS_HUD_CHAT": "tal-vez",
+        })
+    assert malo.pantalla_fps == 1.0 and malo.vision_fps == 3.0
+    assert malo.travesura_amplitud_max_px == 40 and malo.vision_hfov == 70.0
+    assert malo.pantalla_modo == "off" and malo.vision_detector == "auto"
+    assert malo.vtuber_ai_tema == "amadeus"
+    assert malo.travesuras_habilitadas is False and malo.hud_chat is True
+    mensajes = " ".join(r.getMessage() for r in _avisos_config(caplog))
+    for var in ("RAMS_PANTALLA_FPS", "RAMS_VISION_FPS", "RAMS_TRAVESURA_AMPLITUD", "RAMS_VISION_HFOV",
+                "RAMS_PANTALLA_MODO", "RAMS_VISION_DETECTOR", "VTUBER_AI_TEMA", "RAMS_TRAVESURAS"):
+        assert var in mensajes
+    assert "otro-tema-raro" not in mensajes and "a-veces" not in mensajes   # nunca el valor recibido
+    assert cargar_settings(entorno={"RAMS_PANTALLA_FPS": "3"}).pantalla_fps == 1.0
+    bueno = cargar_settings(entorno={
+        "RAMS_PANTALLA_FPS": "0,2", "RAMS_VISION_FPS": "5", "RAMS_TRAVESURA_AMPLITUD": "80",
+        "RAMS_VISION_HFOV": "120", "RAMS_PANTALLA_MODO": "Metadatos", "RAMS_VISION_DETECTOR": "YUNET",
+        "VTUBER_AI_TEMA": "None", "RAMS_TRAVESURAS": "1", "RAMS_ESCRITORIO": "0",
+        "RAMS_ESCRITORIO_VOZ": "sí", "RAMS_HUD_CHAT": "0", "RAMS_VISION_ESPEJO": "1",
+        "RAMS_PANTALLA_EXCLUIR_AVATAR": "0", "RAMS_VISION_MODELO": "modelos/yunet.onnx",
+    }, base_dir=RAIZ_PROYECTO)
+    assert bueno.pantalla_fps == 0.2 and bueno.vision_fps == 5.0
+    assert bueno.travesura_amplitud_max_px == 80 and bueno.vision_hfov == 120.0
+    assert bueno.pantalla_modo == "metadatos" and bueno.vision_detector == "yunet"
+    assert bueno.vtuber_ai_tema == "none" and bueno.travesuras_habilitadas is True
+    assert bueno.escritorio_habilitado is False and bueno.tiene_escritorio is False
+    assert bueno.escritorio_voz is True and bueno.hud_chat is False
+    assert bueno.vision_espejo is True and bueno.pantalla_excluir_avatar is False
+    assert bueno.vision_modelo == RAIZ_PROYECTO / "modelos" / "yunet.onnx"   # relativa a base_dir
+    assert cargar_settings(entorno={"RAMS_TRAVESURA_AMPLITUD": "5"}).travesura_amplitud_max_px == 5
+    assert cargar_settings(entorno={"RAMS_PANTALLA_MODO": "pixeles"}).pantalla_modo == "pixeles"
+
+
+def test_v02_csv_procesos_y_patrones(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        s = cargar_settings(entorno={
+            "RAMS_VISION_APPS_PAUSA": "Zoom.exe, slack ,zoom,,mal nombre,OBS64",
+            "RAMS_PANTALLA_EXCLUIR": "Mi Banco Ñ, Diario  Íntimo,,mi banco ñ," + "x" * 61,
+        })
+    assert s.vision_apps_pausa == ("zoom", "slack", "obs64")
+    assert s.pantalla_excluir == ("mi banco n", "diario intimo")
+    avisos = [r.getMessage() for r in _avisos_config(caplog)]
+    assert any("RAMS_VISION_APPS_PAUSA" in m for m in avisos)
+    assert any("RAMS_PANTALLA_EXCLUIR" in m for m in avisos)
+    assert all("mal nombre" not in m for m in avisos)
+    todo_malo = cargar_settings(entorno={"RAMS_VISION_APPS_PAUSA": "???, a b"})
+    assert todo_malo.vision_apps_pausa == DEFECTOS_V02["vision_apps_pausa"]
+    muchos = cargar_settings(entorno={"RAMS_PANTALLA_EXCLUIR": ",".join(f"p{i}" for i in range(40))})
+    assert len(muchos.pantalla_excluir) == 32
+
+
+def test_v02_rams_destinos_suma_sinonimos_y_descarta(caplog: pytest.LogCaptureFixture) -> None:
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        s = cargar_settings(entorno={
+            "RAMS_DESTINOS": "wasap=whatsapp, Twitter=X,malo=noexiste,x=whatsapp,Música=spotify,"
+                             "sin igual,con espacio=x,face=facebook,face=instagram,youtube=youtube"})
+    assert s.destinos_items == (("wasap", "whatsapp"), ("twitter", "x"), ("musica", "spotify"),
+                                ("face", "instagram"))
+    avisos = [r.getMessage() for r in _avisos_config(caplog)]
+    assert len(avisos) == 1 and "RAMS_DESTINOS" in avisos[0] and "4" in avisos[0]
+    assert "noexiste" not in avisos[0]
+    destinos = s.destinos_permitidos
+    assert isinstance(destinos, types.MappingProxyType)
+    for clave in DESTINOS_BASE:
+        assert destinos[clave] == clave                      # el catálogo siempre está
+    assert destinos["wasap"] == "whatsapp" and destinos["twitter"] == "x"
+    assert destinos["musica"] == "spotify" and destinos["face"] == "instagram"
+    assert destinos["x"] == "x"                              # un sinónimo nunca pisa una clave
+    assert set(destinos) == set(DESTINOS_BASE) | {"wasap", "twitter", "musica", "face"}
+    with pytest.raises(TypeError):
+        destinos["rm"] = "archivos"  # type: ignore[index]
+    sin_destinos = cargar_settings(entorno={})
+    assert dict(sin_destinos.destinos_permitidos) == {clave: clave for clave in DESTINOS_BASE}
+    # Robusto ante una copia con datos raros (con()), sin lanzar.
+    raro = sin_destinos.con(destinos_items=[["chat", "telegram"], ("MAL", "x"), ("y",)])
+    assert dict(raro.destinos_permitidos) == {**{c: c for c in DESTINOS_BASE}, "chat": "telegram"}
+
+
+def test_v02_capacidades_no_dependen_de_offline() -> None:
+    entorno = {"RAMS_CAMERA": "1", "RAMS_VISION_CONTINUA": "1"}
+    for offline in (True, False):
+        s = cargar_settings(entorno=entorno, offline=offline)
+        assert s.offline is offline
+        assert s.tiene_escritorio is True
+        assert s.tiene_vision_continua is True
+    s = cargar_settings(entorno=entorno, offline=True)
+    assert s.con(camara_habilitada=False).tiene_vision_continua is False      # opt-in de dos niveles
+    assert s.con(vision_continua=False).tiene_vision_continua is False
+    assert cargar_settings(entorno={"RAMS_VISION_CONTINUA": "1"}).tiene_vision_continua is False
+    assert s.con(escritorio_habilitado=False).tiene_escritorio is False
+
+
+def test_v02_pantalla_excluir_re() -> None:
+    s = cargar_settings(entorno={"RAMS_PANTALLA_EXCLUIR": "Diario Íntimo, a.b(c"})
+    patron = s.pantalla_excluir_re
+    assert patron is s.pantalla_excluir_re                    # compilado una vez (caché)
+    for titulo in ("Bitwarden", "Nueva pestaña InPrivate", "Iniciar sesión - Cuenta",
+                   "Bancolombia - Sucursal Virtual", "Mi diario íntimo - Notas", "Pagar con PSE",
+                   "KeePassXC", "Navegación privada - Firefox", "Archivo a.b(c).txt"):
+        assert patron.search(normalizar_titulo(titulo)), titulo
+    assert patron.search("Bitwarden")                         # sin distinguir mayúsculas
+    for titulo in ("YouTube - Google Chrome", "main.py - Visual Studio Code", "Archivo axb(c",
+                   "Steins;Gate 0 - Episodio 1"):
+        assert patron.search(normalizar_titulo(titulo)) is None, titulo
+    base = cargar_settings(entorno={}).pantalla_excluir_re
+    assert base.pattern == PATRON_TITULO_SENSIBLE             # sin extras: exactamente el patrón base
+    assert base.search(normalizar_titulo("Mi diario íntimo")) is None
+
+
+def test_parece_secreto() -> None:
+    for texto in ("482915", "  1234 ", "4111 1111 1111 1111", "4111-1111-1111-1111",
+                  "mi tarjeta es 4111111111111111 ok", "AIza" + "B" * 35, "password: x",
+                  "Contraseña: hunter2", "mi pin: 1234", "el código=998877", "Kj8#mP2$qL9!",
+                  "Password123!", "token=abc", "x" * 30):
+        assert parece_secreto(texto) is True, texto
+    assert parece_secreto("te paso mi-secreto-largo", ["mi-secreto-largo"]) is True
+    for texto in ("hola, ¿vienes mañana?", "¡Felicidades, mamá! #SteinsGate0 @kurisu_makise",
+                  "nos vemos en Bogotá-Medellín a las 3:00pm-5:00pm", "llámame al 300 123 4567",
+                  "4111111111111112", "", "   ", "El Psy Kongroo.", "escríbeme a juan.perez@gmail.com",
+                  "mira https://wa.me/573001234567", "La reunión es el 17/10/2026 a las 10:30"):
+        assert parece_secreto(texto) is False, texto
+    assert parece_secreto(None) is False  # type: ignore[arg-type]
+
+
+def test_titulo_sensible_y_normalizar_titulo() -> None:
+    assert titulo_sensible("Bancolombia - Sucursal Virtual") is True
+    assert titulo_sensible("Iniciar sesión - Google Chrome") is True
+    assert titulo_sensible("Verificación en dos pasos") is True
+    assert titulo_sensible("KeePassXC") is True
+    assert titulo_sensible("Nueva pestaña InPrivate - Microsoft Edge") is True
+    assert titulo_sensible("Nequi") is True and titulo_sensible("Escribe tu PIN") is True
+    assert titulo_sensible("YouTube - Google Chrome") is False
+    assert titulo_sensible("Spinning - Música") is False      # \bpin\b no casa dentro de palabras
+    assert titulo_sensible("") is False and titulo_sensible(None) is False
+    assert normalizar_titulo("  Contraseña   ÑANDÚ ") == "contrasena nandu"
+    assert normalizar_titulo(None) == ""
+
+
+def test_v02_constantes_de_contrato() -> None:
+    assert "curiosidad_web" in INICIATIVAS and INICIATIVAS[:4] == (
+        "conversar", "curiosidad_visual", "descanso", "cambio_linea")
+    assert CANALES_LOCALES == frozenset({"terminal", "escritorio"})
+    assert "escritorio" in CANALES_LOCALES and set(CANALES_LOCALES) <= set(CANALES_ENTRADA)
+    assert CANALES_SALIDA == ("voz", "terminal", "telegram")            # NO cambia
+    assert ORIGENES_ACCION == ("usuario", "iniciativa", "nexus", "telegram", "llm")   # NO cambia
+    assert TIPOS_ACCION[:8] == ("lanzar_app", "enfocar_nexus", "ir_workspace", "cerrar_ventana",
+                                "volumen", "media", "captura_pantalla", "vistazo")
+    assert TIPOS_ACCION_V02 == frozenset({"abrir_destino", "buscar_en", "prerrellenar",
+                                          "escribir_texto", "travesura_cursor"})
+    assert TIPOS_ACCION_V02 <= set(TIPOS_ACCION) and len(set(TIPOS_ACCION)) == 13
+    assert PATRONES_TRAVESURA == ("empujon", "circulo", "temblor", "hacia_avatar")
+    assert MODOS_PANTALLA == ("off", "metadatos", "pixeles")
+    assert ESTADOS_VISION == ("off", "continua", "pausada", "ocupada", "error", "degradada")
+    assert ACCIONES_ORDEN_ESCRITORIO == ("aparecer", "esconderse", "abrir_chat", "notificar")
+    assert EVENTOS_ESCRITORIO == ("toque", "soltada", "cursor_encima", "mostrada", "ocultada",
+                                  "chat_abierto")
+    assert CONTROLES_ESCRITORIO == ("no_molestar_on", "no_molestar_off", "basta_travesuras",
+                                    "pausar_vision")
+    assert CONDUCTAS_SOLICITUD == ("buscar_usuario", "asomarse", "esconderse", "pasear")
+    assert SAFE_ALIAS_RE.match("whatsapp_2") and not SAFE_ALIAS_RE.match("WhatsApp")
+    assert not SAFE_ALIAS_RE.match("a" * 25) and not SAFE_ALIAS_RE.match("")
+    assert list(DESTINOS_BASE) == ["whatsapp", "telegram", "x", "gmail", "correo", "instagram",
+                                   "tiktok", "facebook", "discord", "linkedin", "youtube",
+                                   "spotify", "navegador", "archivos"]
+    prerrelleno = {k for k, v in DESTINOS_BASE.items() if v["prerrelleno"]}
+    busqueda = {k for k, v in DESTINOS_BASE.items() if v["busqueda"]}
+    assert prerrelleno == {"whatsapp", "telegram", "x", "gmail", "correo"}
+    assert busqueda == {"x", "youtube", "spotify", "navegador"}
+    assert isinstance(DESTINOS_BASE, types.MappingProxyType)
+    assert all(isinstance(v, types.MappingProxyType) and set(v) == {"prerrelleno", "busqueda"}
+               for v in DESTINOS_BASE.values())
+    with pytest.raises(TypeError):
+        DESTINOS_BASE["whatsapp"]["prerrelleno"] = False  # type: ignore[index]
+    with pytest.raises(TypeError):
+        DESTINOS_BASE["nuevo"] = {}  # type: ignore[index]
+    assert "bitwarden" in PATRON_TITULO_SENSIBLE and r"\bpin\b" in PATRON_TITULO_SENSIBLE
+    import core.contracts as contratos
+    for nombre in ("TIPOS_ACCION_V02", "PATRONES_TRAVESURA", "MODOS_PANTALLA", "ESTADOS_VISION",
+                   "ACCIONES_ORDEN_ESCRITORIO", "EVENTOS_ESCRITORIO", "CONTROLES_ESCRITORIO",
+                   "CONDUCTAS_SOLICITUD", "SAFE_ALIAS_RE", "DESTINOS_BASE", "PATRON_TITULO_SENSIBLE"):
+        assert nombre in contratos.__all__, nombre
+    for nombre in ("parece_secreto", "titulo_sensible"):
+        assert nombre in config.__all__
+    # Los contratos que validan contra estas constantes aceptan los valores nuevos.
+    assert HomeostaticState(iniciativa="curiosidad_web").iniciativa == "curiosidad_web"
+    assert Utterance(segmentos=(), tipo_iniciativa="curiosidad_web").tipo_iniciativa == "curiosidad_web"
+    ctx = ContextoBroca(estado=HomeostaticState(), canal_entrada="escritorio")
+    assert ctx.canal_entrada == "escritorio"
+    iniciativa = ContextoBroca(estado=HomeostaticState(), canal_entrada="iniciativa",
+                               iniciativa="curiosidad_web")
+    assert iniciativa.iniciativa == "curiosidad_web"
+
+
+def test_contexto_broca_percepcion_filtrada() -> None:
+    estado = HomeostaticState()
+    assert ContextoBroca(estado=estado).percepcion is None
+    ctx = ContextoBroca(estado=estado, percepcion={"app": "chrome", "x": 1})
+    assert ctx.percepcion == {"app": "chrome"}
+    assert isinstance(ctx.percepcion, types.MappingProxyType)
+    with pytest.raises(TypeError):
+        ctx.percepcion["app"] = "otra"  # type: ignore[index]
+    assert isinstance(hash(ctx), int)                        # percepcion no entra en el hash
+    completa = ContextoBroca(estado=estado, percepcion={
+        "app": None, "titulo_corto": "T" * 100 + "\n", "video": 1, "pantalla_completa": float("nan"),
+        "rostro": "sí", "atencion": 3, "dist_m": -2.0, "imagen": b"\x00\x01", "titulo": "completo"})
+    assert dict(completa.percepcion) == {"app": "", "titulo_corto": "T" * 60, "video": True,
+                                         "pantalla_completa": None, "rostro": None,
+                                         "atencion": 1.0, "dist_m": 0.0}
+    normal = ContextoBroca(estado=estado, percepcion={"app": "code", "titulo_corto": "main.py",
+                                                      "video": False, "pantalla_completa": None,
+                                                      "rostro": True, "atencion": 0.4, "dist_m": 0.7})
+    assert dict(normal.percepcion) == {"app": "code", "titulo_corto": "main.py", "video": False,
+                                       "pantalla_completa": None, "rostro": True, "atencion": 0.4,
+                                       "dist_m": 0.7}
+    assert ContextoBroca(estado=estado, percepcion=["app", "chrome"]).percepcion is None  # type: ignore[arg-type]
+    assert ContextoBroca(estado=estado, percepcion={}).percepcion == {}
+    json.dumps(dict(normal.percepcion))
+
+
+def test_v02_settings_hashable_y_resumen() -> None:
+    entorno = {"RAMS_DESTINOS": "wasap=whatsapp", "RAMS_PANTALLA_EXCLUIR": "diario",
+               "RAMS_VISION_MODELO": "/opt/yunet.onnx", "RAMS_VISION_APPS_PAUSA": "zoom,slack"}
+    s = cargar_settings(entorno=entorno)
+    assert isinstance(hash(s), int)
+    assert hash(s) == hash(cargar_settings(entorno=entorno))
+    assert {s: "ok"}[cargar_settings(entorno=entorno)] == "ok"
+    resumen = s.resumen_seguro()
+    json.dumps(resumen, ensure_ascii=False)
+    assert resumen["tiene_escritorio"] is True and resumen["tiene_vision_continua"] is False
+    assert resumen["destinos_items"] == [["wasap", "whatsapp"]]
+    assert str(resumen["escritorio_token_file"]).endswith("escritorio.json")
+
+
+def test_env_example_v02_da_los_defectos_sin_avisos(caplog: pytest.LogCaptureFixture) -> None:
+    ruta = RAIZ_PROYECTO / ".env.example"
+    texto = ruta.read_bytes().decode("utf-8")
+    assert "\r" not in texto
+    for seccion in ("# --- Amadeus Desktop / escritorio ---", "# --- Control del PC y travesuras ---",
+                    "# --- Visión continua (cámara + pantalla) ---"):
+        assert seccion in texto
+    for var in ("RAMS_ESCRITORIO", "RAMS_ESCRITORIO_TOKEN_FILE", "RAMS_ESCRITORIO_VOZ", "RAMS_HUD_CHAT",
+                "RAMS_TRAVESURAS", "RAMS_TRAVESURA_AMPLITUD", "RAMS_DESTINOS", "VTUBER_AI_TEMA",
+                "RAMS_VISION_CONTINUA", "RAMS_VISION_FPS", "RAMS_VISION_DETECTOR", "RAMS_VISION_MODELO",
+                "RAMS_VISION_HFOV", "RAMS_VISION_ESPEJO", "RAMS_VISION_APPS_PAUSA", "RAMS_PANTALLA_MODO",
+                "RAMS_PANTALLA_FPS", "RAMS_PANTALLA_EXCLUIR", "RAMS_PANTALLA_EXCLUIR_AVATAR"):
+        assert f"{var}=" in texto, var
+    leido = leer_env_archivo(ruta)
+    with caplog.at_level(logging.DEBUG, logger="rams.config"):
+        s = cargar_settings(entorno=leido)
+    assert _avisos_config(caplog) == [], [r.getMessage() for r in _avisos_config(caplog)]
+    for campo, esperado in DEFECTOS_V02.items():
+        assert getattr(s, campo) == esperado, campo
+    assert s.escritorio_token_file == cargar_settings(entorno={}).escritorio_token_file
+
+
+def test_asegurar_directorios_crea_el_padre_del_token(tmp_path: Path,
+                                                      caplog: pytest.LogCaptureFixture) -> None:
+    padre = tmp_path / "run" / "rams"
+    s = cargar_settings(entorno={"RAMS_DATA_DIR": str(tmp_path / "d"),
+                                 "RAMS_ESCRITORIO_TOKEN_FILE": str(padre / "escritorio.json")})
+    s.asegurar_directorios()
+    s.asegurar_directorios()  # idempotente
+    assert padre.is_dir() and not (padre / "escritorio.json").exists()   # el archivo lo escribe el HUD
+    ajeno = tmp_path / "compartido"
+    ajeno.mkdir()
+    if os.name == "posix":
+        assert (padre.stat().st_mode & 0o777) == 0o700
+        os.chmod(ajeno, 0o755)
+    otro = s.con(escritorio_token_file=ajeno / "escritorio.json")
+    otro.asegurar_directorios()
+    if os.name == "posix":   # un directorio ajeno que ya existía no cambia de permisos
+        assert (ajeno.stat().st_mode & 0o777) == 0o755
+    (tmp_path / "archivo.txt").write_text("no soy un directorio", encoding="utf-8")
+    roto = s.con(escritorio_token_file=tmp_path / "archivo.txt" / "escritorio.json")
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        roto.asegurar_directorios()   # OSError registrado, no propagado
+    assert any("token de escritorio" in r.getMessage() for r in _avisos_config(caplog))
+
+
+# ---------------------------------------------------------------------------
+# Fixture sin_efectos_pc (tests/conftest.py)
+# ---------------------------------------------------------------------------
+
+
+def _marcada(objeto: object) -> bool:
+    """El sustituto lleva la marca de la fixture (si no, NO se llama: sería el efecto real)."""
+    return getattr(objeto, "_rams_sin_efectos", False) is True
+
+
+def test_sin_efectos_pc_falla_ante_xdg_open_por_asyncio(correr) -> None:
+    assert _marcada(asyncio.create_subprocess_exec)
+    assert _marcada(asyncio.subprocess.create_subprocess_exec)
+    with pytest.raises(pytest.fail.Exception, match="xdg-open"):
+        asyncio.create_subprocess_exec("xdg-open", "https://example.com")
+
+    async def principal() -> None:
+        await asyncio.create_subprocess_exec("/usr/bin/hyprctl", "dispatch", "exec", "kitty")
+
+    with pytest.raises(pytest.fail.Exception, match="hyprctl"):
+        correr(principal())
+
+
+def test_sin_efectos_pc_popen_vigilado() -> None:
+    assert _marcada(subprocess.Popen)
+    for argumentos in (["wtype", "hola"], ["C:\\Windows\\explorer.exe", "https://example.com"],
+                       "cmd /c start https://example.com", ["powershell.exe", "-c", "x"],
+                       [Path("/usr/bin/gtk-launch"), "kitty"], [b"ydotool", b"type", b"x"]):
+        with pytest.raises(pytest.fail.Exception):
+            subprocess.Popen(argumentos)
+    with pytest.raises(pytest.fail.Exception):
+        subprocess.run(["start", "https://example.com"], check=False)
+    # Lo demás pasa (también un iterador, que no se consume al revisarlo).
+    resultado = subprocess.run([sys.executable, "-c", "print('ok')"], capture_output=True, text=True,
+                               timeout=60, check=False)
+    assert resultado.returncode == 0 and resultado.stdout.strip() == "ok"
+    proceso = subprocess.Popen(iter([sys.executable, "-c", "pass"]))
+    assert isinstance(proceso, subprocess.Popen)
+    assert proceso.wait(timeout=60) == 0
+
+
+def test_sin_efectos_pc_navegador_y_win32() -> None:
+    import webbrowser
+
+    for nombre in ("open", "open_new", "open_new_tab"):
+        funcion = getattr(webbrowser, nombre)
+        assert _marcada(funcion), nombre
+        with pytest.raises(pytest.fail.Exception):
+            funcion("https://example.com")
+    if hasattr(os, "startfile"):
+        assert _marcada(os.startfile)
+        with pytest.raises(pytest.fail.Exception):
+            os.startfile("https://example.com")
+    if sys.platform == "win32":
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        for nombre in ("SendInput", "SetCursorPos", "keybd_event", "mouse_event", "SetForegroundWindow"):
+            funcion = getattr(user32, nombre)
+            assert _marcada(funcion), nombre
+            with pytest.raises(pytest.fail.Exception):
+                funcion(0, 0)
+        assert _marcada(ctypes.windll.shell32.ShellExecuteW)
+
+
+def test_sin_efectos_pc_un_monkeypatch_del_test_tiene_prioridad(monkeypatch: pytest.MonkeyPatch,
+                                                               correr) -> None:
+    lanzados: list[tuple[str, ...]] = []
+
+    async def exec_falso(*argv: str, **kwargs: object) -> str:
+        lanzados.append(argv)
+        return "proceso-falso"
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", exec_falso)
+    assert correr(asyncio.create_subprocess_exec("xdg-open", "https://example.com")) == "proceso-falso"
+    assert lanzados == [("xdg-open", "https://example.com")]
+    import webbrowser
+
+    monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: True)
+    assert webbrowser.open("https://example.com") is True

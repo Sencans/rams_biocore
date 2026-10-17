@@ -6,6 +6,8 @@ Qué hace:
   Ningún fotograma sale de una variable local: nunca se codifica, se guarda ni se graba, y al
   LLM solo llegan ``{"rostro", "n_rostros", "duracion_ms"}``. Canon del episodio 3 de
   *Steins;Gate 0*: Amadeus ve el mundo por la cámara del teléfono, y siempre lo dice.
+  v0.2: con la visión continua abierta (``set_fuente_continua``), el vistazo se sirve de su
+  última muestra sin abrir el dispositivo; ``vision.camara`` lleva ``fuente:"vistazo"``.
 - **Captura de pantalla** bajo petición explícita del usuario (``grim``, solo Linux/Wayland).
 - **Telemetría** del sistema (psutil, ``nvidia-smi``, sysfs) con alertas por flanco en
   formato J.A.R.V.I.S. y refractario de 10 min por tipo.
@@ -114,6 +116,9 @@ __all__ = [
 SAFE_CLASS_RE: Final = CLASE_SEGURA_RE          # ^[A-Za-z0-9_.\-]{1,64}$ (mismo patrón que la compuerta)
 
 ORIGEN_BUS: Final = "aura_vision_pc"
+# v0.2 (§C2.3): vision.camara lleva la fuente; el parpadeo de aura es "vistazo" (la visión
+# continua publica "continua"). El LED del HUD y la consola son el OR de las fuentes.
+FUENTE_CAMARA: Final = "vistazo"
 
 # Cámara (§9.2, §10.17).
 TIMEOUT_CAMARA_S: Final = 3.0
@@ -123,8 +128,12 @@ CALENTAMIENTO_GRABS: Final = 4
 _ANCHO_CAMARA: Final = 640
 _ALTO_CAMARA: Final = 480
 _XML_HAAR: Final = "haarcascade_frontalface_default.xml"
-_DIRS_HAAR_SISTEMA: Final = ("/usr/share/opencv4/haarcascades", "/usr/local/share/opencv4/haarcascades")
-_MODELO_YUNET: Final = "face_detection_yunet.onnx"
+# OpenCV 4 y OpenCV 5 (Arch instala los XML de opencv 5.x con contrib en /usr/share/opencv5/).
+_DIRS_HAAR_SISTEMA: Final = (
+    "/usr/share/opencv4/haarcascades", "/usr/local/share/opencv4/haarcascades",
+    "/usr/share/opencv5/haarcascades", "/usr/local/share/opencv5/haarcascades",
+)
+_PREFIJO_YUNET: Final = "face_detection_yunet"   # …_2023mar.onnx (guía §C5), el corto de la v0.1, etc.
 # Código FourCC de MJPG calculado a mano (evita depender de utilidades de grabación de OpenCV).
 _FOURCC_MJPG: Final = sum(ord(c) << (8 * i) for i, c in enumerate("MJPG"))
 
@@ -813,6 +822,16 @@ def _a_resultado(valor: Any) -> ResultadoVistazo:
     return ResultadoVistazo(None, error="no_abre")
 
 
+def _clase_cascada() -> Any:
+    """``CascadeClassifier`` del núcleo (OpenCV 4) o de ``xobjdetect`` (OpenCV 5 con contrib)."""
+    if cv2 is None:
+        return None
+    clase = getattr(cv2, "CascadeClassifier", None)
+    if clase is None:
+        clase = getattr(getattr(cv2, "xobjdetect", None), "CascadeClassifier", None)
+    return clase
+
+
 def _resolver_futuro(futuro: asyncio.Future[Any], valor: Any) -> None:
     if not futuro.done():
         futuro.set_result(valor)
@@ -886,6 +905,8 @@ class AuraVisionPC:
         self._yunet: Any = None
         self._yunet_tam: tuple[int, int] | None = None
         self._lock_detector = threading.Lock()
+        # v0.2: con la visión continua abierta, el vistazo se sirve de su última muestra (§C2.9).
+        self._fuente_continua: Callable[[str], ResultadoVistazo | None] | None = None
 
         # Telemetría.
         self._ejecutor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rams-pc")
@@ -967,6 +988,35 @@ class AuraVisionPC:
             log.warning("set_camara falló (%s)", type(exc).__name__)
             return False
 
+    def set_fuente_continua(self, fn: Callable[[str], ResultadoVistazo | None] | None) -> None:
+        """Fija (o quita con ``None``) la fuente de la visión continua (``VisionContinua.como_vistazo``).
+
+        Con una fuente fijada, si ``fn(motivo)`` devuelve un resultado, :meth:`vistazo` lo
+        devuelve **sin abrir el dispositivo**, sin contar el cupo diario ni el *backoff* y sin
+        publicar ``vision.camara`` (la cámara ya la tiene abierta la visión continua, que publica
+        su propio ``vision.camara`` con ``fuente:"continua"``). La compuerta y el interruptor de
+        la cámara se siguen aplicando antes. Si devuelve ``None`` (o falla), parpadeo normal.
+        """
+        if fn is not None and not callable(fn):
+            log.warning("set_fuente_continua: la fuente no es invocable; se ignora")
+            return
+        self._fuente_continua = fn
+        log.debug("Fuente de visión continua %s", "fijada" if fn is not None else "quitada")
+
+    def _vistazo_continuo(self, motivo: str) -> ResultadoVistazo | None:
+        """Resultado de la fuente continua (con ``motivo``), o ``None`` si no hay o no sirve."""
+        fuente = self._fuente_continua
+        if fuente is None:
+            return None
+        try:
+            bruto = fuente(motivo)
+        except Exception as exc:  # una fuente rota nunca debe tumbar el vistazo
+            log.debug("La fuente de visión continua falló (%s); parpadeo normal", type(exc).__name__)
+            return None
+        if bruto is None or not isinstance(bruto, (ResultadoVistazo, Mapping, bool)):
+            return None
+        return dataclasses.replace(_a_resultado(bruto), motivo=motivo)
+
     def reiniciar_backoff_camara(self) -> None:
         """Vuelve al primer escalón del *backoff* (main la llama con cada entrada local)."""
         self._escalon = 0
@@ -1018,13 +1068,23 @@ class AuraVisionPC:
             origen = "usuario" if motivo == "usuario" else "iniciativa"
         if not self.camara_habilitada:
             return self._fallo(motivo, "camara_deshabilitada")
-        if cv2 is None:
+        if cv2 is None and self._fuente_continua is None:
             return self._fallo(motivo, "sin_opencv")
         accion = AccionPC("vistazo", {"motivo": motivo}, "mirar por la cámara", origen=origen)
         if not await self._autorizada(accion):
             return self._fallo(motivo, "denegada")
         if not self.camara_habilitada:  # se pudo deshabilitar mientras se autorizaba
             return self._fallo(motivo, "camara_deshabilitada")
+        # v0.2: con la visión continua abierta se usa su última muestra; no se abre el
+        # dispositivo, no cuenta cupo ni backoff y no hay vision.camara (un vistazo ⇒ un
+        # vision.vistazo, como siempre).
+        continuo = self._vistazo_continuo(motivo)
+        if continuo is not None:
+            log.debug("Vistazo (%s) servido por la visión continua", motivo)
+            self._publicar("vision.vistazo", continuo.a_dict())
+            return continuo
+        if cv2 is None:
+            return self._fallo(motivo, "sin_opencv")
         ahora = self._reloj()
         ultimo = self._ultimo_vistazo_ts
         if motivo == "usuario":
@@ -1045,7 +1105,8 @@ class AuraVisionPC:
         estado = _Parpadeo(motivo=motivo, inicio=time.monotonic(), inicio_reloj=ahora,
                            cancelar=threading.Event())
         self._parpadeo_actual = estado
-        self._publicar("vision.camara", {"activa": True, "habilitada": True, "duracion_ms": 0})
+        self._publicar("vision.camara", {"activa": True, "habilitada": True, "duracion_ms": 0,
+                                         "fuente": FUENTE_CAMARA})
         futuro.add_done_callback(lambda f: self._al_terminar_parpadeo(estado, f))
         hilo = threading.Thread(target=self._hilo_camara, args=(loop, futuro, estado.cancelar),
                                 name="rams-camara", daemon=True)
@@ -1120,7 +1181,7 @@ class AuraVisionPC:
             ms_reales = int((time.monotonic() - estado.inicio) * 1000)
             resultado = self._resultado_de(estado, futuro)
             self._publicar("vision.camara", {"activa": False, "habilitada": self.camara_habilitada,
-                                             "duracion_ms": ms_reales})
+                                             "duracion_ms": ms_reales, "fuente": FUENTE_CAMARA})
             # Siempre, también tras un timeout: un vistazo ⇒ un vision.vistazo con lo que de
             # verdad pasó (lo mismo que se contabiliza abajo para el backoff).
             self._publicar("vision.vistazo", resultado.a_dict())
@@ -1223,8 +1284,8 @@ class AuraVisionPC:
         return cv2.cvtColor(fotograma, cv2.COLOR_BGR2GRAY)
 
     def _ruta_haar(self) -> Path | None:
-        """XML de Haar de ``cv2.data.haarcascades`` o de ``/usr/share/opencv4/haarcascades/``."""
-        if cv2 is None or not hasattr(cv2, "CascadeClassifier"):
+        """XML de Haar de ``cv2.data.haarcascades`` o de ``/usr/share/opencv{4,5}/haarcascades/``."""
+        if cv2 is None or _clase_cascada() is None:
             return None
         candidatos: list[Path] = []
         datos = getattr(cv2, "data", None)
@@ -1241,14 +1302,35 @@ class AuraVisionPC:
         return None
 
     def _ruta_yunet(self) -> Path | None:
-        """Modelo YuNet en ``data_dir/models`` si OpenCV trae ``FaceDetectorYN``."""
+        """Modelo YuNet si OpenCV trae ``FaceDetectorYN``: la misma búsqueda que la visión continua.
+
+        ``settings.vision_modelo`` o ``data_dir/models/face_detection_yunet*.onnx`` (el
+        ``…_2023mar.onnx`` de la guía incluido), con la preferencia por versión de OpenCV de
+        ``lobes.vision_continua.ruta_modelo_yunet``. Si ese módulo no se puede importar, el
+        primer ``face_detection_yunet*.onnx`` no cuantizado.
+        """
         if cv2 is None or not hasattr(cv2, "FaceDetectorYN"):
             return None
-        ruta = self.settings.data_dir / "models" / _MODELO_YUNET
+        explicita = getattr(self.settings, "vision_modelo", None)
         try:
-            return ruta if ruta.is_file() else None
-        except OSError:
+            mayor = int(str(getattr(cv2, "__version__", "4")).split(".", 1)[0])
+        except ValueError:
+            mayor = 4
+        try:
+            from lobes.vision_continua import ruta_modelo_yunet
+        except Exception as exc:  # módulo ausente o roto: búsqueda mínima equivalente
+            log.debug("Búsqueda compartida de YuNet no disponible (%s)", type(exc).__name__)
+        else:
+            return ruta_modelo_yunet(self.settings.data_dir, explicita=explicita, mayor=mayor)
+        try:
+            if explicita:
+                ruta = Path(explicita)
+                return ruta if ruta.is_file() else None
+            candidatos = sorted((p for p in (self.settings.data_dir / "models").glob(_PREFIJO_YUNET + "*.onnx")
+                                 if p.is_file()), key=lambda p: ("int8" in p.name.lower(), p.name.lower()))
+        except (OSError, TypeError, ValueError):
             return None
+        return candidatos[0] if candidatos else None
 
     def _tipo_detector(self) -> str | None:
         """``"haar"``, ``"yunet"`` o ``None`` (sin detector de rostros)."""
@@ -1268,7 +1350,7 @@ class AuraVisionPC:
             if ruta is None:
                 return None
             try:
-                clasificador = cv2.CascadeClassifier(str(ruta))
+                clasificador = _clase_cascada()(str(ruta))
                 if clasificador.empty():
                     log.warning("El clasificador Haar está vacío; sin detección Haar")
                     return None

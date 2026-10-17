@@ -50,6 +50,23 @@ consolidaciones con IDs Köchel `KV-0001` (compresor "Salieri"), llamadas perdid
 dosificado, el apodo "Christina" con escalado y «El Psy Kongroo» solo en despedidas especiales.
 La especificación completa está en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.md).
 
+### Novedades de la v0.2 "Amadeus Companion"
+
+- **Amadeus Desktop** (sección 8.2): una app de escritorio que vive en la bandeja. Amadeus aparece
+  caminando desde el borde de la pantalla cuando la llamas (o cuando **ella** decide buscarte porque
+  está aburrida, tiene un recordatorio para ti o encontró algo curioso), pasea, se asoma, sigue el
+  cursor con la mirada y, si tú lo activas, hace pequeñas **travesuras con el mouse**.
+- **Chat**: escríbele desde la ventana de chat de Amadeus Desktop o desde el panel RINE del HUD.
+- **Control de apps y redes** (sección 8.3): abre apps y webs de un catálogo cerrado, busca dentro de
+  ellas, deja **borradores** listos en WhatsApp/Telegram/X/Gmail y, donde no hay borrador, teclea en
+  la ventana que elijas. **Nunca pulsa Enter**: enviar siempre lo decides tú.
+- **Visión en tiempo real local** (sección 8.4, opt-in): cámara y pantalla procesadas en tu PC, sin
+  tokens y sin guardar ni enviar imágenes.
+- **Look de Kurisu/Amadeus** para el avatar VRM (tema `amadeus` de VTuber AI Studio).
+- Todo sigue siendo **No-LLM**: cuándo aparece, cuándo te busca, qué app abre o cuándo hace una
+  travesura lo deciden el conectoma y reglas deterministas; Gemini (opcional) solo pone las palabras.
+  **No hace falta ninguna clave de API nueva.**
+
 ## 2. Requisitos
 
 - **Python ≥ 3.11** (recomendado 3.12+).
@@ -97,6 +114,7 @@ acota otros. Todos los cambios tienen una razón técnica:
 | — | `tzdata` (añadido) | `zoneinfo` necesita la base de zonas horarias; Windows no la trae y algunos Linux mínimos tampoco. Sin ella se usa UTC−5 fijo. |
 | — | `prompt_toolkit` (añadido) | La consola imprime los mensajes de Amadeus sin borrar lo que estás escribiendo. Es Python puro; si falta, hay un modo ANSI. |
 | `sounddevice` | Solo en Windows (`; sys_platform == "win32"`) | En Linux el audio sale por `pw-play`/`paplay`/`aplay` (subproceso), sin dependencias nativas. En Linux puedes descomentar `sounddevice` si prefieres PortAudio. |
+| — | `soundfile` (añadido) | Decodifica el MP3 de edge-tts sin `ffmpeg` (la wheel trae libsndfile con MP3): boca real del avatar también en Windows. Si falta, se usa `mpv`/`ffplay`. |
 | `audioop` | Nada (no se usa) | `audioop` desapareció en Python 3.13: el RMS del *lip-sync* se calcula con numpy o con `array` + `math`. |
 
 **No uses dos variantes de OpenCV a la vez** (`opencv-python`, `opencv-python-headless`,
@@ -165,15 +183,16 @@ cuanto no configuras ElevenLabs. Si no lo quieres:
 - `python main.py --offline`: además, ni Gemini, ni Telegram, ni búsqueda web.
 - `/silencio` silencia la voz en caliente durante la sesión.
 
-edge-tts produce MP3; para mover la boca del avatar se decodifica a PCM con `ffmpeg`. Sin
-`ffmpeg`, el MP3 se reproduce con `mpv` o `ffplay` y la boca se simula.
+edge-tts produce MP3; para mover la boca del avatar se decodifica a PCM con `ffmpeg` o, sin
+`ffmpeg`, con `soundfile` (lo instala `requirements.txt`; su wheel trae libsndfile con MP3). Si
+ninguno sirve, el MP3 se reproduce con `mpv` o `ffplay` y la boca se simula.
 
 ### Reproducción de audio por plataforma
 
 | Sistema | ElevenLabs (PCM) | edge-tts (MP3) |
 |---|---|---|
 | **Arch Linux** | `pw-play` (PipeWire), o `paplay`, o `aplay`: `sudo pacman -S pipewire` | Lo mismo + `ffmpeg` (`sudo pacman -S ffmpeg`); o `mpv` (boca simulada) |
-| **Windows** | `sounddevice` (lo instala `requirements.txt`) | `sounddevice` **+ `ffmpeg` en el `PATH`**; sin `ffmpeg` hace falta `mpv` o `ffplay` en el `PATH` (si no hay ninguno, solo texto) |
+| **Windows** | `sounddevice` (lo instala `requirements.txt`) | `sounddevice` + `soundfile` (los dos los instala `requirements.txt`; **no hace falta `ffmpeg`**). Con `ffmpeg` en el `PATH` se usa en streaming; sin `soundfile` ni `ffmpeg`, `mpv` o `ffplay` en el `PATH` (si no hay ninguno, solo texto) |
 
 `python main.py --selftest` lista en su última comprobación los reproductores y binarios que
 encontró.
@@ -222,6 +241,9 @@ Cuando la cámara se enciende verás `● CÁMARA ACTIVA` en rojo y, al soltarla
 | `/bitacora` | Última entrada de la bitácora de sesión |
 | `/hud` | Enlace privado del HUD (con token; **solo** en esta terminal) |
 | `/logro <texto>` | Registra un logro: la sesión se vuelve "especial" (despedida con «El Psy Kongroo») |
+| `/vision on\|off\|pausa [min]\|estado` | Visión continua local (cámara; opt-in, sección 8.4) |
+| `/pantalla off\|metadatos\|pixeles` | Qué mira la visión de la pantalla |
+| `/travesuras on\|off` | Travesuras con el cursor real (opt-in, sección 8.5) |
 
 También entiende frases naturales, decididas por reglas locales y sin LLM: «busca…»,
 «recuérdame llamar a mamá a las 6 pm», «recuérdame mañana a las 8 llamar al banco», «recuerda que
@@ -234,6 +256,13 @@ completa** («mañana a las 6 pm», «para las 8», «en 20 minutos» o, si falt
 mamá»), siempre por el mismo canal y dentro de los 5 minutos siguientes. Si respondes algo que no
 trae lo que faltaba, o dices «no, olvídalo», el recordatorio se cancela y Amadeus te lo dice; si
 pides otra cosa («busca…», «abre terminal»), se descarta y se atiende tu nueva petición.
+
+Frases nuevas de la v0.2 (también por el chat): «abre WhatsApp», «busca lofi en YouTube», «pon
+Despacito en Spotify», «escríbele a mamá por WhatsApp: llego tarde», «pon en X: …», «escribe ahí:
+…», «escríbeme un tweet sobre…» y luego «ponlo en X», «búscame en 10 minutos», «llámame a las 6 pm
+para revisar el horno», «ven», «vete», «basta» / «quieta» / «deja el mouse», «deja de mirarme» /
+«no me mires por 20 minutos». Las frases cortas («ven», «basta»…) solo cuentan si son el mensaje
+completo.
 
 **Limitación conocida sin `prompt_toolkit`:** si Amadeus habla mientras estás escribiendo, el
 texto a medio escribir deja de verse en pantalla, pero sigue en el búfer de la terminal y se envía
@@ -278,6 +307,49 @@ listener {
 
 `timeout` debe coincidir con `RAMS_IDLE_TIMEOUT_S` (180 por defecto). Con uwsm:
 `systemctl --user enable --now hypridle.service`.
+
+Para las **travesuras** (sección 8.5) Amadeus necesita saber si dejaste quietos el teclado y el
+ratón unos segundos. Añade este segundo listener (archivo-bandera `rams_quieto`):
+
+```ini
+listener {
+    timeout = 5                                   # 5 s sin teclado ni ratón ⇒ "quieto"
+    on-timeout = touch $XDG_RUNTIME_DIR/rams_quieto
+    on-resume = rm -f $XDG_RUNTIME_DIR/rams_quieto
+}
+```
+
+En Hyprland no se puede leer el estado de los botones del ratón, así que las travesuras con el
+**cursor real** quedan deshabilitadas allí (Amadeus solo persigue el cursor con la mirada y el
+cuerpo); la bandera sirve para la presencia fina y para los vetos.
+
+### Amadeus Desktop en Hyprland
+
+Amadeus Desktop crea dos ventanas: el overlay transparente (título `Amadeus Overlay`), que debe
+cubrir el monitor, y el chat (título `Amadeus Chat`). Ninguna debe robar el foco ni seguir al
+ratón. Las reglas completas están en `desktop/hyprland.ejemplo.lua` (Hyprland 0.55+, configuración
+en Lua) y `desktop/hyprland.ejemplo.conf` (0.53–0.54, hyprlang); cópialas de ahí. El antiguo
+`windowrulev2 = …` (< 0.53) ya no es la sintaxis vigente. Extracto de la versión hyprlang:
+
+```ini
+# Overlay: flotante, en todos los workspaces, cubriendo el monitor y sin robar el foco.
+windowrule = match:title ^(Amadeus Overlay)$, float on, pin on, move 0 0, size monitor_w monitor_h, no_initial_focus on, no_follow_mouse on, focus_on_activate off, no_blur on, no_shadow on, no_dim on, no_anim on, border_size 0, rounding 0, decorate off
+# Chat: flotante abajo a la derecha; R.A.M.S. puede abrirlo sin foco.
+windowrule = match:title ^(Amadeus Chat)$, float on, pin on, size 380 560, move (monitor_w-window_w-24) (monitor_h-window_h-24), no_initial_focus on, no_follow_mouse on, focus_on_activate off, no_shadow on, border_size 0
+# Atajos (los mismos que en Windows; en Wayland Amadeus Desktop no registra atajos globales).
+bind = SUPER, A, exec, amadeus-desktop --amadeus=toggle
+bind = CTRL ALT, A, exec, amadeus-desktop --amadeus=toggle
+bind = CTRL ALT, SPACE, exec, amadeus-desktop --amadeus=chat
+bind = CTRL ALT SHIFT, Q, exec, amadeus-desktop --amadeus=basta
+bind = CTRL ALT, V, exec, amadeus-desktop --amadeus=vision_pausa
+bind = CTRL ALT SHIFT, A, exec, amadeus-desktop --amadeus=clics
+exec-once = amadeus-desktop --hidden
+```
+
+`amadeus-desktop` es el lanzador de `desktop/`; ponlo en el PATH con
+`ln -s ~/proyectos/rams_biocore/desktop/scripts/amadeus-desktop.sh ~/.local/bin/amadeus-desktop`
+(ajusta la ruta a tu copia). En Wayland sin Hyprland, si la transparencia falla, usa
+`npm run start:x11`.
 
 ### HUD "videollamada Amadeus"
 
@@ -364,6 +436,149 @@ Alternativa sin VTube Studio: un avatar VRM que se mueve por HTTP (`lobes/vtuber
 
 Si el servidor usa otro puerto: `VTUBER_AI_URL=http://127.0.0.1:3940`.
 
+### 8.2 Amadeus Desktop: Amadeus en tu escritorio
+
+Una app de escritorio (Electron) que se queda en segundo plano, en la bandeja, y deja que Amadeus
+salga a caminar por tu pantalla. Requiere **Node ≥ 22**.
+
+1. **Instalación** (una vez): `cd desktop && npm i` (descarga Electron 44.8.0, ~158 MB).
+2. **Orden de arranque:**
+   1. VTuber AI Studio: `cd vtuber-ai && node server.js` (el avatar; ver 8.1).
+   2. R.A.M.S.: `python main.py`. En el arranque verás `Amadeus Desktop (/escritorio) ... OK`: el
+      HUD abre el endpoint `ws://127.0.0.1:<puerto>/escritorio` y escribe un token privado nuevo en
+      `%LOCALAPPDATA%\rams\escritorio.json` (Windows) o `$XDG_RUNTIME_DIR/rams/escritorio.json`
+      (Linux), permisos 600. Nunca escucha fuera de `127.0.0.1`.
+   3. Amadeus Desktop: `cd desktop && npm start`. Se queda en la **bandeja** y no roba el foco;
+      sin más opciones, en cuanto carga el visor Amadeus entra caminando una vez para que veas que
+      funciona. Para arrancarla **escondida** (p. ej. al iniciar sesión): `npm start -- --hidden`,
+      o `AMADEUS_AUTOARRANQUE=1` (Windows) para que Windows la lance así sola en cada inicio.
+
+   El orden no es estricto: la app reintenta el visor cada 5 s y a R.A.M.S. con espera creciente.
+
+   **`.env` para la v0.2:** no hace falta ninguna clave nueva. Si tu `.env` es anterior a esta
+   versión, todo lo nuevo funciona con los valores por defecto (chat y escritorio activos); lo
+   opcional se enciende añadiendo estas líneas (cada una en su propia línea):
+
+   | Quieres… | Añade a `.env` |
+   |---|---|
+   | Que te vea por la cámara de forma continua (local, sin tokens) | `RAMS_CAMERA=1` y `RAMS_VISION_CONTINUA=1` |
+   | Que además sepa qué app tienes delante | `RAMS_PANTALLA_MODO=metadatos` (o `pixeles` tras `pip install mss==10.2.0`) |
+   | Que moleste con el mouse (empujoncitos del cursor real, solo Windows) | `RAMS_TRAVESURAS=1` |
+   | Sinónimos propios para abrir apps | `RAMS_DESTINOS=wasap=whatsapp,pajarito=x` |
+   | Que las respuestas del chat también se digan en voz alta | `RAMS_ESCRITORIO_VOZ=1` |
+   | Quitar el look de Kurisu (licencia del modelo) | `VTUBER_AI_TEMA=none` (y lo mismo en el entorno de Amadeus Desktop) |
+
+   La lista completa, comentada, está en `.env.example` (secciones «Amadeus Desktop / escritorio»,
+   «Control del PC y travesuras» y «Visión continua»). Gemini sigue siendo opcional: sin
+   `GEMINI_API_KEY` responde con el banco local de frases (sin borradores de tweets ni charla libre).
+3. **Llamarla:** clic en la bandeja («Llamar a Amadeus»), `Ctrl+Alt+A`, o escribe «ven» /
+   «aparece» / «sal» en el chat. Entra caminando desde un borde. «vete» o «escóndete» la devuelven
+   a la bandeja.
+4. **Ella sale sola** (sin LLM): cuando el conectoma dispara una iniciativa (aburrimiento,
+   descanso, cambio de línea, curiosidad) y estás frente al computador, Amadeus se asoma por un
+   borde y te busca; si no estás, te llama por Telegram como en la v0.1. «Búscame en 10 minutos»
+   (solo desde el computador; por Telegram usa «recuérdame en …») programa que vaya a buscarte a
+   esa hora. Con «no molestar» (bandeja o chat) no aparece ni
+   interrumpe; tampoco durante una presentación, un juego o una app a pantalla completa
+   ("no molestar" del sistema, que se comprueba cada 5 s).
+5. **Chat:** clic derecho sobre Amadeus o `Ctrl+Alt+Space` abre la ventana de chat (también hay
+   un panel de chat estilo RINE en el HUD, con `RAMS_HUD_CHAT=1`, el defecto). Las respuestas
+   llegan por texto (labios mudos); con `RAMS_ESCRITORIO_VOZ=1` siguen la regla de voz normal. La
+   salida de los comandos (`/estado`, `/ayuda`…) vuelve al chat. `/hud` nunca muestra el enlace por
+   el chat: solo en la terminal.
+6. **Confirmaciones:** si una acción necesita tu visto bueno (un borrador, escribir en otra ventana)
+   aparecen **botones** en el chat con la vista previa del texto. Escribir «sí» en el chat **no**
+   aprueba nada (el mensaje queda en cola y se lee después); la terminal puede responder igual que
+   en la v0.1. Cerrar ventanas solo se confirma en la terminal.
+7. **Bandeja:** Llamar a Amadeus · Abrir chat · No molestar · Quieta (sin travesuras) · Pausar
+   visión · Dejar pasar clics · Salir.
+8. **Atajos y emergencias:**
+
+   | Atajo | Qué hace |
+   |---|---|
+   | `Ctrl+Alt+A` | Llamar / esconder a Amadeus |
+   | `Ctrl+Alt+Space` | Abrir el chat (con foco) |
+   | `Ctrl+Alt+Shift+Q` | **Quieta**: corta las travesuras y la esconde (igual que «basta» en el chat) |
+   | `Ctrl+Alt+V` | Pausar la cámara (igual que «deja de mirarme») |
+   | `Ctrl+Alt+Shift+A` | Emergencia: oculta el overlay y deja pasar todos los clics (no necesita a R.A.M.S.) |
+
+   «Quieta» lleva Shift porque en Windows `Ctrl+Alt` es AltGr y, en el teclado latinoamericano,
+   AltGr+Q escribe «@». Los atajos se cambian con `AMADEUS_ATAJO_*` (ver `desktop/README.md`).
+
+   En Hyprland, los mismos comandos por CLI: `amadeus-desktop --amadeus=toggle|show|hide|chat|basta|vision_pausa|clics|quit`
+   (sección 7).
+9. **Capturas de pantalla:** con `AMADEUS_EXCLUIR_CAPTURA=1` (defecto) el overlay **no** sale en
+   capturas, OBS ni Discord. Pon `0` si quieres capturarla.
+10. **Look de Kurisu:** el tema `amadeus` de VTuber AI Studio recolorea el modelo VRM a la paleta de
+    Kurisu (cabello castaño rojizo, chaqueta, corbata roja, medias oscuras) y, fuera del escritorio,
+    añade el marco de videollamada holográfica. Pon tu propio `.vrm` en `vtuber-ai/models/` (VRoid
+    Hub o VRoid Studio exportando VRM 1.0 **sin reducir materiales**; ver `vtuber-ai/models/README.md`).
+    `VTUBER_AI_TEMA=none` desactiva el tema. Homenaje de fan: sin assets oficiales.
+
+### 8.3 Control de apps y redes (sin enviar nunca nada)
+
+Pídele «abre WhatsApp», «busca lofi en YouTube» o «escríbele a mamá por WhatsApp: llego tarde».
+Las reglas, en orden de seguridad:
+
+1. **Abrir** una app o web del **catálogo cerrado** (no hay comandos libres): `whatsapp`,
+   `telegram`, `x`, `gmail`, `correo`, `instagram`, `tiktok`, `facebook`, `discord`, `linkedin`,
+   `youtube`, `spotify`, `navegador` y `archivos`. Buscar dentro: YouTube, Spotify, X y el navegador
+   (DuckDuckGo). Sinónimos de serie: «twitter», «wasap», «insta», «yt», «mail»…; añade los tuyos con
+   `RAMS_DESTINOS=wasap=whatsapp,pajarito=x` (cada sinónimo `^[a-z0-9_]{1,24}$` y siempre hacia una
+   clave del catálogo). Si el alias no está en el catálogo, en Linux se usa `RAMS_APPS` (sección 3).
+2. **Borrador prerrellenado** (WhatsApp, Telegram, X, Gmail, correo): Amadeus abre la app con el
+   texto ya escrito y **tú pulsas Enviar**. Siempre pide confirmación con la vista previa.
+3. **Teclear** donde no hay prerrelleno (Instagram, TikTok, Discord…): «escribe ahí: …». El
+   objetivo es la última ventana en primer plano que no es de Amadeus. Tras confirmar, Amadeus te
+   dice «haz clic en la caja de texto de <app>» y escribe en cuanto esa ventana tenga el foco (si no
+   en 10 s, no escribe nada). **Nunca pulsa Enter.** Si mueves el teclado durante el tecleo, aborta.
+4. **Borradores de Amadeus:** «escríbeme un tweet sobre la mosca de la fruta» (con Gemini) y luego
+   «ponlo en X» o «pásalo a WhatsApp»: usa el último borrador que te escribió **en este computador**
+   (≤ 10 min, ≤ 500 caracteres; nunca uno de Nexus, Telegram, una iniciativa ni una respuesta con
+   resultados de la web, de la cámara o de una captura). Sin Gemini no hay borradores: escribe tú el
+   texto con «pon en X: …» o «escríbele a mamá por WhatsApp: …».
+5. **Anti-contraseñas:** nunca escribe textos que parezcan una contraseña, un PIN/OTP, una tarjeta
+   o una clave, ni en ventanas de inicio de sesión, banca o pago. Topes: borradores ≤ 1 cada 20 s,
+   tecleo ≤ 1 cada 30 s.
+6. **Auditoría:** `data/acciones_pc.jsonl` (permisos 600) registra cada acción con su veredicto,
+   el destino y la **longitud y el hash** del texto (nunca el texto ni títulos completos).
+
+Windows no necesita nada más. En Arch: `sudo pacman -S wtype xdg-utils gtk3`.
+
+### 8.4 Visión en tiempo real, local y sin tokens (opt-in, OFF por defecto)
+
+Con `RAMS_CAMERA=1` **y** `RAMS_VISION_CONTINUA=1`, Amadeus mira por la cámara de forma continua
+(2–5 fps) y, si quieres, la pantalla (`RAMS_PANTALLA_MODO=metadatos` o `pixeles`, 0,2–2 fps). Todo
+se procesa en tu PC: **ninguna imagen se guarda ni se envía** (tampoco a Gemini). Lo que Amadeus
+"ve" son números: si estás, cuántas caras hay, a qué distancia, si miras la pantalla, qué app
+tienes delante y su título (salvo títulos privados: banca, contraseñas, navegación privada…), si hay
+vídeo o pantalla completa. Con eso comenta lo que haces («¿Otra vez YouTube?») y sabe cuándo no
+molestar.
+
+- **Instalación:** el detector YuNet (`face_detection_yunet_2023mar.onnx`, 232 KB, MIT) en
+  `data/models/` (sin él usa Haar); en Windows `pip install mss==10.2.0` para la pantalla.
+- **Calibración:** `RAMS_VISION_HFOV` (ángulo de tu webcam), `RAMS_VISION_ESPEJO=1` si da la imagen
+  en espejo. En Windows 11, para videollamadas con la cámara continua encendida, activa "Permitir que
+  varias apps usen la cámara"; si no, se pausa sola con Zoom, Teams, Discord u OBS.
+- **Indicador permanente:** `● CÁMARA ACTIVA` en la terminal, LED y ojo en el HUD y en el overlay.
+- **Pausar:** «deja de mirarme» / «no me mires por 20 minutos» / «cierra los ojos», `/vision pausa
+  [min]`, `/camara off`, el botón Cámara del HUD, `Ctrl+Alt+V` o la bandeja. Se pausa sola si
+  bloqueas la sesión, si te vas, con apps de llamada, con batería baja o en juegos a pantalla
+  completa. No se activa nunca desde Telegram.
+
+### 8.5 Travesuras con el mouse (opt-in, OFF por defecto)
+
+Si está aburrida, Amadeus puede dar un pequeño empujón a tu cursor (como mucho
+`RAMS_TRAVESURA_AMPLITUD` px, 40 por defecto, ≤ 0,6 s). Solo con `RAMS_TRAVESURAS=1` y en Windows
+(en Hyprland solo persigue el cursor con la mirada). Nunca hace clic, nunca usa la rueda ni
+teclas, y no lo intenta si estás escribiendo, en una videollamada, viendo un vídeo, con una
+confirmación pendiente, mientras habla o en "no molestar". Si mueves el ratón durante la
+travesura, aborta y se apaga 2 h. Topes: ≤ 1 cada 15 min y ≤ 6 al día.
+
+**«basta»** (o «quieta», «deja el mouse», «para ya», `Ctrl+Alt+Shift+Q`, bandeja "Quieta"): el primero
+del día las apaga 2 h; el segundo, hasta mañana. `/travesuras off` las apaga hasta `/travesuras on`.
+El estado se guarda en `data/travesuras.json`.
+
 ## 9. Nexus IDE
 
 **Servidor MCP** (Nexus → Ajustes → «Servidores MCP»):
@@ -444,6 +659,15 @@ los fragmentos que consolidó mientras no estabas.
   Tras cada vistazo sin nadie, el intervalo crece (90 s → 5 → 15 → 60 min) y hay un límite diario
   (`RAMS_CAMERA_MAX_DIA`). Si el sistema está seguro de que no estás, no mira. Amadeus **siempre te
   cuenta** que usó la cámara, en el momento o en el siguiente turno.
+- **Visión continua (v0.2):** opt-in de dos niveles (`RAMS_CAMERA=1` y `RAMS_VISION_CONTINUA=1`),
+  procesada en local, sin guardar ni enviar imágenes; a Gemini solo llegan la app y el título corto
+  de la ventana (si no es privada). Ver la sección 8.4.
+- **Chat de escritorio (v0.2):** el texto del chat, y lo que se saca de él (consultas, recuerdos,
+  recordatorios, `/recordar`, `/logro`), se redacta (claves, tokens y cadenas largas tipo clave)
+  antes de llegar a la memoria, la agenda, el bus, la búsqueda web y Gemini; nunca se registra en
+  los logs. Las respuestas del chat, incluidas sus confirmaciones, no se dicen en voz alta salvo
+  con `RAMS_ESCRITORIO_VOZ=1`. `/escritorio` exige un token de
+  archivo privado que cambia en cada arranque.
 - **Secretos:** solo en `.env` (nunca en git; `chmod 600 .env`). Los logs, el bus y el HUD pasan
   por un filtro que redacta claves y tokens (también en trazas de excepciones). Los directorios de
   datos se crean con permisos 700 y los archivos sensibles (memoria, perfil, tokens, log) con 600.
@@ -451,6 +675,9 @@ los fragmentos que consolidó mientras no estabas.
   LLM ni de Telegram) y pasa por una lista permitida. Cerrar una ventana **siempre pide
   confirmación** en la terminal, con la ventana exacta fijada de antemano, y R.A.M.S. **nunca
   cierra su propia terminal**. No se usa `shell=True` en ningún sitio.
+- **Control del PC (v0.2):** abrir, buscar, prerrellenar y teclear pasan por la misma compuerta;
+  prerrellenar y teclear **siempre** se confirman con la vista previa del texto y nunca se pulsa
+  Enter. Ver la sección 8.3.
 - **Red:** el HUD y el socket de control escuchan solo en `127.0.0.1`, con token.
 - **Qué sale de tu PC** (solo con red y con la clave correspondiente; `--offline` lo corta todo):
   - **Gemini:** tu mensaje, los turnos recientes, los recuerdos relevantes, el estado del
@@ -486,7 +713,15 @@ pytest
 
 Los tests no usan la red (un *fixture* la bloquea) ni hardware (sin cámara, audio ni Hyprland
 reales) y corren también en Windows. Las pruebas asíncronas usan `asyncio.run` (sin
-pytest-asyncio).
+pytest-asyncio). Tampoco tocan el PC: la *fixture* `sin_efectos_pc` hace fallar cualquier
+apertura de apps, tecleo o movimiento del cursor reales.
+
+Amadeus Desktop y VTuber AI Studio tienen sus propias pruebas (Node ≥ 22):
+
+```bash
+cd desktop && npm test && npm run smoke     # módulos puros + Electron oculto ("smoke OK")
+cd ../../vtuber-ai && npm test               # servidor, protocolo, tema Amadeus y vendor local
+```
 
 ## 14. Créditos y aviso legal
 

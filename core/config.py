@@ -8,9 +8,13 @@ Qué hace:
 - Configura el logging en español (niveles traducidos, archivo rotativo 0o600 y consola) con
   un filtro que redacta secretos en el mensaje, en la traza (``exc_text``) y en ``stack_info``.
 - Ofrece la hora local (``America/Bogota``) y el cálculo del horario silencioso.
+- v0.2 "Amadeus Companion" (``docs/COMPANION.md`` §C2.1): ajustes de Amadeus Desktop, del
+  control del PC y travesuras, y de la visión continua; y las funciones puras
+  :func:`parece_secreto` y :func:`titulo_sensible` (base de la regla anti-contraseñas, §C2.12).
 
-Dependencias: solo la biblioteca estándar. ``python-dotenv`` es opcional: si falta, se usa
-un parser mínimo propio que imita a dotenv.
+Dependencias: solo la biblioteca estándar y ``core.contracts`` (que no importa este módulo: no
+hay ciclo). ``python-dotenv`` es opcional: si falta, se usa un parser mínimo propio que imita a
+dotenv.
 
 Degradación: ``cargar_settings`` nunca lanza por valores de entorno (valor inválido ⇒ valor
 por defecto y ``log.warning`` sin el valor recibido). Sin ``tzdata`` la zona horaria cae a
@@ -20,21 +24,25 @@ UTC−5 ("COT"), registrado una sola vez.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import logging.handlers
 import math
 import os
 import re
+import string
 import sys
 import threading
 import types
 import unicodedata
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from core.contracts import DESTINOS_BASE, MODOS_PANTALLA, PATRON_TITULO_SENSIBLE, SAFE_ALIAS_RE
 
 try:  # opcional: si falta, se usa el parser mínimo propio
     from dotenv import dotenv_values
@@ -47,6 +55,9 @@ __all__ = [
     "APPS_DEFECTO",
     "NOMBRES_NIVEL",
     "MENSAJEROS",
+    "VISION_APPS_PAUSA_DEFECTO",
+    "VISION_DETECTORES",
+    "VTUBER_AI_TEMAS",
     "Settings",
     "cargar_settings",
     "leer_env_archivo",
@@ -54,6 +65,9 @@ __all__ = [
     "configurar_logging",
     "FiltroSecretos",
     "redactar",
+    "parece_secreto",
+    "titulo_sensible",
+    "normalizar_titulo",
     "nombre_nivel",
     "zona_local",
     "ahora_local",
@@ -116,6 +130,7 @@ _RE_REGION_WEB: Final = re.compile(r"^[a-z]{2,3}-[a-z]{2,3}$")
 _RE_WS_URL: Final = re.compile(r"^wss?://\S+$")
 _RE_URL_LOCAL: Final = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?/?$")
 _RE_LANG_BCP47: Final = re.compile(r"^[a-z]{2,3}(-[A-Z]{2})?$")
+_RE_VOZ_NAVEGADOR: Final = re.compile(r"^[A-Za-z0-9 ,_\-]{1,120}$")
 _RE_HOST: Final = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,253}$")
 _RE_HHMM: Final = re.compile(r"^(\d{1,2}):(\d{2})$")
 _RE_SALIDA_11L: Final = re.compile(r"^(?:pcm_)?(\d+)$", re.IGNORECASE)
@@ -127,6 +142,15 @@ _MODOS_HYPR: Final = ("auto", "lua", "legacy")
 _FUENTES_CONECTOMA: Final = ("reducido", "stub", "flywire")
 # RAMS_MENSAJERO: quién entrega los mensajes proactivos por Telegram (CONTRATO de cierre, §10.19).
 MENSAJEROS: Final = ("hibrido", "megumin", "amadeus")
+
+# v0.2 (§C2.1): catálogos de opciones y valores por defecto de los ajustes nuevos.
+VTUBER_AI_TEMAS: Final = ("amadeus", "none")
+VISION_DETECTORES: Final = ("auto", "yunet", "haar")
+# Procesos que autopausan la cámara continua y vetan las travesuras (nombre sin ".exe", minúsculas).
+VISION_APPS_PAUSA_DEFECTO: Final[tuple[str, ...]] = ("zoom", "teams", "ms-teams", "discord", "obs64", "obs")
+_RE_NOMBRE_PROCESO: Final = re.compile(r"^[a-z0-9_.+\-]{1,64}$")
+_PANTALLA_EXCLUIR_MAX: Final = 32          # patrones extra como mucho
+_PANTALLA_EXCLUIR_LARGO: Final = 60        # caracteres por patrón extra
 
 # Campos que nunca se muestran ni se registran.
 _CAMPOS_SECRETOS: Final = (
@@ -146,6 +170,49 @@ def _ruta_token_ctl_defecto() -> Path:
     except (RuntimeError, KeyError, OSError) as exc:  # sin HOME determinable
         log.debug("No se pudo determinar el directorio personal (%s); uso base_dir", type(exc).__name__)
         return BASE_DIR_DEFECTO / ".config" / "rams_biocore" / "ctl_token"
+
+
+def _valor_entorno(obtener: Callable[[str], Any], var: str) -> str | None:
+    """Valor útil de una variable (regla única de ausencia) a partir de un ``get``; nunca lanza."""
+    try:
+        valor = obtener(var)
+    except (TypeError, AttributeError, KeyError) as exc:
+        log.debug("Entorno no legible para %s (%s)", var, type(exc).__name__)
+        return None
+    if valor is None:
+        return None
+    texto = str(valor).strip()
+    if not texto or texto.startswith("#") or "\x00" in texto:
+        return None
+    return texto
+
+
+def _ruta_token_escritorio(obtener: Callable[[str], Any], data_dir: Path, *,
+                           plataforma: str | None = None) -> Path:
+    """Ruta por defecto del token de ``/escritorio`` (§C2.1).
+
+    - Windows: ``%LOCALAPPDATA%\\rams\\escritorio.json``.
+    - Linux y demás: ``$XDG_RUNTIME_DIR/rams/escritorio.json``.
+    - Sin ``LOCALAPPDATA``/``XDG_RUNTIME_DIR`` (o con un valor relativo): ``data_dir/escritorio.json``
+      (Amadeus Desktop entonces solo conecta si ``RAMS_ESCRITORIO_TOKEN_FILE`` está definida, §C2.7.6).
+
+    ``obtener`` es el ``get`` del entorno que se está leyendo (con ``entorno`` explícito, el de
+    ese mapeo: los tests nunca tocan el ``%LOCALAPPDATA%`` real).
+    """
+    sistema = sys.platform if plataforma is None else plataforma
+    var = "LOCALAPPDATA" if sistema == "win32" else "XDG_RUNTIME_DIR"
+    base = _valor_entorno(obtener, var)
+    if base is not None:
+        raiz = Path(base)
+        if raiz.anchor:  # mismo criterio que _Lector.expandir_ruta: nunca relativa a os.getcwd()
+            return raiz / "rams" / "escritorio.json"
+        log.debug("%s es una ruta relativa; el token de escritorio va a data_dir", var)
+    return data_dir / "escritorio.json"
+
+
+def _ruta_token_escritorio_defecto() -> Path:
+    """Defecto de ``Settings.escritorio_token_file`` cuando se construye ``Settings`` a mano."""
+    return _ruta_token_escritorio(os.environ.get, BASE_DIR_DEFECTO / "data")
 
 
 # ---------------------------------------------------------------------------
@@ -203,6 +270,13 @@ class Settings:
     vtuber_ai_url: str = "http://127.0.0.1:3939"
     vtuber_ai_tts: bool = True          # sin voz propia, habla la voz del navegador
     vtuber_ai_lang: str = "es-MX"
+    vtuber_ai_voz: str = "female"        # voz del navegador: nombre(s) "Sabina,Helena" o "female"
+    # Autonomía corporal del avatar 3D (lobes/corteza_motora.py): el conectoma decide cuándo y cómo
+    # se mueve, gesticula y cambia de cara, sin LLM.
+    avatar_autonomo: bool = True
+    avatar_actividad: float = 1.0        # multiplicador de la frecuencia de conductas (0 = quieta)
+    avatar_caminar: bool = True          # puede desplazarse por el escenario
+    avatar_camara: bool = False          # puede cambiar el encuadre de la cámara
     camara_habilitada: bool = False
     camara_indice: int = 0
     camara_intervalo_min_s: float = 90.0
@@ -236,6 +310,29 @@ class Settings:
     # "hibrido" (defecto, fiel a S;G0): Amadeus llama y Megumin insiste; "megumin": Megumin
     # entrega todos los mensajes; "amadeus": Megumin nunca aparece.
     mensajero: str = "hibrido"
+    # --- v0.2 Amadeus Companion (docs/COMPANION.md §C2.1) ---
+    # Amadeus Desktop / escritorio: endpoint /escritorio del HUD y efectores de escritorio.
+    escritorio_habilitado: bool = True
+    escritorio_token_file: Path = field(default_factory=_ruta_token_escritorio_defecto)  # {url, token, pid}, 0o600
+    escritorio_voz: bool = False         # True = las respuestas al chat siguen la regla de voz de la v0.1
+    hud_chat: bool = True                # False = el HUD no recibe el token de /escritorio
+    # Control del PC y travesuras (interruptor maestro del cursor real: OFF por defecto).
+    travesuras_habilitadas: bool = False
+    travesura_amplitud_max_px: int = 40  # 5..80
+    destinos_items: tuple[tuple[str, str], ...] = ()   # (sinónimo, clave de DESTINOS_BASE); se SUMAN
+    vtuber_ai_tema: str = "amadeus"      # "amadeus" | "none" (con "none" el puente nunca envía theme)
+    # Visión continua (opt-in; además exige camara_habilitada) y pantalla.
+    vision_continua: bool = False
+    vision_fps: float = 3.0              # 1..5
+    vision_detector: str = "auto"        # "auto" | "yunet" | "haar"
+    vision_modelo: Path | None = None    # YuNet; None = data_dir/models/face_detection_yunet*.onnx
+    vision_hfov: float = 70.0            # grados, 30..120
+    vision_espejo: bool = False          # la webcam entrega la imagen en espejo
+    vision_apps_pausa: tuple[str, ...] = VISION_APPS_PAUSA_DEFECTO
+    pantalla_modo: str = "off"           # ∈ MODOS_PANTALLA ("pixeles" es un permiso aparte)
+    pantalla_fps: float = 1.0            # 0,2..2
+    pantalla_excluir: tuple[str, ...] = ()   # patrones EXTRA; PATRON_TITULO_SENSIBLE se aplica siempre
+    pantalla_excluir_avatar: bool = True     # enmascara la caja del avatar (escritorio.caja)
 
     # --- Capacidades (§4.1.2) ---
 
@@ -279,6 +376,37 @@ class Settings:
         """Cómo llama Amadeus al usuario: su nombre de pila o, si no hay, su rango."""
         return self.nombre_usuario if self.nombre_usuario else self.rango_lab
 
+    # --- Capacidades v0.2 (§C2.1): NINGUNA depende de offline (todo es local) ---
+
+    @property
+    def tiene_escritorio(self) -> bool:
+        """Endpoint ``/escritorio`` y efectores de escritorio activos (no depende de ``offline``)."""
+        return bool(self.escritorio_habilitado)
+
+    @property
+    def tiene_vision_continua(self) -> bool:
+        """Visión continua pedida **y** cámara habilitada (opt-in de dos niveles; no depende de ``offline``)."""
+        return bool(self.vision_continua) and bool(self.camara_habilitada)
+
+    @property
+    def destinos_permitidos(self) -> Mapping[str, str]:
+        """Alias de destino → clave de ``DESTINOS_BASE``, de solo lectura.
+
+        ``{clave: clave}`` para cada destino del catálogo más los sinónimos de ``RAMS_DESTINOS``
+        (``destinos_items``). Un sinónimo nunca reemplaza a una clave del catálogo.
+        """
+        return _destinos_permitidos(self.destinos_items)
+
+    @property
+    def pantalla_excluir_re(self) -> re.Pattern[str]:
+        """``PATRON_TITULO_SENSIBLE`` | patrones extra de ``pantalla_excluir`` (escapados).
+
+        Se aplica con ``search`` al título en minúsculas y sin tildes (:func:`normalizar_titulo`);
+        se compila sin distinguir mayúsculas como red de seguridad. Compilado una vez por
+        conjunto de extras (caché).
+        """
+        return _compilar_excluir(self.pantalla_excluir)
+
     def secretos(self) -> tuple[str, ...]:
         """Valores no vacíos de las claves (Gemini, ElevenLabs, token y chat de Telegram, Brave)
         y del token de colaboración de Nexus. Se pasan a :class:`FiltroSecretos`."""
@@ -290,6 +418,10 @@ class Settings:
 
         También aplica ``chmod 0o700`` a los que ya existían. Los errores de E/S se registran
         y no se propagan.
+
+        v0.2 (§C2.1): crea también el directorio padre de ``escritorio_token_file`` con 0o700.
+        Un padre que ya existía solo recibe ``chmod`` si es el directorio propio ``rams`` (nunca
+        se cambian los permisos de un directorio ajeno como ``/tmp``).
         """
         for ruta in (self.data_dir, self.memoria_dir, self.log_dir, self.data_dir / "models"):
             try:
@@ -298,6 +430,15 @@ class Settings:
                 log.warning("No se pudo crear el directorio %s: %s", ruta, exc)
                 continue
             _chmod_seguro(ruta, 0o700)
+        padre = Path(self.escritorio_token_file).parent
+        try:
+            existia = padre.is_dir()
+            padre.mkdir(mode=0o700, parents=True, exist_ok=True)
+        except OSError as exc:
+            log.warning("No se pudo crear el directorio del token de escritorio %s: %s", padre, exc)
+            return
+        if not existia or padre.name == "rams":
+            _chmod_seguro(padre, 0o700)
 
     def resumen_seguro(self) -> dict[str, object]:
         """Diccionario JSON-serializable de la configuración, sin secretos.
@@ -316,7 +457,7 @@ class Settings:
             else:
                 resumen[campo.name] = valor
         for nombre in ("tiene_gemini", "tiene_elevenlabs", "tiene_edge_tts", "tiene_telegram",
-                       "tiene_brave", "tiene_web"):
+                       "tiene_brave", "tiene_web", "tiene_escritorio", "tiene_vision_continua"):
             resumen[nombre] = getattr(self, nombre)
         return resumen
 
@@ -661,6 +802,96 @@ class _Lector:
             return self.invalido(var, defecto)
         return tuple(pares.items())
 
+    def destinos(self, var: str) -> tuple[tuple[str, str], ...]:
+        """``sinonimo=clave,…`` (§C2.1): sinónimos que se SUMAN a ``DESTINOS_BASE``.
+
+        El sinónimo se normaliza (minúsculas y sin tildes, como el texto que enruta
+        ``core/intenciones.py``) y debe cumplir ``SAFE_ALIAS_RE``; la clave (en minúsculas) debe
+        estar en ``DESTINOS_BASE``. Se descartan, con un único ``log.warning`` sin los valores, los
+        pares mal formados, las claves desconocidas, los sinónimos inválidos y los que
+        coinciden con otra clave del catálogo (un sinónimo nunca la reemplaza). Si un sinónimo se
+        repite, gana el último. Ausente ⇒ ``()``.
+        """
+        valor = self.crudo(var)
+        if valor is None:
+            return ()
+        pares: dict[str, str] = {}
+        descartados = 0
+        for parte in valor.split(","):
+            parte = parte.strip()
+            if not parte:
+                continue
+            sinonimo, igual, clave = parte.partition("=")
+            sinonimo = normalizar_titulo(sinonimo).strip()
+            clave = clave.strip().lower()
+            if (not igual or not SAFE_ALIAS_RE.match(sinonimo) or clave not in DESTINOS_BASE
+                    or (sinonimo in DESTINOS_BASE and sinonimo != clave)):
+                descartados += 1
+                continue
+            if sinonimo == clave:  # redundante: la clave ya es su propio alias
+                continue
+            pares.pop(sinonimo, None)  # el último gana, conservando el orden de aparición
+            pares[sinonimo] = clave
+        if descartados:
+            log.warning("Se descartaron %d entradas inválidas de %s", descartados, var)
+        return tuple(pares.items())
+
+    def csv_procesos(self, var: str, defecto: tuple[str, ...]) -> tuple[str, ...]:
+        """CSV de nombres de proceso en minúsculas, sin ``.exe`` y sin duplicados.
+
+        Las entradas que no cumplen ``^[a-z0-9_.+-]{1,64}$`` se descartan con un aviso; si no
+        queda ninguna, valor inválido ⇒ ``defecto``.
+        """
+        valor = self.crudo(var)
+        if valor is None:
+            return defecto
+        nombres: list[str] = []
+        descartados = 0
+        for parte in valor.split(","):
+            nombre = parte.strip().lower()
+            if not nombre:
+                continue
+            if nombre.endswith(".exe"):
+                nombre = nombre[:-4]
+            if not _RE_NOMBRE_PROCESO.match(nombre):
+                descartados += 1
+                continue
+            if nombre not in nombres:
+                nombres.append(nombre)
+        if descartados:
+            log.warning("Se descartaron %d entradas inválidas de %s", descartados, var)
+        if not nombres:
+            return self.invalido(var, defecto)
+        return tuple(nombres)
+
+    def csv_patrones(self, var: str) -> tuple[str, ...]:
+        """CSV de patrones literales de título (minúsculas y sin tildes, ≤ 60 caracteres, ≤ 32).
+
+        Se comparan con títulos normalizados igual (:func:`normalizar_titulo`). Las entradas con
+        caracteres de control, demasiado largas o que sobran se descartan con un aviso.
+        Ausente ⇒ ``()``.
+        """
+        valor = self.crudo(var)
+        if valor is None:
+            return ()
+        patrones: list[str] = []
+        descartados = 0
+        for parte in valor.split(","):
+            if _RE_CONTROL.search(parte):
+                descartados += 1
+                continue
+            patron = normalizar_titulo(parte)
+            if not patron:
+                continue
+            if len(patron) > _PANTALLA_EXCLUIR_LARGO or len(patrones) >= _PANTALLA_EXCLUIR_MAX:
+                descartados += 1
+                continue
+            if patron not in patrones:
+                patrones.append(patron)
+        if descartados:
+            log.warning("Se descartaron %d entradas inválidas de %s", descartados, var)
+        return tuple(patrones)
+
     def secreto(self, var: str, patron: re.Pattern[str]) -> str | None:
         """Secreto validado por formato; inválido ⇒ ``None`` con aviso sin el valor."""
         valor = self.crudo(var)
@@ -738,6 +969,7 @@ def _settings_por_defecto(base: Path, *, offline: bool) -> Settings:
         base_dir=base, data_dir=data, memoria_dir=memoria, db_path=memoria / "rams_memory.db",
         perfil_path=memoria / "perfil_conductual.json", persona_dir=base / "persona",
         log_dir=data / "logs", flywire_dir=data / "flywire", offline=offline,
+        escritorio_token_file=_ruta_token_escritorio(os.environ.get, data),
     )
 
 
@@ -802,6 +1034,11 @@ def _cargar_settings(
     ctl_defecto = home / ".config" / "rams_biocore" / "ctl_token"
     ctl_token_file = lector.ruta("RAMS_CTL_TOKEN_FILE", ctl_defecto)
     nexus_workspace = lector.ruta_opcional("NEXUS_WORKSPACE", None)
+
+    # v0.2 (§C2.1): token de /escritorio (LOCALAPPDATA / XDG_RUNTIME_DIR salen del entorno leído).
+    escritorio_token_file = lector.ruta("RAMS_ESCRITORIO_TOKEN_FILE",
+                                        _ruta_token_escritorio(lector.crudo, data_dir))
+    vision_modelo = lector.ruta_opcional("RAMS_VISION_MODELO", None)
 
     # --- Nivel de log ---
     nivel_crudo = lector.crudo("RAMS_LOG_LEVEL")
@@ -879,6 +1116,11 @@ def _cargar_settings(
         vtuber_ai_url=lector.texto("VTUBER_AI_URL", "http://127.0.0.1:3939", patron=_RE_URL_LOCAL),
         vtuber_ai_tts=lector.booleano("VTUBER_AI_TTS", True),
         vtuber_ai_lang=lector.texto("VTUBER_AI_LANG", "es-MX", patron=_RE_LANG_BCP47),
+        vtuber_ai_voz=lector.texto("VTUBER_AI_VOICE", "female", patron=_RE_VOZ_NAVEGADOR),
+        avatar_autonomo=lector.booleano("RAMS_AVATAR_AUTONOMO", True),
+        avatar_actividad=lector.real("RAMS_AVATAR_ACTIVIDAD", 1.0, minimo=0.0, maximo=3.0),
+        avatar_caminar=lector.booleano("RAMS_AVATAR_CAMINAR", True),
+        avatar_camara=lector.booleano("RAMS_AVATAR_CAMARA", False),
         camara_habilitada=lector.booleano("RAMS_CAMERA", False),
         camara_indice=lector.entero("RAMS_CAMERA_INDEX", 0, minimo=0, maximo=63),
         camara_intervalo_min_s=lector.real("RAMS_CAMERA_MIN_INTERVAL_S", 90.0, minimo=0.0),
@@ -914,6 +1156,29 @@ def _cargar_settings(
         silencio_inicio=silencio_inicio,
         silencio_fin=silencio_fin,
         mensajero=_mensajero(lector),
+        # --- v0.2 Amadeus Companion (§C2.1) ---
+        escritorio_habilitado=lector.booleano("RAMS_ESCRITORIO", True),
+        escritorio_token_file=escritorio_token_file,
+        escritorio_voz=lector.booleano("RAMS_ESCRITORIO_VOZ", False),
+        hud_chat=lector.booleano("RAMS_HUD_CHAT", True),
+        travesuras_habilitadas=lector.booleano("RAMS_TRAVESURAS", False),
+        travesura_amplitud_max_px=lector.entero("RAMS_TRAVESURA_AMPLITUD", 40, minimo=5, maximo=80),
+        destinos_items=lector.destinos("RAMS_DESTINOS"),
+        vtuber_ai_tema=lector.texto("VTUBER_AI_TEMA", "amadeus", opciones=VTUBER_AI_TEMAS,
+                                    minusculas=True),
+        vision_continua=lector.booleano("RAMS_VISION_CONTINUA", False),
+        vision_fps=lector.real("RAMS_VISION_FPS", 3.0, minimo=1.0, maximo=5.0),
+        vision_detector=lector.texto("RAMS_VISION_DETECTOR", "auto", opciones=VISION_DETECTORES,
+                                     minusculas=True),
+        vision_modelo=vision_modelo,
+        vision_hfov=lector.real("RAMS_VISION_HFOV", 70.0, minimo=30.0, maximo=120.0),
+        vision_espejo=lector.booleano("RAMS_VISION_ESPEJO", False),
+        vision_apps_pausa=lector.csv_procesos("RAMS_VISION_APPS_PAUSA", VISION_APPS_PAUSA_DEFECTO),
+        pantalla_modo=lector.texto("RAMS_PANTALLA_MODO", "off", opciones=MODOS_PANTALLA,
+                                   minusculas=True),
+        pantalla_fps=lector.real("RAMS_PANTALLA_FPS", 1.0, minimo=0.2, maximo=2.0),
+        pantalla_excluir=lector.csv_patrones("RAMS_PANTALLA_EXCLUIR"),
+        pantalla_excluir_avatar=lector.booleano("RAMS_PANTALLA_EXCLUIR_AVATAR", True),
     )
 
 
@@ -1001,6 +1266,191 @@ def redactar(texto: str, secretos: Iterable[str] = (), *, alta_entropia: bool = 
     if alta_entropia:
         texto = _RE_ALTA_ENTROPIA.sub("«oculto»", texto)
     return texto
+
+
+# ---------------------------------------------------------------------------
+# v0.2: textos y títulos sensibles (§C2.12 "Anti-contraseñas", §C2.13)
+# ---------------------------------------------------------------------------
+
+_RE_TITULO_SENSIBLE: Final = re.compile(PATRON_TITULO_SENSIBLE, re.IGNORECASE)
+_RE_OTP: Final = re.compile(r"^\s*\d{4,8}\s*$")
+# Rachas de 13+ dígitos con separadores sueltos (espacio o guion) y rachas puras de 13–19.
+_RE_RACHA_DIGITOS: Final = re.compile(r"[0-9](?:[ \-]?[0-9]){12,}")
+_RE_RACHA_PURA: Final = re.compile(r"(?<![0-9])[0-9]{13,19}(?![0-9])")
+_RE_SEPARADOR_DIGITOS: Final = re.compile(r"[ \-]")
+# Se aplica al texto en minúsculas y sin tildes: cubre "contraseña"/"contrasena", "código"/"codigo".
+_RE_ASIGNA_CLAVE: Final = re.compile(r"(?:contrasena|clave|password|\bpin|codigo)\s*[:=]\s*\S+")
+# Puntuación de borde que no cuenta como parte de una palabra ("¡Felicidades!" → "Felicidades").
+_BORDE_PALABRA: Final = (string.punctuation.replace("#", "").replace("@", "")
+                         + "¡¿«»“”‘’…–—·")
+# Separadores habituales dentro de palabras normales (no cuentan como clase "símbolo").
+_SEPARADORES_PALABRA: Final = frozenset("-.'’/:_")
+_RE_URL_PALABRA: Final = re.compile(r"^(?:https?://|www\.)", re.IGNORECASE)
+_RE_EMAIL_PALABRA: Final = re.compile(r"^[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+$")
+_RE_ETIQUETA_SOCIAL: Final = re.compile(r"^[#@]\w+$")   # #hashtag o @mención
+
+
+def normalizar_titulo(titulo: Any) -> str:
+    """Texto en minúsculas, sin tildes (NFKD sin marcas) y con los espacios colapsados.
+
+    Es la forma a la que se aplican ``PATRON_TITULO_SENSIBLE`` y ``Settings.pantalla_excluir_re``
+    (``"Contraseña  - Bancolombia"`` → ``"contrasena - bancolombia"``). ``None`` ⇒ ``""``.
+    """
+    if titulo is None:
+        return ""
+    descompuesto = unicodedata.normalize("NFKD", str(titulo))
+    sin_marcas = "".join(c for c in descompuesto if not unicodedata.combining(c))
+    return " ".join(sin_marcas.lower().split())
+
+
+def titulo_sensible(titulo: Any) -> bool:
+    """``True`` si el título (en minúsculas y sin tildes) casa con ``PATRON_TITULO_SENSIBLE``.
+
+    Ej.: ``"Bancolombia - Sucursal Virtual"``, ``"Iniciar sesión"``, ``"Bitwarden"``. Nunca lanza.
+    """
+    try:
+        return _RE_TITULO_SENSIBLE.search(normalizar_titulo(titulo)) is not None
+    except Exception as exc:  # título exótico (str() roto): se trata como sensible
+        log.debug("titulo_sensible: título no legible (%s); se trata como sensible", type(exc).__name__)
+        return True
+
+
+def _luhn(digitos: str) -> bool:
+    """Suma de verificación de Luhn sobre una cadena de dígitos ASCII."""
+    total = 0
+    for indice, caracter in enumerate(reversed(digitos)):
+        valor = ord(caracter) - 48
+        if indice % 2 == 1:
+            valor *= 2
+            if valor > 9:
+                valor -= 9
+        total += valor
+    return total % 10 == 0
+
+
+def _hay_tarjeta(texto: str) -> bool:
+    """13–19 dígitos (seguidos o con espacios/guiones sueltos) que pasan Luhn."""
+    for coincidencia in _RE_RACHA_DIGITOS.finditer(texto):
+        digitos = _RE_SEPARADOR_DIGITOS.sub("", coincidencia.group())
+        if 13 <= len(digitos) <= 19 and _luhn(digitos):
+            return True
+    return any(_luhn(c.group()) for c in _RE_RACHA_PURA.finditer(texto))
+
+
+def _parece_clave_compleja(palabra: str) -> bool:
+    """Palabra de ≥ 12 caracteres con ≥ 3 clases (minúscula, mayúscula, dígito, símbolo).
+
+    No cuentan como contraseña las URL, los correos, los #hashtags/@menciones ni las palabras
+    normales con puntuación de borde o separadores (``"¡Felicidades!"``, ``"Bogotá-Medellín"``).
+    """
+    if len(palabra) < 12:
+        return False
+    limpia = palabra.strip(_BORDE_PALABRA)
+    if not limpia:
+        return False
+    if (_RE_URL_PALABRA.match(limpia) or _RE_EMAIL_PALABRA.match(limpia)
+            or _RE_ETIQUETA_SOCIAL.match(limpia)):
+        return False
+    clases = 0
+    if any(c.islower() for c in limpia):
+        clases += 1
+    if any(c.isupper() for c in limpia):
+        clases += 1
+    if any(c.isdigit() for c in limpia):
+        clases += 1
+    if any(not c.isalnum() and not c.isspace() and c not in _SEPARADORES_PALABRA for c in limpia):
+        clases += 1
+    return clases >= 3
+
+
+def parece_secreto(texto: Any, secretos: Iterable[str] = ()) -> bool:
+    """``True`` si el texto parece un secreto (reglas "Texto" de §C2.12). Basta una:
+
+    1. ``redactar(texto, secretos, alta_entropia=True) != texto`` (claves, tokens, asignaciones
+       sensibles, secuencias de 24+ caracteres tipo clave, secretos literales).
+    2. ``^\\s*\\d{4,8}\\s*$``: el texto entero es un código OTP o un PIN.
+    3. 13–19 dígitos (seguidos o agrupados con espacios/guiones) que pasan Luhn (tarjeta).
+    4. ``(contraseña|clave|password|pin|código)\\s*[:=]\\s*\\S+`` (sobre minúsculas sin tildes).
+    5. Una palabra de ≥ 12 caracteres con ≥ 3 clases de caracteres (ver
+       :func:`_parece_clave_compleja`).
+
+    Función pura que comparten ``core/permisos.py`` y ``lobes/control_pc.py``. Nunca lanza: ante
+    un error interno responde ``True`` (lo prudente es no escribir el texto).
+    """
+    try:
+        cadena = "" if texto is None else str(texto)
+        if not cadena.strip():
+            return False
+        if redactar(cadena, secretos, alta_entropia=True) != cadena:
+            return True
+        if _RE_OTP.match(cadena):
+            return True
+        if _hay_tarjeta(cadena):
+            return True
+        if _RE_ASIGNA_CLAVE.search(normalizar_titulo(cadena)):
+            return True
+        return any(_parece_clave_compleja(palabra) for palabra in cadena.split())
+    except Exception as exc:  # contrato: nunca lanza; ante la duda, se trata como secreto
+        log.debug("parece_secreto: texto no evaluable (%s); se trata como secreto", type(exc).__name__)
+        return True
+
+
+def _como_tupla(valor: Any) -> tuple[Any, ...]:
+    """Tupla *hashable* de un campo de secuencia (tolera listas y una cadena suelta de ``con()``)."""
+    if valor is None:
+        return ()
+    if isinstance(valor, str):
+        return (valor,)
+    try:
+        return tuple(tuple(v) if isinstance(v, list) else v for v in valor)
+    except TypeError as exc:
+        log.debug("Secuencia de configuración no iterable (%s); se ignora", type(exc).__name__)
+        return ()
+
+
+@functools.lru_cache(maxsize=16)
+def _compilar_excluir_cache(extras: tuple[Any, ...]) -> re.Pattern[str]:
+    """``PATRON_TITULO_SENSIBLE`` | extras escapados (normalizados), sin distinguir mayúsculas."""
+    partes = [PATRON_TITULO_SENSIBLE]
+    for extra in extras:
+        normalizado = normalizar_titulo(extra)
+        if normalizado and re.escape(normalizado) not in partes:
+            partes.append(re.escape(normalizado))
+    return re.compile("|".join(partes), re.IGNORECASE)
+
+
+def _compilar_excluir(extras: Any) -> re.Pattern[str]:
+    """Patrón de títulos excluidos (ver :meth:`Settings.pantalla_excluir_re`); nunca lanza."""
+    try:
+        return _compilar_excluir_cache(_como_tupla(extras))
+    except TypeError as exc:  # elementos no hashables: sin extras (el patrón base siempre se aplica)
+        log.debug("pantalla_excluir no válido (%s); uso solo el patrón base", type(exc).__name__)
+        return _compilar_excluir_cache(())
+
+
+@functools.lru_cache(maxsize=16)
+def _destinos_permitidos_cache(items: tuple[Any, ...]) -> Mapping[str, str]:
+    """``{clave: clave}`` de ``DESTINOS_BASE`` ∪ ``{sinonimo: clave}`` válidos, de solo lectura."""
+    destinos = {clave: clave for clave in DESTINOS_BASE}
+    for par in items:
+        try:
+            sinonimo, clave = par
+        except (TypeError, ValueError) as exc:
+            log.debug("destinos_items: entrada no válida (%s); se ignora", type(exc).__name__)
+            continue
+        if (isinstance(sinonimo, str) and isinstance(clave, str) and clave in DESTINOS_BASE
+                and SAFE_ALIAS_RE.match(sinonimo) and sinonimo not in DESTINOS_BASE):
+            destinos[sinonimo] = clave
+    return types.MappingProxyType(destinos)
+
+
+def _destinos_permitidos(items: Any) -> Mapping[str, str]:
+    """Alias de destino → clave (ver :attr:`Settings.destinos_permitidos`); nunca lanza."""
+    try:
+        return _destinos_permitidos_cache(_como_tupla(items))
+    except TypeError as exc:  # elementos no hashables: solo el catálogo base
+        log.debug("destinos_items no válido (%s); uso solo DESTINOS_BASE", type(exc).__name__)
+        return _destinos_permitidos_cache(())
 
 
 class FiltroSecretos(logging.Filter):

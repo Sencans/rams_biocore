@@ -15,6 +15,24 @@ Qué hace:
 - Apaga de forma limpia en ≤ 15 s: despedida (con «El Psy Kongroo» solo en sesiones
   especiales), bitácora, cancelación de tareas y cierre ordenado de módulos (§6.6).
 
+v0.2 "Amadeus Companion" (``docs/COMPANION.md`` §C2.14, grupo ``orquestacion``):
+- Arranque de ``ControlPC`` (control de apps, teclado y cursor), ``VisionContinua`` (cámara y
+  pantalla en local, opt-in) y del endpoint ``/escritorio`` del HUD (Amadeus Desktop y chat
+  RINE), con sus diagnósticos ``control_pc``, ``vision_camara``, ``vision_pantalla`` y
+  ``escritorio``.
+- Chat de escritorio (``escritorio.chat``): un turno serializado por mensaje en el canal local
+  ``escritorio`` (texto redactado con alta entropía); con una confirmación pendiente, el texto
+  espera (como mucho 3) y **nunca** resuelve la confirmación: eso solo se hace con los botones
+  (``escritorio.confirmacion`` → ``resolver_por_id``) o en la terminal.
+- Acciones v0.2 (``abrir_destino``, ``buscar_en``, ``prerrellenar``, ``escribir_texto``,
+  ``travesura_cursor``): pasan **una** vez por la compuerta y las ejecuta ``ControlPC`` (nunca
+  ``aura.ejecutar``), con auditoría en ``data/acciones_pc.jsonl`` (sin el texto) y ``pc.accion``.
+- Travesuras (dueño único: main): ``EstadoTravesuras`` persistido en ``data/travesuras.json``
+  y un solo método, ``_set_travesuras``, para "basta", ``/travesuras``, el aborto y la bandeja.
+- Iniciativas con el overlay (aparecer, buscar al usuario), curiosidad web, borradores,
+  "no molestar" (usuario y sistema) y la traducción de visión/escritorio al conectoma y a la
+  presencia, todo con reglas deterministas (sin LLM).
+
 Dependencias: los módulos P0 (memoria, conectoma, Broca, permisos, presencia y salida) son
 obligatorios y se importan al iniciar; los P1/P2 (visión/PC, VTube Studio, web, HUD, control
 y Nexus) se importan y construyen dentro de ``try/except`` y, si faltan o fallan, quedan en
@@ -30,6 +48,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -47,7 +66,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
-from datetime import datetime, timezone
+from contextvars import ContextVar
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, TextIO
 
@@ -92,6 +112,26 @@ from core.intenciones import (
     quiere_cancelar,
 )
 
+try:  # v0.2 (grupo base): contratos del companion; sin ellos main sigue en modo v0.1
+    from core.contracts import DESTINOS_BASE, PATRONES_TRAVESURA, TIPOS_ACCION_V02
+except ImportError:  # contratos v0.1
+    DESTINOS_BASE = {}  # type: ignore[assignment]
+    PATRONES_TRAVESURA = ()  # type: ignore[assignment]
+    TIPOS_ACCION_V02 = frozenset()  # type: ignore[assignment]
+try:  # v0.2 (este grupo): constantes del enrutador
+    from core.intenciones import MENSAJE_BUSCAR_DEFECTO, NOTA_ESCRIBIR_DESPUES
+except ImportError:  # enrutador v0.1
+    MENSAJE_BUSCAR_DEFECTO = "Me pediste que te buscara"  # type: ignore[misc]
+    NOTA_ESCRIBIR_DESPUES = "escribir_despues"  # type: ignore[misc]
+try:  # nombres legibles de los destinos y saneado del texto (core/permisos.py, este grupo)
+    from core.permisos import nombre_destino, sanear_texto_accion
+except ImportError:  # compuerta v0.1
+    def nombre_destino(alias: Any) -> str:  # type: ignore[misc]
+        return str(alias or "esa app")
+
+    def sanear_texto_accion(texto: Any) -> str:  # type: ignore[misc]
+        return re.sub(r"[\r\n\t]+", " ", texto).strip() if isinstance(texto, str) else ""
+
 try:  # opcional: cliente HTTP compartido (Gemini, ElevenLabs, Telegram, Brave)
     import httpx
 except ImportError:  # sin httpx: los módulos se degradan a modo local
@@ -109,6 +149,7 @@ except ImportError:  # sin prompt_toolkit: hilo rams-stdin + ANSI
 __all__ = [
     "CANAL_DE_MODO",
     "Consola",
+    "EstadoTravesuras",
     "Orquestador",
     "supervisar",
     "autodiagnostico",
@@ -149,21 +190,58 @@ _NOMBRES_MODULO: Final = {
     "nexus": "Nexus IDE",
     "vts": "Puente VTube Studio",
     "avatar3d": "Avatar 3D (VTuber AI Studio)",
+    "motor": "Corteza motora (avatar 3D)",
     "voz": "Salida de voz",
     "telegram": "Mensajería (Telegram/RINE)",
     "web": "Investigación web",
     "hud": "HUD",
     "control": "Socket de control (MCP)",
+    # v0.2
+    "escritorio": "Amadeus Desktop (/escritorio)",
+    "control_pc": "Control del PC",
+    "vision_camara": "Visión continua (cámara)",
+    "vision_pantalla": "Visión continua (pantalla)",
 }
 
-# Orden fijo de las líneas de módulos en el arranque (maqueta de §6.4).
-_ORDEN_ARRANQUE: Final = ("broca", "camara", "telemetria", "hyprland", "vts", "avatar3d", "voz", "telegram", "web",
-                          "nexus", "hud", "control")
+# Orden fijo de las líneas de módulos en el arranque (maqueta de §6.4, ampliada en la v0.2).
+_ORDEN_ARRANQUE: Final = ("broca", "camara", "telemetria", "hyprland", "vts", "avatar3d", "motor", "voz", "telegram",
+                          "web", "nexus", "hud", "escritorio", "control_pc", "vision_camara", "vision_pantalla",
+                          "control")
 
 # Tarea supervisada → clave de diagnóstico que pasa a DEGRADADO si se desactiva.
 _CLAVE_TAREA: Final = {"conectoma": "conectoma", "salida": "voz", "telemetria": "telemetria",
                        "hyprland": "hyprland", "nexus": "nexus", "vts": "vts", "avatar3d": "avatar3d",
-                       "telegram_entrada": "telegram", "salieri": "memoria", "agenda": "memoria"}
+                       "motor": "motor", "telegram_entrada": "telegram", "salieri": "memoria", "agenda": "memoria",
+                       "vigilancia": "control_pc"}
+
+# --- v0.2 (docs/COMPANION.md §C2.14) ---------------------------------------
+TTL_BORRADOR_S: Final = 600.0                 # el último borrador caduca a los 10 min
+MAX_BORRADOR: Final = 500
+CHAT_EN_ESPERA_MAX: Final = 3                 # mensajes del chat retenidos durante una confirmación
+MAX_TEXTO_CHAT: Final = 2000
+MAX_TEXTO_SISTEMA: Final = 4000
+MENSAJE_CONFIRMACION_PENDIENTE_CHAT: Final = ("Tienes una confirmación pendiente: usa los botones. "
+                                              "Leo tu mensaje después.")
+MENSAJE_HUD_SOLO_TERMINAL: Final = "La URL del HUD solo se muestra en la terminal."
+SONDEO_VIGILANCIA_S: Final = 5.0              # no molestar, vencimiento de travesuras, rostro
+REFRESCO_ROSTRO_S: Final = 30.0               # registrar_rostro(True) mientras la visión ve a alguien
+INTERVALO_INYECCION_ESCRITORIO_S: Final = 5.0  # toque / soltada → conectoma, ≤ 1 cada 5 s
+VENTANA_TOQUES_S: Final = 30.0
+TOQUES_ENFADO: Final = 5                      # ≥ 5 toques en 30 s → error (enfado)
+INTERVALO_PANTALLA_ESTIMULO_S: Final = 30.0   # pantalla.estimulo → ventana_cambia, ≤ 1 cada 30 s
+PANTALLA_FRESCA_S: Final = 10.0               # muestra de pantalla.estado utilizable para la percepción
+CURIOSIDAD_WEB_MAX_DIA: Final = 3
+CURIOSIDAD_WEB_SEPARACION_S: Final = 7200.0
+MAX_CONSULTA_CURIOSIDAD: Final = 60
+MAX_URL_NOTIFICACION: Final = 300
+MAX_TEXTO_NOTIFICACION: Final = 300
+TTL_SOLICITUD_MOTOR_S: Final = 20.0
+TRAVESURAS_BASTA_S: Final = 7200.0            # 1.er "basta" del día: 2 h
+TRAVESURAS_ABORTO_S: Final = 7200.0           # el usuario movió el ratón: 2 h
+TTL_ULTIMO_DESTINO_S: Final = 120.0           # "abre whatsapp" → "escríbele a mamá: …"
+_URL_HTTPS_RE: Final = re.compile(r"^https://[^\s<>\"']+$")
+_ID_CONFIRMACION_RE: Final = re.compile(r"^[0-9a-f]{8}$")
+_EXE_SEGURO_RE: Final = re.compile(r"[^A-Za-z0-9_.\- ]+")
 
 _MESES: Final = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
                  "octubre", "noviembre", "diciembre")
@@ -187,6 +265,9 @@ _DESCRIPCION_COMANDOS: Final = {
     "/devolver_llamada": ("/devolver_llamada", "retoma la última llamada de Amadeus"),
     "/hud": ("/hud", "enlace privado del HUD (solo en esta terminal)"),
     "/logro": ("/logro <texto>", "registra un logro de la sesión"),
+    "/vision": ("/vision on|off|pausa [min]|estado", "visión continua local (cámara; opt-in)"),
+    "/pantalla": ("/pantalla off|metadatos|pixeles", "qué mira la visión de la pantalla"),
+    "/travesuras": ("/travesuras on|off", "travesuras con el cursor real (opt-in)"),
 }
 
 _CATEGORIAS_OBLIGATORIAS: Final = (
@@ -197,6 +278,11 @@ _CATEGORIAS_OBLIGATORIAS: Final = (
     "iniciativa_curiosidad_visual", "iniciativa_descanso", "iniciativa_cambio_linea", "accion_ok",
     "accion_denegada", "busqueda_resultados", "busqueda_sin_resultados", "confirmacion_requerida",
     "error_propio", "nexus_trabajo_terminado", "riesgo_9090", "logro", "bitacora",
+    # v0.2
+    "iniciativa_curiosidad_web", "iniciativa_conversar_app", "escritorio_aparece", "escritorio_te_busca",
+    "travesura_cursor", "basta_travesuras", "vision_pausada", "prerrellenar_confirma", "escribir_confirma",
+    "escribir_haz_clic", "accion_abrir_ok", "confirmacion_pendiente_chat", "sin_borrador", "sin_borrador_sin_llm",
+    "vistazo_presente_continua", "vistazo_ausente_continua", "iniciativa_curiosidad_visual_continua",
 )
 _CATEGORIAS_MINIMO_2: Final = frozenset({"bitacora", "logro"})
 
@@ -308,6 +394,36 @@ def _con_el_psy_kongroo(reply: BrocaReply) -> BrocaReply:
     return dataclasses.replace(reply, segmentos=tuple(segmentos))
 
 
+_ARGS_CITA_USUARIO: Final = ("consulta", "contenido", "mensaje")
+
+# Canal del turno que está ejecutando una AccionPC. Es un ContextVar (no un atributo) para que
+# dos acciones concurrentes no se pisen: ``permisos.autorizar`` publica ``permiso.solicitado``
+# dentro de la misma tarea y el manejador síncrono lo lee para no hablar las confirmaciones
+# pedidas desde el chat de escritorio (labios mudos, §C1.5, §C2.14.3).
+_CANAL_ACCION: ContextVar[str | None] = ContextVar("rams_canal_accion", default=None)
+
+
+def _intencion_redactada(intencion: Intencion, secretos: Sequence[str], *, alta_entropia: bool) -> Intencion:
+    """``intencion`` con sus argumentos de texto del usuario redactados (§4.1.3, §C2.14.3).
+
+    El enrutador saca ``consulta`` (búsqueda web, memoria), ``contenido`` (recordar) y
+    ``mensaje`` (programar, recordatorio personal) del texto **crudo**; aquí pasan por la misma
+    redacción que ``texto_seguro`` (con ``alta_entropia`` en el chat de escritorio) antes de
+    llegar a la memoria, la agenda, el bus, la red o Broca. Las ``AccionPC`` no se tocan: su
+    texto lo filtra la compuerta (``parece_secreto``). Nunca lanza.
+    """
+    args = dict(intencion.args)
+    cambio = False
+    for clave in _ARGS_CITA_USUARIO:
+        valor = args.get(clave)
+        if isinstance(valor, str) and valor:
+            redactado = redactar(valor, secretos, alta_entropia=alta_entropia)
+            if redactado != valor:
+                args[clave] = redactado
+                cambio = True
+    return dataclasses.replace(intencion, args=args) if cambio else intencion
+
+
 def _con_detalle(reply: BrocaReply, detalle: str) -> BrocaReply:
     """Garantiza que una alerta lleve sus cifras exactas (§8: "Plantilla J.A.R.V.I.S. con las cifras exactas").
 
@@ -335,6 +451,110 @@ async def _quizas_await(valor: Any) -> Any:
     if inspect.isawaitable(valor):
         return await valor
     return valor
+
+
+# ---------------------------------------------------------------------------
+# Estado persistente de la v0.2 (travesuras, auditoría, agenda "búscame")
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class EstadoTravesuras:
+    """Estado de las travesuras con el cursor real (dueño único: main, §C2.14.4).
+
+    Se persiste en ``data/travesuras.json`` (0o600). El estado **efectivo** además exige el
+    interruptor maestro ``RAMS_TRAVESURAS`` y que el usuario no haya pedido "no molestar".
+    """
+
+    activas: bool = True
+    apagadas_hasta_ts: float | None = None      # reloj de pared (sobrevive a reinicios)
+    basta_hoy: int = 0
+    fecha: str = ""                              # "YYYY-MM-DD" local del último "basta"
+
+    def a_dict(self) -> dict[str, Any]:
+        """Dict JSON-serializable."""
+        return {"activas": bool(self.activas), "apagadas_hasta_ts": self.apagadas_hasta_ts,
+                "basta_hoy": int(self.basta_hoy), "fecha": str(self.fecha)}
+
+    @classmethod
+    def desde_dict(cls, datos: Any) -> EstadoTravesuras:
+        """Estado validado desde el JSON guardado (cualquier valor raro vuelve al defecto)."""
+        if not isinstance(datos, Mapping):
+            return cls()
+        activas = datos.get("activas")
+        hasta = datos.get("apagadas_hasta_ts")
+        basta = datos.get("basta_hoy")
+        fecha = datos.get("fecha")
+        hasta_ok = (isinstance(hasta, (int, float)) and not isinstance(hasta, bool)
+                    and hasta == hasta and abs(float(hasta)) != float("inf"))
+        return cls(activas=activas if isinstance(activas, bool) else True,
+                   apagadas_hasta_ts=float(hasta) if hasta_ok else None,
+                   basta_hoy=basta if isinstance(basta, int) and not isinstance(basta, bool) and basta >= 0 else 0,
+                   fecha=fecha if isinstance(fecha, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", fecha) else "")
+
+
+def _escribir_json_privado(ruta: Path, datos: Any) -> None:
+    """Escribe ``datos`` como JSON de forma atómica (temporal + ``os.replace``) con permisos 0o600.
+
+    Bloqueante: se llama con ``asyncio.to_thread``.
+    """
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporal = tempfile.mkstemp(prefix=f".{ruta.name}.", suffix=".tmp", dir=str(ruta.parent))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as archivo:
+            json.dump(datos, archivo, ensure_ascii=False)
+        try:
+            os.chmod(temporal, 0o600)
+        except OSError as exc:  # Windows ignora casi todo el modo; no es un error
+            log.debug("chmod 0o600 no aplicado a %s: %s", ruta.name, type(exc).__name__)
+        for intento in range(5):
+            try:
+                os.replace(temporal, ruta)
+                break
+            except PermissionError:
+                # Windows: el destino puede estar abierto un instante por otro lector (antivirus,
+                # indexador…); se reintenta en este mismo hilo de trabajo (nunca en el loop).
+                if intento == 4:
+                    raise
+                time.sleep(0.05 * (intento + 1))
+    except BaseException:
+        try:
+            os.unlink(temporal)
+        except OSError:
+            pass
+        raise
+
+
+def _leer_json(ruta: Path) -> Any:
+    """JSON de ``ruta`` o ``None`` si no existe o no se puede leer (bloqueante: ``to_thread``)."""
+    try:
+        return json.loads(ruta.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        log.warning("No se pudo leer %s (%s); uso valores por defecto", ruta.name, type(exc).__name__)
+        return None
+
+
+def _anexar_jsonl_privado(ruta: Path, registro: Mapping[str, Any]) -> None:
+    """Añade una línea JSON a un archivo *append-only* creado con 0o600 (bloqueante: ``to_thread``)."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    linea = (json.dumps(dict(registro), ensure_ascii=False) + "\n").encode("utf-8")
+    banderas = os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    descriptor = os.open(str(ruta), banderas, 0o600)
+    try:
+        os.write(descriptor, linea)
+    finally:
+        os.close(descriptor)
+
+
+def _nombre_app(objetivo: Any) -> str:
+    """Nombre corto de una app a partir de un objetivo de ventana (``chrome.exe`` → ``chrome``)."""
+    exe = str(getattr(objetivo, "exe", "") or getattr(objetivo, "clase", "") or "")
+    exe = _EXE_SEGURO_RE.sub("", exe).strip()
+    if exe.lower().endswith(".exe"):
+        exe = exe[:-4]
+    return exe[:40]
 
 
 # ---------------------------------------------------------------------------
@@ -798,12 +1018,15 @@ class Orquestador:
         self.web: Any = None
         self.vtube: Any = None
         self.avatar3d: Any = None
+        self.corteza: Any = None     # corteza motora: el conectoma mueve el avatar 3D
         self.aura: Any = None
         self.permisos: Any = None
         self.presencia: Any = None
         self.riko: Any = None
         self.hud: Any = None
         self.control: Any = None
+        self.control_pc: Any = None  # v0.2: lobes/control_pc.py (apps, teclado y cursor)
+        self.vision: Any = None      # v0.2: lobes/vision_continua.py (cámara y pantalla en local)
         self._cliente = cliente
         self._cliente_propio = False
         # Estado propio (§10.21)
@@ -842,6 +1065,40 @@ class Orquestador:
         self._stats = {"turnos": 0, "busquedas": 0, "vistazos": 0, "iniciativas": 0}
         self._temas: deque[str] = deque(maxlen=3)
         self._fragmentos_inicio: int | None = None
+        # --- v0.2 (§C2.14) ---
+        # Relojes inyectables (tests): monotónico para ritmos y de pared para lo persistido.
+        self._reloj: Callable[[], float] = time.monotonic
+        self._reloj_pared: Callable[[], float] = time.time
+        self._chat_en_espera: deque[str] = deque(maxlen=CHAT_EN_ESPERA_MAX)
+        self._overlay_conectado = False          # escritorio.conectado.overlay (Electron conectado)
+        self._overlay_visible = False            # escritorio.evento mostrada/ocultada
+        self._travesuras = EstadoTravesuras()
+        self._travesuras_publicadas: tuple[bool, float | None] | None = None
+        self._ultima_travesura_mono: float | None = None
+        self._no_molestar_usuario = False
+        self._no_molestar_sistema: tuple[bool, str] = (False, "")
+        self._no_molestar_publicado: tuple[bool, str] | None = None
+        self._lock_archivos = asyncio.Lock()     # serializa las escrituras de data/*.json
+        self._rng = random.Random()
+        self._ultimo_borrador: tuple[str, float] | None = None
+        self._ultimo_destino: tuple[str, float] | None = None
+        self._ultima_pantalla: dict[str, Any] | None = None
+        self._ultima_pantalla_ts = float("-inf")
+        self._ultimo_estado_vision: dict[str, Any] | None = None
+        self._ultimo_rostro: dict[str, Any] | None = None
+        self._ultima_atencion: float | None = None
+        self._toques: deque[float] = deque(maxlen=64)
+        self._ultima_inyeccion_escritorio = float("-inf")
+        self._ultima_inyeccion_pantalla = float("-inf")
+        self._ultima_firma_pantalla: str | None = None
+        self._ultimo_refresco_rostro = float("-inf")
+        self._camaras_activas: dict[str, bool] = {}
+        self._indicador_camara = False
+        self._curiosidad_web_ts: list[float] = []          # reloj de pared
+        self._temas_curiosidad: list[str] | None = None
+        self._temas_recientes: deque[str] = deque(maxlen=5)
+        self._agenda_buscar: set[int] = set()
+        self._ultimo_turno_local_mono = float("-inf")
 
     # ------------------------------------------------------------------
     # Construcción y arranque
@@ -864,6 +1121,98 @@ class Orquestador:
                     clave, _NOMBRES_MODULO.get(clave, clave), EstadoModulo.OFF, detalle)
             return None
 
+    # --- v0.2: construcción de ControlPC, visión y estado persistente ---------
+
+    @staticmethod
+    def _activar_dpi() -> None:
+        """``control_pc.activar_dpi_por_monitor()`` si el módulo existe (nunca lanza)."""
+        try:
+            modulo = importlib.import_module("lobes.control_pc")
+        except Exception as exc:  # módulo ausente o roto: _construir_opcional lo diagnostica
+            log.debug("Sin lobes.control_pc para la consciencia de DPI (%s)", type(exc).__name__)
+            return
+        activar = getattr(modulo, "activar_dpi_por_monitor", None)
+        if not callable(activar):
+            return
+        try:
+            activar()
+        except Exception as exc:  # contrato: no lanza; defensa en profundidad
+            log.debug("activar_dpi_por_monitor falló: %s", type(exc).__name__)
+
+    def _conectar_presencia_control_pc(self) -> None:
+        """Inactividad de Windows y filtro de inyecciones propias (ControlPC → presencia)."""
+        if self.control_pc is None or self.presencia is None:
+            return
+        conectar = getattr(self.presencia, "conectar_control_pc", None)
+        if not callable(conectar):
+            return
+        inactividad = getattr(self.control_pc, "inactividad_s", None)
+        inyeccion = getattr(self.control_pc, "ts_ultima_inyeccion", None)
+        try:
+            conectar(inactividad_pc=inactividad if callable(inactividad) else None,
+                     ts_ultima_inyeccion=inyeccion if callable(inyeccion) else None)
+        except Exception as exc:
+            log.warning("No se pudo conectar ControlPC a la presencia: %s", type(exc).__name__)
+
+    def _construir_vision(self) -> None:
+        """``VisionContinua`` si ``tiene_vision_continua``; si no, diagnósticos ``OFF`` con el motivo."""
+        s = self.settings
+        claves = ("vision_camara", "vision_pantalla")
+        if not getattr(s, "tiene_vision_continua", False):
+            if not getattr(s, "vision_continua", False):
+                detalle = "deshabilitada (RAMS_VISION_CONTINUA=0)"
+            else:
+                detalle = "requiere la cámara (RAMS_CAMERA=1)"
+            for clave in claves:
+                self._diag_ausentes[clave] = DiagnosticoModulo(clave, _NOMBRES_MODULO[clave], EstadoModulo.OFF,
+                                                               detalle)
+            return
+        self.vision = self._construir_opcional(
+            "lobes.vision_continua", "VisionContinua", claves,
+            lambda cls: cls(s, self.bus, presencia=self.presencia))
+        if self.vision is None or self.aura is None:
+            return
+        fijar = getattr(self.aura, "set_fuente_continua", None)
+        fuente = getattr(self.vision, "como_vistazo", None)
+        if callable(fijar) and callable(fuente):
+            try:
+                fijar(fuente)   # un solo dueño del dispositivo: los vistazos usan la muestra continua
+            except Exception as exc:
+                log.warning("No se pudo enlazar la visión continua con aura: %s", type(exc).__name__)
+        else:
+            log.info("aura no admite fuente continua (set_fuente_continua); pendiente de integración")
+
+    def _ruta_datos(self, nombre: str) -> Path:
+        return Path(self.settings.data_dir) / nombre
+
+    async def _cargar_estado_v02(self) -> None:
+        """Lee ``data/travesuras.json`` y ``data/agenda_buscar.json`` (fuera del loop)."""
+        try:
+            datos = await asyncio.to_thread(_leer_json, self._ruta_datos("travesuras.json"))
+            self._travesuras = EstadoTravesuras.desde_dict(datos)
+        except Exception as exc:
+            log.warning("Estado de travesuras no disponible (%s); uso el defecto", type(exc).__name__)
+            self._travesuras = EstadoTravesuras()
+        try:
+            ids = await asyncio.to_thread(_leer_json, self._ruta_datos("agenda_buscar.json"))
+            if isinstance(ids, list):
+                self._agenda_buscar = {i for i in ids if isinstance(i, int) and not isinstance(i, bool)}
+        except Exception as exc:
+            log.debug("Agenda de búsquedas no disponible (%s)", type(exc).__name__)
+
+    def _pids_extra(self) -> frozenset[int]:
+        """PIDs de Amadeus Desktop (y descendientes) que tampoco son objetivo de escribir_texto."""
+        if self.control_pc is None:
+            return frozenset()
+        fuente = getattr(self.control_pc, "pids_excluidos", None)
+        if not callable(fuente):
+            return frozenset()
+        try:
+            return frozenset(fuente())
+        except Exception as exc:
+            log.debug("pids_excluidos no disponible (%s)", type(exc).__name__)
+            return frozenset()
+
     async def iniciar(self, *, lanzar_tareas: bool = True, imprimir_arranque: bool = True) -> list[DiagnosticoModulo]:
         """Construye y conecta los módulos (orden normativo de §10.21), hace los diagnósticos y,
         si se pide, imprime el arranque Amadeus, saluda y lanza las tareas supervisadas.
@@ -878,6 +1227,10 @@ class Orquestador:
         self._inicio_ts = time.time()
         self._inicio_mono = time.monotonic()
 
+        # 0. v0.2: consciencia de DPI por monitor, lo primero (antes de ControlPC y de la visión:
+        # mss cambia la consciencia de DPI del proceso y las coordenadas dejarían de ser físicas).
+        self._activar_dpi()
+
         # 1. Bus y manejador de log (con los secretos para el filtro).
         self.bus.vincular_loop(loop)
         instalar_manejador_log(self.bus, secretos=s.secretos())
@@ -888,13 +1241,25 @@ class Orquestador:
             self._cliente_propio = True
 
         # 2. HUD antes que nadie: se suscribe en su __init__ y guarda todos los sistema.modulo.
-        if s.hud_habilitado:
-            self.hud = self._construir_opcional("interface.hud_server", "ServidorHUD", ("hud",),
+        # v0.2: el mismo servidor sirve /escritorio (Amadeus Desktop y chat), así que arranca si
+        # hay HUD **o** escritorio.
+        tiene_escritorio = bool(getattr(s, "tiene_escritorio", False))
+        if s.hud_habilitado or tiene_escritorio:
+            claves_hud = ("hud", "escritorio") if tiene_escritorio else ("hud",)
+            self.hud = self._construir_opcional("interface.hud_server", "ServidorHUD", claves_hud,
                                                 lambda cls: cls(s, self.bus))
         else:
             self._diag_ausentes["hud"] = DiagnosticoModulo("hud", "HUD", EstadoModulo.OFF, "deshabilitado")
+        if not tiene_escritorio:
+            self._diag_ausentes["escritorio"] = DiagnosticoModulo(
+                "escritorio", _NOMBRES_MODULO["escritorio"], EstadoModulo.OFF, "deshabilitado (RAMS_ESCRITORIO=0)")
         self.bus.publicar("sistema.arranque", {"version": VERSION, "offline": s.offline,
                                                "inicio_ts": self._inicio_ts}, origen="main")
+
+        # 2b. v0.2: ControlPC (antes de la compuerta, que excluye sus pids, y de la presencia,
+        # que usa su inactividad). Opcional: sin él, las acciones v0.2 responden "no disponible".
+        self.control_pc = self._construir_opcional("lobes.control_pc", "ControlPC", ("control_pc",),
+                                                   lambda cls: cls(s))
 
         # 3. Área de Broca.
         clase_broca = _importar_obligatorio("lobes.broca_llm", "BrocaLLM")
@@ -921,9 +1286,12 @@ class Orquestador:
         clase_conectoma = _importar_obligatorio("core.sincan_connectome", "SincanConnectome")
         self.conectoma = clase_conectoma(s)
 
-        # 7. Compuerta de permisos (las confirmaciones se imprimen en la consola).
+        # 7. Compuerta de permisos (las confirmaciones se imprimen en la consola y, en la v0.2,
+        # también llegan al chat de escritorio como botones). pids_extra: ventanas de Amadeus
+        # Desktop; travesuras_activas: estado efectivo de main (§C2.14.4).
         clase_permisos = _importar_obligatorio("core.permisos", "CompuertaPermisos")
-        self.permisos = clase_permisos(s, self.bus, preguntar=self.consola.imprimir_sistema)
+        self.permisos = clase_permisos(s, self.bus, preguntar=self.consola.imprimir_sistema,
+                                       pids_extra=self._pids_extra, travesuras_activas=self._travesuras_efectivas)
 
         # 8. Lóbulos periféricos (P1/P2, opcionales).
         self.aura = self._construir_opcional(
@@ -938,10 +1306,19 @@ class Orquestador:
             self.avatar3d = self._construir_opcional(
                 "lobes.vtuber_ai_bridge", "VTuberAIBridge", ("avatar3d",),
                 lambda cls: cls(s, self.bus, cliente=self._cliente))
+        # Corteza motora: el conectoma decide cuándo y cómo se mueve el avatar 3D (sin LLM).
+        if self.avatar3d is not None and getattr(s, "avatar_autonomo", False):
+            self.corteza = self._construir_opcional(
+                "lobes.corteza_motora", "CortezaMotora", ("motor",),
+                lambda cls: cls(s, self.bus, self.avatar3d))
 
-        # 9. Presencia.
+        # 9. Presencia (v0.2: inactividad de Windows desde ControlPC, ignorando sus propias inyecciones).
         clase_presencia = _importar_obligatorio("core.presence", "RastreadorPresencia")
         self.presencia = clase_presencia(s)
+        self._conectar_presencia_control_pc()
+
+        # 9b. v0.2: visión continua (opt-in de dos niveles; solo lee la presencia, nunca la escribe).
+        self._construir_vision()
 
         # 10. Salida (voz + avatar / Telegram).
         clase_riko = _importar_obligatorio("lobes.riko_megumin_io", "RikoMeguminIO")
@@ -954,6 +1331,7 @@ class Orquestador:
                                                 lambda cls: cls(s, self._despachar_control))
 
         self._suscribir_eventos()
+        await self._cargar_estado_v02()
 
         # Diagnósticos en paralelo (con conectoma.iniciar), cada uno con su plazo.
         calibrar = lanzar_tareas or imprimir_arranque
@@ -965,6 +1343,8 @@ class Orquestador:
         for diag in diags:
             self.bus.publicar("sistema.modulo", diag.a_dict(), origen="main")
         self._diags_arranque = list(diags)
+        # v0.2: la corteza y el chat conocen el estado efectivo de las travesuras desde el arranque.
+        self._publicar_travesuras(forzar=True)
         self._ultimo_campo = self.conectoma.estado().campo
         self._ultima_fuente = self.conectoma.estado().fuente
 
@@ -1063,6 +1443,11 @@ class Orquestador:
             trabajos.append((("control",), self.control.iniciar, 4.0))
         if self.avatar3d is not None:
             trabajos.append((("avatar3d",), self.avatar3d.iniciar, 4.0))
+        # v0.2: ControlPC y visión continua, cada uno con wait_for(…, 4).
+        if self.control_pc is not None:
+            trabajos.append((("control_pc",), self.control_pc.iniciar, 4.0))
+        if self.vision is not None:
+            trabajos.append((("vision_camara", "vision_pantalla"), self.vision.iniciar, 4.0))
         resultados = await asyncio.gather(*(self._medir(f, t) for _c, f, t in trabajos))
 
         por_clave: dict[str, DiagnosticoModulo] = {}
@@ -1094,6 +1479,23 @@ class Orquestador:
         if not getattr(s, "vtuber_ai_habilitado", False):
             por_clave["avatar3d"] = DiagnosticoModulo("avatar3d", _NOMBRES_MODULO["avatar3d"], EstadoModulo.OFF,
                                                       "deshabilitado")
+        # La corteza motora se diagnostica después del avatar 3D (su estado depende de él).
+        if self.corteza is not None:
+            try:
+                por_clave["motor"] = self.corteza.diagnostico()
+            except Exception as exc:
+                log.warning("Diagnóstico de la corteza motora falló: %s", type(exc).__name__)
+                por_clave["motor"] = DiagnosticoModulo("motor", _NOMBRES_MODULO["motor"], EstadoModulo.DEGRADADO,
+                                                       "diagnóstico falló")
+            tiempos["motor"] = time.monotonic() - self._inicio_mono
+        elif not getattr(s, "avatar_autonomo", False):
+            por_clave["motor"] = DiagnosticoModulo("motor", _NOMBRES_MODULO["motor"], EstadoModulo.OFF, "deshabilitado")
+        elif self.avatar3d is None:
+            por_clave["motor"] = DiagnosticoModulo("motor", _NOMBRES_MODULO["motor"], EstadoModulo.OFF, "sin avatar 3D")
+        # v0.2: /escritorio lo diagnostica el HUD (sin token en el detalle).
+        if self.hud is not None and getattr(s, "tiene_escritorio", False):
+            por_clave["escritorio"] = self._diagnostico_escritorio()
+            tiempos["escritorio"] = time.monotonic() - self._inicio_mono
         for clave, diag in self._diag_ausentes.items():
             por_clave.setdefault(clave, diag)
             tiempos.setdefault(clave, time.monotonic() - self._inicio_mono)
@@ -1101,6 +1503,21 @@ class Orquestador:
         diags = [por_clave[c] for c in orden if c in por_clave]
         diags.extend(d for c, d in por_clave.items() if c not in orden)
         return diags, tiempos
+
+    def _diagnostico_escritorio(self) -> DiagnosticoModulo:
+        """``hud.diagnostico_escritorio()`` (grupo escritorio-ws) o un ``OFF`` si aún no existe."""
+        nombre = _NOMBRES_MODULO["escritorio"]
+        diagnosticar = getattr(self.hud, "diagnostico_escritorio", None)
+        if not callable(diagnosticar):
+            return DiagnosticoModulo("escritorio", nombre, EstadoModulo.OFF, "el HUD no ofrece /escritorio")
+        try:
+            diag = diagnosticar()
+        except Exception as exc:
+            log.warning("Diagnóstico de /escritorio falló: %s", type(exc).__name__)
+            return DiagnosticoModulo("escritorio", nombre, EstadoModulo.DEGRADADO, "diagnóstico falló")
+        if isinstance(diag, DiagnosticoModulo):
+            return diag
+        return DiagnosticoModulo("escritorio", nombre, EstadoModulo.DEGRADADO, "diagnóstico no válido")
 
     def _valor_diagnostico(self, diag: DiagnosticoModulo) -> str:
         """Texto de la columna de valor de una línea del arranque (§6.4)."""
@@ -1205,9 +1622,12 @@ class Orquestador:
         etiquetas = {
             "broca": "Área de Broca (Gemini)", "camara": "Lóbulo visual (cámara)", "telemetria": "Telemetría",
             "hyprland": "Hyprland", "vts": f"Puente VTube Studio :{puerto_vts}",
-            "avatar3d": f"Avatar 3D VTuber AI Studio :{puerto_avatar}", "voz": "Salida de voz",
+            "avatar3d": f"Avatar 3D VTuber AI Studio :{puerto_avatar}", "motor": "Corteza motora (avatar 3D)",
+            "voz": "Salida de voz",
             "telegram": "Mensajería (Telegram/RINE)", "web": "Investigación web", "nexus": "Nexus IDE",
             "hud": "HUD", "control": "Socket de control (MCP)",
+            "escritorio": "Amadeus Desktop (/escritorio)", "control_pc": "Control del PC",
+            "vision_camara": "Visión continua (cámara)", "vision_pantalla": "Visión continua (pantalla)",
         }
         for clave in _ORDEN_ARRANQUE:
             diag = diags.get(clave)
@@ -1261,11 +1681,14 @@ class Orquestador:
              self.aura is not None and getattr(self.aura, "nexus", None) is not None),
             ("vts", lambda: self.vtube.bucle_reconexion(self.parar), self.vtube is not None and s.vts_habilitado),
             ("avatar3d", lambda: self.avatar3d.bucle(self.parar), self.avatar3d is not None),
+            ("motor", lambda: self.corteza.bucle(self.parar), self.corteza is not None),
             ("telegram_entrada", lambda: self.riko.bucle_telegram_entrada(self.parar, self._manejar_telegram),
              s.tiene_telegram and s.telegram_polling),
             ("salieri", lambda: self.memoria.bucle_compresor(self.parar, presente=self._usuario_presente), True),
             ("agenda", self._bucle_agenda, True),
             ("presencia", self._bucle_presencia, True),
+            # v0.2: no molestar (5 s), vencimiento de las travesuras y rostro → presencia (30 s).
+            ("vigilancia", self._bucle_vigilancia, True),
         ]
         for nombre, fabrica, condicion in especificaciones:
             if not condicion:
@@ -1366,6 +1789,22 @@ class Orquestador:
             sub("homeostasis.estado", self._ev_homeostasis),
             sub("hud.control", self._ev_hud_control),
             sub("permiso.solicitado", self._ev_permiso_solicitado),
+            # v0.2 (§C2.3): nombres exactos; nunca "*" ni "escritorio.*".
+            sub("permiso.resuelto", self._ev_permiso_resuelto),
+            sub("escritorio.chat", self._ev_escritorio_chat),
+            sub("escritorio.confirmacion", self._ev_escritorio_confirmacion),
+            sub("escritorio.control", self._ev_escritorio_control),
+            sub("escritorio.evento", self._ev_escritorio_evento),
+            sub("escritorio.conectado", self._ev_escritorio_conectado),
+            sub("escritorio.app", self._ev_escritorio_app),
+            sub("escritorio.caja", self._ev_escritorio_caja),
+            sub("motor.travesura", self._ev_motor_travesura),
+            sub("vision.estimulo", self._ev_vision_estimulo),
+            sub("vision.rostro", self._ev_vision_rostro),
+            sub("vision.atencion", self._ev_vision_atencion),
+            sub("vision.estado", self._ev_vision_estado),
+            sub("pantalla.estado", self._ev_pantalla_estado),
+            sub("pantalla.estimulo", self._ev_pantalla_estimulo),
         ]
 
     def _inyectar(self, evento: str, **datos: Any) -> None:
@@ -1421,8 +1860,18 @@ class Orquestador:
             self._inyectar("rostro", presente=bool(rostro), n=int(evento.datos.get("n_rostros") or 0))
 
     def _ev_camara(self, evento: Evento) -> None:
+        """Indicador ``● CÁMARA ACTIVA`` de la consola = OR de las fuentes (vistazo y continua, §C2.13).
+
+        Solo se imprime al cambiar el OR: la visión continua repite ``vision.camara`` cada 5 s.
+        """
         d = evento.datos
-        self.consola.indicador_camara(bool(d.get("activa")), d.get("duracion_ms"))
+        fuente = d.get("fuente") if d.get("fuente") in ("vistazo", "continua") else "vistazo"
+        self._camaras_activas[str(fuente)] = bool(d.get("activa"))
+        activa = any(self._camaras_activas.values())
+        if activa == self._indicador_camara:
+            return
+        self._indicador_camara = activa
+        self.consola.indicador_camara(activa, d.get("duracion_ms"))
 
     def _ev_web(self, evento: Evento) -> None:
         d = evento.datos
@@ -1469,8 +1918,12 @@ class Orquestador:
             if accion == "silenciar" and self.riko is not None:
                 self.riko.set_silencio(not self.riko.silenciado)
                 self.consola.imprimir_sistema("HUD: voz silenciada." if self.riko.silenciado else "HUD: voz activada.")
-            elif accion == "camara" and self.aura is not None:
-                efectivo = self.aura.set_camara(not self.aura.camara_habilitada)
+            elif accion == "camara" and (self.aura is not None or self.vision is not None):
+                efectivo = False
+                if self.aura is not None:
+                    efectivo = bool(self.aura.set_camara(not self.aura.camara_habilitada))
+                if not efectivo:
+                    self._apagar_vision_camara()   # §C2.13: el botón "Cámara" también pausa la continua
                 self.consola.imprimir_sistema("HUD: cámara habilitada." if efectivo else "HUD: cámara deshabilitada.")
             elif accion == "colgar" and self.riko is not None:
                 self.riko.pausar_proactividad(30)
@@ -1482,15 +1935,653 @@ class Orquestador:
         if self._apagando or self.riko is None or self.presencia is None or self.broca is None:
             return None
         try:
+            # v0.2: lo pedido desde el chat de escritorio se confirma con sus botones y en silencio
+            # (labios mudos), salvo RAMS_ESCRITORIO_VOZ=1 (§C1.5, §C2.14.3).
+            if _CANAL_ACCION.get() == "escritorio" and not getattr(self.settings, "escritorio_voz", False):
+                return None
             presente = self.presencia.estado().presente
             if not (presente and self.riko.voz_disponible):
                 return None
-            reply = self.broca.frase_local("confirmacion_requerida", self.conectoma.estado(),
-                                           descripcion=str(evento.datos.get("descripcion", "")))
+            # v0.2: un borrador o un tecleo no son "destructivos": frase propia (nunca lee el texto).
+            tipo = evento.datos.get("tipo")
+            if tipo == "prerrellenar":
+                reply = self.broca.frase_local("prerrellenar_confirma", self.conectoma.estado())
+            elif tipo == "escribir_texto":
+                reply = self.broca.frase_local("escribir_confirma", self.conectoma.estado())
+            else:
+                reply = self.broca.frase_local("confirmacion_requerida", self.conectoma.estado(),
+                                               descripcion=str(evento.datos.get("descripcion", "")))
         except Exception as exc:
             log.debug("Sin confirmación por voz: %s", type(exc).__name__)
             return None
         return self.riko.decir(reply, origen="sistema", canal="voz")
+
+    # ------------------------------------------------------------------
+    # v0.2: escritorio, visión, travesuras y "no molestar" (§C2.3, §C2.14)
+    # ------------------------------------------------------------------
+
+    def _publicar(self, nombre: str, datos: Mapping[str, Any]) -> None:
+        """``bus.publicar`` protegido (origen ``main``; nunca lanza)."""
+        try:
+            self.bus.publicar(nombre, dict(datos), origen="main")
+        except Exception as exc:
+            log.debug("No se pudo publicar %s: %s", nombre, type(exc).__name__)
+
+    def _sistema_escritorio(self, texto: str) -> None:
+        """``escritorio.sistema`` (≤ 4000): salida de comandos y avisos para el chat (nunca ``/ws``)."""
+        limpio = str(texto or "").strip()
+        if limpio:
+            self._publicar("escritorio.sistema", {"texto": limpio[:MAX_TEXTO_SISTEMA]})
+
+    def _aviso_local(self, texto: str, canal: str) -> None:
+        """Aviso del sistema en la consola y, si el turno vino del chat de escritorio, también allí."""
+        self.consola.imprimir_sistema(texto)
+        if canal == "escritorio":
+            self._sistema_escritorio(texto)
+
+    def _orden_escritorio(self, accion: str, **campos: Any) -> None:
+        """``escritorio.orden`` hacia Amadeus Desktop (visibilidad, chat y notificaciones)."""
+        self._publicar("escritorio.orden", {"accion": accion, **campos})
+
+    def _solicitud_motor(self, conducta: str, motivo: str, *, borde: str | None = None,
+                         ttl_s: float = TTL_SOLICITUD_MOTOR_S) -> None:
+        """``motor.solicitud``: main decide QUÉ (iniciativa); la corteza motora decide CÓMO."""
+        self._publicar("motor.solicitud", {"conducta": conducta, "motivo": str(motivo or "")[:60],
+                                           "borde": borde if borde in ("left", "right") else None,
+                                           "ttl_s": float(min(30.0, max(0.0, ttl_s)))})
+
+    def _overlay_disponible(self) -> bool:
+        """Overlay disponible (§C2.14.6): Electron conectado **y** algún visor de escritorio cargado."""
+        if not self._overlay_conectado or self.avatar3d is None:
+            return False
+        try:
+            return int(getattr(self.avatar3d, "visores_escritorio_total", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _salir_a_buscar(self, motivo: str, *, presente: bool) -> bool:
+        """Regla única de C1.3: presente + overlay disponible + sin "no molestar" → aparece y te busca.
+
+        Si el overlay está oculto, primero ``escritorio.orden{aparecer, modo:"asomarse"}``; después
+        ``motor.solicitud{buscar_usuario, ttl_s:20}``. Devuelve ``True`` si publicó la solicitud.
+        """
+        if not presente or not self._overlay_disponible() or self._no_molestar_activo():
+            return False
+        borde = self._rng.choice(("left", "right"))
+        if not self._overlay_visible:
+            self._orden_escritorio("aparecer", borde=borde, modo="asomarse")
+        self._solicitud_motor("buscar_usuario", motivo, borde=borde, ttl_s=TTL_SOLICITUD_MOTOR_S)
+        return True
+
+    # --- chat y confirmaciones --------------------------------------------
+
+    def _ev_escritorio_chat(self, evento: Evento) -> None:
+        """Mensaje del chat de escritorio (§C2.14.2). Síncrono; el texto nunca se registra.
+
+        Con una confirmación pendiente el texto espera (deque de 3) y **no** la resuelve: solo
+        los botones o la terminal. Si no, un turno serializado en el canal ``escritorio``.
+        """
+        try:
+            texto = evento.datos.get("texto")
+            if not isinstance(texto, str):
+                return
+            texto = texto.strip()[:MAX_TEXTO_CHAT]
+            if not texto or self._apagando or not self._iniciado:
+                return
+            if self.permisos is not None and self.permisos.hay_pendiente():
+                self._chat_en_espera.append(texto)
+                self._sistema_escritorio(MENSAJE_CONFIRMACION_PENDIENTE_CHAT)
+                return
+            self._crear_tarea(self._turno_serializado(texto, "escritorio"), "turno_escritorio")
+        except Exception as exc:  # nunca con el texto en el log
+            log.warning("No se pudo atender un mensaje del chat de escritorio (%s)", type(exc).__name__)
+
+    def _ev_permiso_resuelto(self, evento: Evento) -> None:
+        """Resuelta la confirmación, los mensajes del chat que esperaban pasan a turnos (en orden)."""
+        if self._apagando:
+            self._chat_en_espera.clear()
+            return
+        while self._chat_en_espera:
+            texto = self._chat_en_espera.popleft()
+            self._crear_tarea(self._turno_serializado(texto, "escritorio"), "turno_escritorio")
+
+    def _ev_escritorio_confirmacion(self, evento: Evento) -> None:
+        """Botón de confirmación del chat → ``permisos.resolver_por_id`` (síncrono, §C2.14.5)."""
+        d = evento.datos
+        ident, aprobado = d.get("id"), d.get("aprobado")
+        if (not isinstance(ident, str) or not _ID_CONFIRMACION_RE.fullmatch(ident)
+                or not isinstance(aprobado, bool) or self.permisos is None):
+            return
+        resolver = getattr(self.permisos, "resolver_por_id", None)
+        try:
+            resuelta = bool(resolver(ident, aprobado)) if callable(resolver) else False
+        except Exception as exc:
+            log.warning("No se pudo resolver la confirmación con el botón: %s", type(exc).__name__)
+            resuelta = False
+        if resuelta:
+            return
+        pendiente = self.permisos.pendiente() if self.permisos.hay_pendiente() else None
+        if pendiente is not None and getattr(pendiente.accion, "tipo", "") == "cerrar_ventana":
+            self._sistema_escritorio("Cerrar ventanas solo se confirma en la terminal.")
+        else:
+            self._sistema_escritorio("Esa confirmación ya no está pendiente.")
+
+    # --- controles, eventos y estado de Amadeus Desktop -------------------
+
+    def _ev_escritorio_control(self, evento: Evento) -> None:
+        """Bandeja, atajos y botones del chat (§C1.11, §C1.12)."""
+        accion = evento.datos.get("accion")
+        try:
+            if accion == "no_molestar_on":
+                self._set_no_molestar_usuario(True)
+            elif accion == "no_molestar_off":
+                self._set_no_molestar_usuario(False)
+            elif accion == "basta_travesuras":
+                mensaje = self._set_travesuras("basta")
+                self._orden_escritorio("esconderse")
+                self.consola.imprimir_sistema(mensaje)
+                self._sistema_escritorio(mensaje)
+            elif accion == "pausar_vision":
+                mensaje = self._pausar_vision(None)
+                self.consola.imprimir_sistema(mensaje)
+                self._sistema_escritorio(mensaje)
+        except Exception as exc:
+            log.warning("Control de escritorio %s falló: %s", str(accion)[:30], type(exc).__name__)
+
+    def _set_no_molestar_usuario(self, activo: bool) -> None:
+        """"No molestar" del usuario: proactividad en pausa 24 h, sin travesuras y escondida."""
+        self._no_molestar_usuario = bool(activo)
+        if self.riko is not None:
+            try:
+                self.riko.pausar_proactividad(1440 if activo else 0)
+            except Exception as exc:
+                log.debug("pausar_proactividad falló: %s", type(exc).__name__)
+        if activo:
+            self._orden_escritorio("esconderse")
+            texto = "No molestar activado: sin llamadas proactivas ni travesuras hasta que lo quites."
+        else:
+            texto = "No molestar desactivado."
+        self.consola.imprimir_sistema(texto)
+        self._sistema_escritorio(texto)
+        self._publicar_travesuras()
+        self._recalcular_no_molestar()
+
+    def _ev_escritorio_conectado(self, evento: Evento) -> None:
+        """Electron conectado/desconectado (nunca se usa ``clientes`` para decidir)."""
+        self._overlay_conectado = bool(evento.datos.get("overlay"))
+        if not self._overlay_conectado:
+            self._overlay_visible = False
+        # Un cliente nuevo no conoce el estado: se reenvía el de las travesuras.
+        self._publicar_travesuras(forzar=True)
+
+    def _ev_escritorio_app(self, evento: Evento) -> None:
+        """PID de Amadeus Desktop: sus ventanas no son objetivo de escribir_texto."""
+        pid = evento.datos.get("pid")
+        if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0 or self.control_pc is None:
+            return
+        excluir = getattr(self.control_pc, "excluir_pids", None)
+        if callable(excluir):
+            try:
+                excluir([pid])
+            except Exception as exc:
+                log.debug("excluir_pids falló: %s", type(exc).__name__)
+
+    def _ev_escritorio_caja(self, evento: Evento) -> None:
+        """Caja del avatar (px físicos globales) → ControlPC (``hacia_avatar``) y máscara de la visión."""
+        d = evento.datos
+        valores = [d.get(k) for k in ("x", "y", "w", "h")]
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in valores):
+            return
+        x, y, w, h = valores
+        if w <= 0 or h <= 0:
+            return
+        caja = (x, y, w, h)
+        for modulo in (self.control_pc, self.vision):
+            fijar = getattr(modulo, "set_caja_avatar", None) if modulo is not None else None
+            if callable(fijar):
+                try:
+                    fijar(caja)
+                except Exception as exc:
+                    log.debug("set_caja_avatar falló: %s", type(exc).__name__)
+
+    def _ev_escritorio_evento(self, evento: Evento) -> None:
+        """Visibilidad del overlay y traducción al conectoma (tabla de §C2.3, con límites de ritmo)."""
+        nombre = evento.datos.get("nombre")
+        datos = evento.datos.get("datos")
+        datos = datos if isinstance(datos, Mapping) else {}
+        if nombre == "mostrada":
+            self._overlay_visible = True
+        elif nombre == "ocultada":
+            self._overlay_visible = False
+        elif nombre in ("toque", "soltada", "chat_abierto"):
+            # Interacción directa con Amadeus: el usuario está ahí.
+            if self.presencia is not None:
+                self.presencia.registrar_entrada("escritorio")
+            if nombre == "toque":
+                self._toque_conectoma()
+            elif nombre == "soltada":
+                altura = datos.get("altura")
+                if (isinstance(altura, (int, float)) and not isinstance(altura, bool) and altura > 0.3
+                        and self._ritmo_escritorio()):
+                    self._inyectar("error", severidad=0.2)      # la dejaron caer desde alto
+
+    def _ritmo_escritorio(self) -> bool:
+        """≤ 1 inyección del escritorio cada 5 s (marca el instante si deja pasar)."""
+        ahora = self._reloj()
+        if ahora - self._ultima_inyeccion_escritorio < INTERVALO_INYECCION_ESCRITORIO_S:
+            return False
+        self._ultima_inyeccion_escritorio = ahora
+        return True
+
+    def _toque_conectoma(self) -> None:
+        """Toque: recompensa 0,3; ≥ 5 toques en 30 s: error 0,4 (enfado). ≤ 1 inyección cada 5 s."""
+        ahora = self._reloj()
+        self._toques.append(ahora)
+        while self._toques and ahora - self._toques[0] > VENTANA_TOQUES_S:
+            self._toques.popleft()
+        if not self._ritmo_escritorio():
+            return
+        if len(self._toques) >= TOQUES_ENFADO:
+            self._inyectar("error", severidad=0.4)
+        else:
+            self._inyectar("recompensa", magnitud=0.3)
+
+    # --- visión continua ----------------------------------------------------
+
+    def _ev_vision_estimulo(self, evento: Evento) -> None:
+        """Flancos de la cámara → conectoma y presencia (llegada/salida; el resto, nada)."""
+        d = evento.datos
+        if d.get("fuente", "camara") != "camara":
+            return
+        tipo = d.get("tipo")
+        if tipo == "llegada":
+            n = 1
+            if self._ultimo_rostro is not None:
+                try:
+                    n = max(1, int(self._ultimo_rostro.get("n") or 1))
+                except (TypeError, ValueError):
+                    n = 1
+            self._inyectar("rostro", presente=True, n=n)
+            self._registrar_rostro_presencia(True)
+        elif tipo == "salida":
+            self._inyectar("rostro", presente=False, n=0)
+            self._inyectar("usuario_presencia", presente=False)
+            self._registrar_rostro_presencia(False)
+
+    def _registrar_rostro_presencia(self, presente: bool) -> None:
+        """Main es el único dueño de la presencia por rostro (VisionContinua no escribe en ella)."""
+        if self.presencia is None:
+            return
+        try:
+            self.presencia.registrar_rostro(bool(presente))
+            if presente:
+                self._ultimo_refresco_rostro = self._reloj()
+            self._actualizar_presencia()
+        except Exception as exc:
+            log.debug("No se pudo registrar el rostro en la presencia: %s", type(exc).__name__)
+
+    def _ev_vision_rostro(self, evento: Evento) -> None:
+        """Solo percepción (nunca el conectoma)."""
+        self._ultimo_rostro = dict(evento.datos)
+
+    def _ev_vision_atencion(self, evento: Evento) -> None:
+        """Tónico de atención: solo percepción."""
+        nivel = evento.datos.get("nivel")
+        if isinstance(nivel, (int, float)) and not isinstance(nivel, bool):
+            self._ultima_atencion = max(0.0, min(1.0, float(nivel)))
+
+    def _ev_vision_estado(self, evento: Evento) -> None:
+        self._ultimo_estado_vision = dict(evento.datos)
+
+    def _ev_pantalla_estado(self, evento: Evento) -> None:
+        """Última muestra de la pantalla (percepción, "no molestar" y vetos de travesuras)."""
+        self._ultima_pantalla = dict(evento.datos)
+        self._ultima_pantalla_ts = self._reloj()
+        self._recalcular_no_molestar()
+
+    def _ev_pantalla_estimulo(self, evento: Evento) -> None:
+        """Cambio en la pantalla → ``ventana_cambia`` con la clase real (≤ 1 cada 30 s y si cambia la firma)."""
+        firma = evento.datos.get("firma")
+        if not isinstance(firma, str) or not firma:
+            return
+        if firma == self._ultima_firma_pantalla:
+            return
+        ahora = self._reloj()
+        if ahora - self._ultima_inyeccion_pantalla < INTERVALO_PANTALLA_ESTIMULO_S:
+            return
+        clase = str((self._ultima_pantalla or {}).get("clase") or "")[:64]
+        self._ultima_inyeccion_pantalla = ahora
+        self._ultima_firma_pantalla = firma
+        self._inyectar("ventana_cambia", clase=clase, titulo=firma[:64])
+
+    def _pantalla_fresca(self, maximo_s: float = PANTALLA_FRESCA_S) -> dict[str, Any] | None:
+        """Última ``pantalla.estado`` si tiene ≤ ``maximo_s`` segundos."""
+        if self._ultima_pantalla is None or self._reloj() - self._ultima_pantalla_ts > maximo_s:
+            return None
+        return self._ultima_pantalla
+
+    def _video_activo(self) -> bool:
+        pantalla = self._pantalla_fresca()
+        return bool(pantalla and (pantalla.get("video") or pantalla.get("reproduciendo")))
+
+    def _estado_vision(self) -> dict[str, Any] | None:
+        """``vision.estado()`` como dict (o el último ``vision.estado`` del bus)."""
+        if self.vision is not None:
+            try:
+                estado = self.vision.estado()
+                a_dict = getattr(estado, "a_dict", None)
+                if callable(a_dict):
+                    return dict(a_dict())
+            except Exception as exc:
+                log.debug("vision.estado() no disponible (%s)", type(exc).__name__)
+        return self._ultimo_estado_vision
+
+    def _percepcion(self) -> dict[str, Any] | None:
+        """``ContextoBroca.percepcion`` con la última muestra local (§C2.14.10): solo escalares.
+
+        App y título corto (``""`` si la ventana es privada) de ``pantalla.estado`` (≤ 10 s);
+        rostro, atención y distancia de la visión. Sin visión: ``None`` (nada que contar).
+        """
+        percepcion: dict[str, Any] = {}
+        pantalla = self._pantalla_fresca()
+        if pantalla is not None:
+            privada = bool(pantalla.get("privada"))
+            percepcion["app"] = str(pantalla.get("clase") or "")
+            percepcion["titulo_corto"] = "" if privada else str(pantalla.get("titulo") or "")[:60]
+            percepcion["video"] = pantalla.get("video") if isinstance(pantalla.get("video"), bool) else None
+            completa = pantalla.get("pantalla_completa")
+            percepcion["pantalla_completa"] = completa if isinstance(completa, bool) else None
+        estado = self._estado_vision()
+        if isinstance(estado, Mapping) and estado.get("camara") not in (None, "off"):
+            presente = estado.get("presente")
+            percepcion["rostro"] = presente if isinstance(presente, bool) else None
+            atencion = self._ultima_atencion if self._ultima_atencion is not None else estado.get("atencion")
+            percepcion["atencion"] = atencion if isinstance(atencion, (int, float)) else None
+            if self._ultimo_rostro is not None and isinstance(self._ultimo_rostro.get("dist_m"), (int, float)):
+                percepcion["dist_m"] = self._ultimo_rostro.get("dist_m")
+        return percepcion or None
+
+    def _apagar_vision_camara(self) -> None:
+        """La cámara continua se suelta (``set_camara(False)``: el hilo hace ``release()``)."""
+        if self.vision is None:
+            return
+        try:
+            self.vision.set_camara(False)
+        except Exception as exc:
+            log.debug("vision.set_camara(False) falló: %s", type(exc).__name__)
+
+    def _pausar_vision(self, minutos: float | None) -> str:
+        """Pausa la cámara continua (``None`` = hasta que la reanuden). Devuelve el texto para el usuario."""
+        if self.vision is None:
+            if self.aura is not None and getattr(self.aura, "camara_habilitada", False):
+                self.aura.set_camara(False)
+                return "Cámara deshabilitada: ya no hago vistazos (/camara on para volver)."
+            return "No tengo ninguna cámara encendida: no estoy mirando."
+        segundos = None if minutos is None else max(1.0, min(1440.0, float(minutos))) * 60.0
+        try:
+            self.vision.pausar(segundos, "usuario")
+        except Exception as exc:
+            log.warning("No se pudo pausar la visión: %s", type(exc).__name__)
+            return "No pude pausar la cámara; usa /camara off."
+        if segundos is None:
+            return "Cámara en pausa hasta que escribas /vision on."
+        return f"Cámara en pausa durante {formatear_decimal(segundos / 60.0, 0)} min."
+
+    # --- no molestar ----------------------------------------------------------
+
+    def _no_molestar_activo(self) -> bool:
+        """``pc.no_molestar.activo`` (último publicado) o el "no molestar" del usuario."""
+        return self._no_molestar_usuario or bool(self._no_molestar_publicado and self._no_molestar_publicado[0])
+
+    async def _evaluar_no_molestar(self) -> None:
+        """Sondeo (cada 5 s): ``ControlPC.no_molestar()`` OR ``pantalla.estado.no_molestar`` OR usuario."""
+        sistema: tuple[bool, str] = (False, "")
+        consultar = getattr(self.control_pc, "no_molestar", None) if self.control_pc is not None else None
+        if callable(consultar):
+            try:
+                resultado = await asyncio.wait_for(_quizas_await(consultar()), timeout=2.0)
+                if isinstance(resultado, (tuple, list)) and len(resultado) == 2:
+                    sistema = (bool(resultado[0]), str(resultado[1] or ""))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # incluye TimeoutError
+                log.debug("ControlPC.no_molestar() no respondió (%s)", type(exc).__name__)
+        self._no_molestar_sistema = sistema
+        self._recalcular_no_molestar()
+
+    def _recalcular_no_molestar(self) -> None:
+        """Combina las fuentes y publica ``pc.no_molestar{activo, motivo}`` solo si cambia."""
+        sistema = self._no_molestar_sistema
+        pantalla = self._pantalla_fresca(15.0)
+        if self._no_molestar_usuario:
+            nuevo = (True, "usuario")
+        elif sistema[0]:
+            motivo = sistema[1] if sistema[1] in ("presentacion", "pantalla_completa", "ocupado", "juego") else "ocupado"
+            nuevo = (True, motivo)
+        elif pantalla is not None and bool(pantalla.get("no_molestar")):
+            nuevo = (True, "pantalla")
+        else:
+            nuevo = (False, "")
+        if nuevo == self._no_molestar_publicado:
+            return
+        anterior = self._no_molestar_publicado
+        self._no_molestar_publicado = nuevo
+        if anterior is None and not nuevo[0]:
+            return      # el estado inicial "sin no molestar" no es un cambio
+        self._publicar("pc.no_molestar", {"activo": nuevo[0], "motivo": nuevo[1]})
+
+    # --- travesuras (dueño único: main, §C2.14.4) ---------------------------
+
+    def _travesuras_efectivas(self) -> bool:
+        """Maestro ``RAMS_TRAVESURAS`` **y** activas **y** no apagadas **y** sin "no molestar" del usuario."""
+        estado = self._travesuras
+        if not getattr(self.settings, "travesuras_habilitadas", False) or not estado.activas:
+            return False
+        if self._no_molestar_usuario:
+            return False
+        hasta = estado.apagadas_hasta_ts
+        return hasta is None or self._reloj_pared() >= hasta
+
+    def _publicar_travesuras(self, *, forzar: bool = False) -> None:
+        """``motor.travesuras{activas, hasta_ts}`` al cambiar el estado efectivo (o forzado)."""
+        activas = self._travesuras_efectivas()
+        hasta = self._travesuras.apagadas_hasta_ts
+        if hasta is not None and self._reloj_pared() >= hasta:
+            hasta = None
+        estado = (activas, hasta)
+        if not forzar and estado == self._travesuras_publicadas:
+            return
+        self._travesuras_publicadas = estado
+        self._publicar("motor.travesuras", {"activas": activas, "hasta_ts": hasta})
+
+    def _fecha_local(self, ts: float) -> datetime:
+        try:
+            return datetime.fromtimestamp(ts, zona_local(self.settings))
+        except (OverflowError, OSError, ValueError):
+            return datetime.fromtimestamp(ts, timezone.utc)
+
+    def _set_travesuras(self, evento: str) -> str:
+        """Único punto de cambio de las travesuras: ``"basta"``, ``"off"``, ``"on"`` o ``"aborto"``.
+
+        - ``basta``: 1.º del día → apagadas 2 h; 2.º o más → hasta las 00:00 locales de mañana.
+        - ``off``: desactivadas hasta ``on``. ``on``: activas y sin plazo (avisa si el maestro está OFF).
+        - ``aborto`` (el usuario movió el ratón > 6 px durante una travesura): apagadas 2 h.
+
+        Persiste en ``data/travesuras.json`` (``asyncio.to_thread``) y publica ``motor.travesuras``.
+        Devuelve el texto para el usuario.
+        """
+        estado = self._travesuras
+        ahora = self._reloj_pared()
+        maestro = bool(getattr(self.settings, "travesuras_habilitadas", False))
+        if evento == "basta":
+            hoy = self._fecha_local(ahora).strftime("%Y-%m-%d")
+            if estado.fecha != hoy:
+                estado.basta_hoy = 0
+                estado.fecha = hoy
+            estado.basta_hoy += 1
+            if estado.basta_hoy == 1:
+                estado.apagadas_hasta_ts = max(estado.apagadas_hasta_ts or 0.0, ahora + TRAVESURAS_BASTA_S)
+                hasta = self._fecha_local(estado.apagadas_hasta_ts).strftime("%H:%M")
+                mensaje = f"Travesuras apagadas hasta las {hasta}. Me quedo quieta."
+            else:
+                manana = self._fecha_local(ahora).date() + timedelta(days=1)
+                medianoche = datetime(manana.year, manana.month, manana.day, tzinfo=zona_local(self.settings))
+                estado.apagadas_hasta_ts = max(estado.apagadas_hasta_ts or 0.0, medianoche.timestamp())
+                mensaje = "Travesuras apagadas hasta mañana. Entendido a la primera… bueno, a la segunda."
+        elif evento == "off":
+            estado.activas = False
+            mensaje = "Travesuras desactivadas hasta que escribas /travesuras on."
+        elif evento == "on":
+            estado.activas = True
+            estado.apagadas_hasta_ts = None
+            if maestro:
+                mensaje = "Travesuras activadas. Si te molestan, di «basta» o pulsa Ctrl+Alt+Shift+Q."
+            else:
+                mensaje = ("Las travesuras con el cursor están desactivadas en la configuración: "
+                           "RAMS_TRAVESURAS=1 en .env y reinicia.")
+        elif evento == "aborto":
+            estado.apagadas_hasta_ts = max(estado.apagadas_hasta_ts or 0.0, ahora + TRAVESURAS_ABORTO_S)
+            mensaje = "Moviste el ratón: travesuras apagadas durante 2 h."
+        else:
+            log.debug("Evento de travesuras desconocido: %s", str(evento)[:20])
+            return "Uso: /travesuras on|off"
+        log.info("Travesuras: %s", evento)
+        self._guardar_travesuras_luego()
+        self._publicar_travesuras()
+        return mensaje
+
+    def _guardar_travesuras_luego(self) -> None:
+        """Programa la escritura de ``data/travesuras.json`` (si hay loop; si no, se omite)."""
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            log.debug("Sin loop: no se persiste el estado de las travesuras")
+            return
+        self._crear_tarea(self._guardar_travesuras(), "travesuras_guardar")
+
+    async def _guardar_travesuras(self) -> None:
+        """Escribe el estado ACTUAL (serializado: la última escritura siempre es la más nueva)."""
+        async with self._lock_archivos:
+            datos = self._travesuras.a_dict()
+            try:
+                await asyncio.to_thread(_escribir_json_privado, self._ruta_datos("travesuras.json"), datos)
+            except Exception as exc:
+                log.warning("No se pudo guardar el estado de las travesuras: %s", type(exc).__name__)
+
+    async def _guardar_agenda_buscar(self) -> None:
+        async with self._lock_archivos:
+            ids = sorted(self._agenda_buscar)
+            try:
+                await asyncio.to_thread(_escribir_json_privado, self._ruta_datos("agenda_buscar.json"), ids)
+            except Exception as exc:
+                log.warning("No se pudo guardar la agenda de búsquedas: %s", type(exc).__name__)
+
+    def _ev_motor_travesura(self, evento: Evento) -> Any:
+        if self._apagando:
+            return None
+        return self._al_travesura(evento.datos)
+
+    def _travesura_por_ritmo(self) -> bool:
+        """Nunca dos travesuras seguidas sin una entrada del usuario entre medias (§C2.12)."""
+        ultima = self._ultima_travesura_mono
+        if ultima is None or self._ultimo_turno_local_mono > ultima:
+            return True
+        inactividad = getattr(self.control_pc, "inactividad_s", None) if self.control_pc is not None else None
+        if callable(inactividad):
+            try:
+                segundos = inactividad()
+            except Exception as exc:
+                log.debug("inactividad_s falló: %s", type(exc).__name__)
+                segundos = None
+            # El usuario tocó teclado/ratón más de 2 s después de la travesura (no es nuestra inyección).
+            if isinstance(segundos, (int, float)) and (self._reloj() - ultima) - float(segundos) > 2.0:
+                return True
+        return False
+
+    async def _al_travesura(self, datos: Mapping[str, Any]) -> None:
+        """``motor.travesura`` → guardas de estado (ControlPC) → compuerta → ``empujon_cursor``."""
+        if self.control_pc is None or self.permisos is None:
+            return
+        if not self._travesuras_efectivas() or self._no_molestar_activo():
+            log.debug("Travesura descartada: travesuras apagadas o «no molestar»")
+            return
+        patron = datos.get("patron")
+        amplitud = datos.get("amplitud_px")
+        segundos = datos.get("segundos")
+        if (patron not in PATRONES_TRAVESURA or isinstance(amplitud, bool) or not isinstance(amplitud, int)
+                or isinstance(segundos, bool) or not isinstance(segundos, (int, float))):
+            log.debug("motor.travesura con un payload no válido; se descarta")
+            return
+        if not self._travesura_por_ritmo():
+            log.debug("Travesura descartada: no hubo entrada del usuario desde la anterior")
+            return
+        puede = getattr(self.control_pc, "puede_travesura", None)
+        if not callable(puede):
+            return
+        try:
+            ok, motivo = await asyncio.wait_for(_quizas_await(puede(
+                presente=self._usuario_presente(),
+                voz_activa=bool(getattr(self.riko, "hablando", False)),
+                confirmacion_pendiente=self.permisos.hay_pendiente(),
+                video_activo=self._video_activo())), timeout=2.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("puede_travesura no respondió (%s)", type(exc).__name__)
+            return
+        if not ok:
+            log.debug("Travesura vetada: %s", str(motivo)[:80])
+            return
+        accion = AccionPC("travesura_cursor", {"patron": patron, "amplitud_px": amplitud, "segundos": float(segundos)},
+                          "travesura de cursor", origen="iniciativa")
+        resultado, _error = await self._accion_pc(accion, canal="iniciativa")
+        if resultado.datos.get("abortada_usuario"):
+            self._set_travesuras("aborto")
+            return
+        if not resultado.ok:
+            return
+        self._ultima_travesura_mono = self._reloj()
+        await self._decir_travesura()
+
+    async def _decir_travesura(self) -> None:
+        """Comentario tsundere tras la travesura (si puede interrumpir; nunca por Telegram)."""
+        if self.riko is None or self.broca is None or not self._usuario_presente():
+            return
+        canal = "voz" if self.riko.voz_disponible else "terminal"
+        try:
+            permitido, _motivo = self.riko.puede_proactivo(canal=canal)
+            if not permitido:
+                return
+            reply = self.broca.frase_local("travesura_cursor", self.conectoma.estado())
+            await self.riko.decir(reply, origen="iniciativa", prioridad=0, canal=canal, motivo="travesura")
+        except Exception as exc:
+            log.debug("Sin comentario de la travesura: %s", type(exc).__name__)
+
+    # --- bucle de vigilancia (5 s) -------------------------------------------
+
+    async def _bucle_vigilancia(self) -> None:
+        """Cada 5 s: "no molestar" del sistema, vencimiento de las travesuras y rostro → presencia."""
+        while not self.parar.is_set():
+            if not self._apagando:
+                await self._paso_vigilancia()
+            if await self._esperar(SONDEO_VIGILANCIA_S):
+                return
+
+    async def _paso_vigilancia(self) -> None:
+        """Un paso del bucle de vigilancia (separado para poder probarlo)."""
+        await self._evaluar_no_molestar()
+        self._publicar_travesuras()      # publica solo si vence apagadas_hasta_ts (cambio efectivo)
+        self._refrescar_rostro()
+
+    def _refrescar_rostro(self) -> None:
+        """``registrar_rostro(True)`` cada 30 s mientras ``vision.estado().presente is True``."""
+        if self.vision is None or self.presencia is None:
+            return
+        if self._reloj() - self._ultimo_refresco_rostro < REFRESCO_ROSTRO_S:
+            return
+        estado = self._estado_vision()
+        if isinstance(estado, Mapping) and estado.get("presente") is True:
+            self._registrar_rostro_presencia(True)
 
     def _al_latir(self, estado: HomeostaticState) -> None:
         """Callback síncrono de ``latir`` (§6.2): publica estado, iniciativas, cambios de línea y fuente."""
@@ -1552,6 +2643,10 @@ class Orquestador:
             return "terminal"
         if intencion.explicacion_tecnica:
             return "terminal_largo"          # nunca va a voz
+        # v0.2: el chat de escritorio responde por texto (chat y globo, labios mudos) salvo
+        # RAMS_ESCRITORIO_VOZ=1, que aplica la regla de voz de la v0.1.
+        if canal_entrada == "escritorio" and not getattr(self.settings, "escritorio_voz", False):
+            return "terminal"
         p = self.presencia.estado()
         return "voz" if (p.presente and self.riko.voz_disponible) else "terminal"
 
@@ -1619,6 +2714,8 @@ class Orquestador:
                     reply = self.broca.frase_local("error_propio", self.conectoma.estado())
                     if canal == "telegram":
                         destino = "telegram"
+                    elif canal == "escritorio":
+                        destino = "terminal"        # §C2.14.3: el error del chat va por texto
                     else:
                         destino = "voz" if (self.presencia.estado().presente and self.riko.voz_disponible) \
                             else "terminal"
@@ -1638,13 +2735,18 @@ class Orquestador:
         if not self._iniciado or self.memoria is None:
             raise RuntimeError("El orquestador no está iniciado: llama antes a iniciar()")
         local = canal in CANALES_LOCALES
-        # 0. Confirmación pendiente: la línea es la respuesta (solo desde la terminal local).
-        if local and self.permisos is not None and self.permisos.hay_pendiente():
+        # 0. Confirmación pendiente: la línea es la respuesta SOLO desde la terminal. El chat de
+        # escritorio confirma únicamente con los botones (§C2.12): un "sí" escrito no aprueba nada.
+        if canal == "terminal" and self.permisos is not None and self.permisos.hay_pendiente():
             self.permisos.resolver(texto)
             return None
         s = self.settings
         secretos = s.secretos()
-        texto_seguro = redactar(texto, secretos)
+        # v0.2: el texto del chat se redacta también por alta entropía (bus, memoria y Broca); la
+        # intención se calcula sobre el texto crudo, como en la v0.1. Los argumentos que citan al
+        # usuario (consulta, contenido, mensaje) se redactan con la MISMA regla en el paso 2c.
+        alta = canal == "escritorio"
+        texto_seguro = redactar(texto, secretos, alta_entropia=alta)
         log.debug("Turno por %s (%d caracteres)", canal, len(texto))
 
         # 1. Presencia, regreso y llamadas.
@@ -1662,13 +2764,21 @@ class Orquestador:
                 llamadas_perdidas = int(await self.memoria.contar_llamadas(desde, solo_sin_contestar=True) or 0)
                 consolidaciones = int(await self.memoria.contar_consolidaciones(desde) or 0)
                 self._regreso_pendiente = False
-            self.presencia.registrar_entrada("terminal")
+            self.presencia.registrar_entrada(canal)          # terminal o escritorio
             self._actualizar_presencia(por_entrada_local=True)
+            self._ultimo_turno_local_mono = self._reloj()
             if self.aura is not None:
                 try:
                     self.aura.reiniciar_backoff_camara()
                 except Exception as exc:
                     log.debug("No se pudo reiniciar el backoff de la cámara: %s", type(exc).__name__)
+            if self.vision is not None:
+                calibrar = getattr(self.vision, "calibrar_atencion", None)
+                if callable(calibrar):
+                    try:
+                        calibrar()      # el usuario escribe: mira la pantalla (referencia de atención)
+                    except Exception as exc:
+                        log.debug("calibrar_atencion falló: %s", type(exc).__name__)
             await self.memoria.marcar_llamadas_contestadas(desde_ts=ahora_ts - 7200)
         elif canal == "telegram":
             self.presencia.registrar_entrada("telegram")
@@ -1676,12 +2786,16 @@ class Orquestador:
         # Los payloads del bus nunca llevan secretos (§5): se publica el texto ya redactado.
         self.bus.publicar("usuario.entrada", {"texto": texto_seguro, "canal": canal}, origen="main")
 
-        # 2. Intención (sin LLM) y comandos.
+        # 2. Intención (sin LLM) y comandos. v0.2: sinónimos de RAMS_DESTINOS y, en los canales
+        # locales, lanzar_app (RAMS_APPS) solo en Linux.
         ahora = ahora_local(s)
-        intencion = enrutar(texto, ahora=ahora, apps=s.apps_permitidas, canal=canal)
+        intencion = enrutar(texto, ahora=ahora, apps=s.apps_permitidas, canal=canal,
+                            destinos=getattr(s, "destinos_permitidos", None),
+                            plataforma=sys.platform if local else None)
         entrada_broca: str | None = texto_seguro
         texto_turno = texto_seguro
         instruccion_extra: str | None = None
+        frase_fija: tuple[str, dict[str, Any]] | None = None   # v0.2: respuesta local sin Broca
         if intencion.tipo == "comando":
             comando = str(intencion.args.get("comando", ""))
             resto = str(intencion.args.get("resto", ""))
@@ -1707,6 +2821,9 @@ class Orquestador:
         accion_pendiente: ResultadoAccion | None = None
         if entrada_broca is not None:
             intencion, accion_pendiente = self._resolver_programar_pendiente(texto, intencion, ahora, canal)
+        # 2c. Los argumentos de la intención salen del texto crudo: se redactan aquí, una sola vez y
+        # con la regla del canal, antes de llegar a la memoria, la agenda, el bus, la red o Broca.
+        intencion = _intencion_redactada(intencion, secretos, alta_entropia=alta)
 
         # 3. Herramientas locales.
         accion: ResultadoAccion | None = accion_pendiente
@@ -1719,7 +2836,7 @@ class Orquestador:
         tipo = intencion.tipo
         args = intencion.args
         if tipo == "buscar_web":
-            consulta = redactar(str(args.get("consulta") or texto), secretos)
+            consulta = str(args.get("consulta") or texto_seguro)
             if self.web is None:
                 accion = ResultadoAccion(False, "Búsqueda web no disponible en esta instalación.",
                                          accion_tipo="buscar_web")
@@ -1736,7 +2853,7 @@ class Orquestador:
             else:
                 telemetria = await self.aura.telemetria()
         elif tipo == "recordar":
-            contenido = redactar(str(args.get("contenido") or ""), secretos)
+            contenido = str(args.get("contenido") or "")
             rid = await self.memoria.recordar(contenido, categoria="hecho", importancia=0.7)
             if rid:
                 accion = ResultadoAccion(True, f"Anotado en memoria (fragmento #{rid}).", accion_tipo="recordar")
@@ -1750,7 +2867,12 @@ class Orquestador:
             accion = self._programar_incompleto(args, ahora)
             self._guardar_programar_pendiente(args, canal)
         elif tipo == "mirar_pantalla":
-            if self.aura is None:
+            if sys.platform == "win32":
+                # §C2.14.10: en Windows no hay captura para Broca (la visión local no manda imágenes);
+                # no es un error propio.
+                accion = ResultadoAccion(False, "Mirar la pantalla no está disponible en este sistema.",
+                                         accion_tipo="captura_pantalla")
+            elif self.aura is None:
                 accion = ResultadoAccion(False, "Captura de pantalla no disponible en esta instalación.",
                                          accion_tipo="captura_pantalla")
             else:
@@ -1767,12 +2889,67 @@ class Orquestador:
                 if vision.error is None:
                     self._stats["vistazos"] += 1
         elif tipo == "accion_pc":
-            accion, error_propio = await self._accion_pc(args.get("accion"))
+            accion_usuario = self._ajustar_accion_usuario(args)
+            accion, error_propio = await self._accion_pc(accion_usuario, canal=canal)
+            if accion.ok and args.get("nota") == NOTA_ESCRIBIR_DESPUES:
+                # Sin "nombre_destino": la frase local "accion_abrir_ok" solo dice el destino y se
+                # comería la indicación; "accion_ok" lleva el mensaje completo (con o sin Gemini).
+                datos_sin_nombre = {k: v for k, v in (accion.datos or {}).items() if k != "nombre_destino"}
+                accion = dataclasses.replace(accion, datos=datos_sin_nombre, mensaje=(
+                    f"{accion.mensaje.rstrip()} Cuando tengas abierta la caja de texto, dime «escribe ahí: …» "
+                    "y lo tecleo (con tu confirmación).").strip())
         elif tipo == "memoria_consulta":
-            memoria_relevante = await self.memoria.buscar(str(args.get("consulta") or texto), 8)
+            memoria_relevante = await self.memoria.buscar(str(args.get("consulta") or texto_seguro), 8)
         elif tipo == "bloqueada_canal":
             accion = ResultadoAccion(False, MENSAJE_SOLO_LOCAL, accion_tipo=str(args.get("tipo_original", "")))
-        if accion is not None and not accion.ok and tipo in ("accion_pc", "recordar", "programar"):
+        # v0.2 (§C2.14.8, §C2.14.11): borrador, "búscame", escritorio, travesuras y visión.
+        elif tipo == "publicar_borrador":
+            borrador = self._borrador_vigente()
+            if borrador is None:
+                # Sin Gemini no hay borradores (el banco local no redacta): esa variante ofrece la vía
+                # directa («pon en X: …») en vez de pedir un texto que nunca llegará.
+                con_llm = bool(getattr(self.broca, "disponible", False))
+                frase_fija = ("sin_borrador" if con_llm else "sin_borrador_sin_llm", {})
+            else:
+                accion, error_propio = await self._accion_pc(
+                    self._accion_borrador(str(args.get("alias") or ""), borrador), canal=canal)
+        elif tipo == "recordatorio_personal":
+            accion = await self._recordatorio_personal(args, ahora)
+            error_propio = not accion.ok
+        elif tipo == "escritorio_venir":
+            if self._overlay_disponible():
+                self._orden_escritorio("aparecer", borde=self._rng.choice(("left", "right")), modo="entrar")
+                frase_fija = ("escritorio_aparece", {})
+            elif self._overlay_conectado:
+                accion = ResultadoAccion(False, "Amadeus Desktop está abierto, pero mi avatar no cargó: revisa que "
+                                                "VTuber AI Studio esté corriendo.", accion_tipo="escritorio")
+            else:
+                accion = ResultadoAccion(False, "Amadeus Desktop no está conectado: ábrelo (npm start en desktop/) "
+                                                "y vuelve a llamarme.", accion_tipo="escritorio")
+        elif tipo == "escritorio_vete":
+            if self._overlay_conectado:
+                self._orden_escritorio("esconderse")
+                accion = ResultadoAccion(True, "Me retiro a la bandeja; llámame con Ctrl+Alt+A o escribiendo «ven».",
+                                         accion_tipo="escritorio")
+            else:
+                accion = ResultadoAccion(False, "No estoy en el escritorio ahora mismo.", accion_tipo="escritorio")
+        elif tipo == "basta_travesuras":
+            self._aviso_local(self._set_travesuras("basta"), canal)
+            if self._overlay_conectado:
+                self._orden_escritorio("esconderse")
+            frase_fija = ("basta_travesuras", {})
+        elif tipo == "vision_pausa":
+            minutos = args.get("minutos")
+            hay_camara = self.vision is not None or bool(
+                self.aura is not None and getattr(self.aura, "camara_habilitada", False))
+            mensaje = self._pausar_vision(minutos if isinstance(minutos, (int, float)) else None)
+            if hay_camara:
+                self._aviso_local(mensaje, canal)
+                frase_fija = ("vision_pausada", {})
+            else:
+                accion = ResultadoAccion(True, mensaje, accion_tipo="vision")
+        if accion is not None and not accion.ok and tipo in ("accion_pc", "recordar", "programar",
+                                                             "publicar_borrador", "recordatorio_personal"):
             self._inyectar("error", severidad=0.3)
 
         # 4. Evento social.
@@ -1830,10 +3007,17 @@ class Orquestador:
             ultima_bitacora=ultima_bitacora,
             instruccion_extra=instruccion_extra,
             fecha_hora=ahora,
+            **self._extra_percepcion(local),
         )
 
-        # 6. Verbalización (Broca: Gemini o banco local; nunca decide nada).
-        reply = await self.broca.verbalizar(ctx, entrada_broca, imagen_png=png)
+        # 6. Verbalización (Broca: Gemini o banco local; nunca decide nada). v0.2: algunas
+        # intenciones (aparecer, "basta", pausar la cámara, sin borrador) responden con su
+        # frase local fija, sin gastar Gemini.
+        if frase_fija is not None:
+            categoria, fmt = frase_fija
+            reply = self.broca.frase_local(categoria, ctx.estado, **fmt)
+        else:
+            reply = await self.broca.verbalizar(ctx, entrada_broca, imagen_png=png)
 
         # 7. Turnos en memoria (el del usuario y el de Amadeus).
         canal_salida = CANAL_DE_MODO.get(ctx.modo_salida, "terminal")
@@ -1843,11 +3027,96 @@ class Orquestador:
         self._stats["turnos"] += 1
         if entrada_broca is not None:
             self._temas.append(texto_seguro[:60])
+        # v0.2 (§C2.14.8): el último borrador es una respuesta de Broca (redactada por el LLM) a
+        # un turno LOCAL de conversación; nunca de Nexus, iniciativas, Telegram, una acción ni la
+        # web: un turno con resultados de búsqueda, vistazo o captura (contenido de terceros que
+        # puede traer una inyección de prompt) no deja borrador publicable (§C2.12 "Origen").
+        if (local and frase_fija is None and entrada_broca is not None and reply.fuente != "local"
+                and intencion.tipo in ("ninguna", "memoria_consulta") and busqueda_web is None
+                and ctx.vision is None and png is None and reply.texto_plano):
+            self._ultimo_borrador = (reply.texto_plano[:MAX_BORRADOR], self._reloj())
+        elif local and reply.fuente != "local" and (busqueda_web is not None or ctx.vision is not None
+                                                    or png is not None):
+            # "Ponlo en X" justo después se referiría a ESTA respuesta, que no es publicable: se
+            # olvida el borrador anterior para no publicar por sorpresa un texto más viejo.
+            self._ultimo_borrador = None
 
         # 8. Salida por el canal elegido.
         await self.riko.decir(reply, origen="respuesta", canal=canal_salida)
         # 9.
         return reply
+
+    def _extra_percepcion(self, incluir: bool) -> dict[str, Any]:
+        """``{"percepcion": …}`` para ``ContextoBroca`` (solo turnos locales e iniciativas)."""
+        if not incluir:
+            return {}
+        try:
+            percepcion = self._percepcion()
+        except Exception as exc:
+            log.debug("Percepción no disponible (%s)", type(exc).__name__)
+            return {}
+        if percepcion is None or "percepcion" not in {f.name for f in dataclasses.fields(ContextoBroca)}:
+            return {}
+        return {"percepcion": percepcion}
+
+    # --- v0.2: borradores, "búscame" y acciones del usuario ---------------------
+
+    def _borrador_vigente(self) -> str | None:
+        """El último borrador (≤ 500) si tiene menos de 10 min; si no, ``None`` (y se olvida)."""
+        if self._ultimo_borrador is None:
+            return None
+        texto, ts = self._ultimo_borrador
+        if self._reloj() - ts > TTL_BORRADOR_S or not texto.strip():
+            self._ultimo_borrador = None
+            return None
+        return texto
+
+    def _accion_borrador(self, alias: str, texto: str) -> AccionPC:
+        """``publicar_borrador``: prerrelleno si el destino lo admite; si no, tecleo en la ventana previa."""
+        meta = DESTINOS_BASE.get(alias) if isinstance(DESTINOS_BASE, Mapping) else None
+        nombre = nombre_destino(alias)
+        if isinstance(meta, Mapping) and meta.get("prerrelleno"):
+            return AccionPC("prerrellenar", {"alias": alias, "texto": texto}, f"borrador en {nombre}", origen="usuario")
+        return AccionPC("escribir_texto", {"texto": texto}, f"escribir en {nombre}", origen="usuario")
+
+    def _ajustar_accion_usuario(self, args: Mapping[str, Any]) -> Any:
+        """"escríbele a mamá: …" justo después de "abre whatsapp" → prerrelleno en WhatsApp.
+
+        Prerrellenar antes que teclear (§C1.8): si la intención no trajo destino (``sin_alias``)
+        y el usuario abrió hace < 2 min un destino que admite prerrelleno, se usa ese destino.
+        """
+        accion = args.get("accion")
+        if (not isinstance(accion, AccionPC) or accion.tipo != "escribir_texto" or not args.get("sin_alias")
+                or self._ultimo_destino is None):
+            return accion
+        alias, ts = self._ultimo_destino
+        meta = DESTINOS_BASE.get(alias) if isinstance(DESTINOS_BASE, Mapping) else None
+        if self._reloj() - ts > TTL_ULTIMO_DESTINO_S or not (isinstance(meta, Mapping) and meta.get("prerrelleno")):
+            return accion
+        return AccionPC("prerrellenar", {"alias": alias, "texto": accion.args.get("texto")},
+                        f"borrador en {nombre_destino(alias)}", origen="usuario")
+
+    async def _recordatorio_personal(self, args: Mapping[str, Any], ahora: datetime) -> ResultadoAccion:
+        """"búscame en 10 minutos": recordatorio de la agenda marcado para ir a buscar al usuario."""
+        vence = args.get("vence")
+        if not isinstance(vence, datetime):
+            return ResultadoAccion(False, "Falta la hora: pregunta para cuándo programar el recordatorio.",
+                                   {"falta": "hora", "tipo": "recordatorio",
+                                    "mensaje": MENSAJE_BUSCAR_DEFECTO}, accion_tipo="programar")
+        mensaje = redactar(str(args.get("mensaje") or MENSAJE_BUSCAR_DEFECTO), self.settings.secretos())[:300]
+        item_id = await self.memoria.programar("recordatorio", vence, mensaje)
+        if not item_id:
+            return ResultadoAccion(False, "No pude guardar el recordatorio en la agenda.", accion_tipo="programar")
+        try:
+            self._agenda_buscar.add(int(item_id))
+        except (TypeError, ValueError):
+            log.debug("Id de agenda no entero; el recordatorio queda como uno normal")
+        else:
+            self._crear_tarea(self._guardar_agenda_buscar(), "agenda_buscar_guardar")
+        cuando = describir_vencimiento(vence, ahora)
+        extra = f" para «{mensaje}»" if args.get("con_mensaje") else ""
+        return ResultadoAccion(True, f"Te busco {cuando}{extra}.", {"id": item_id, "tipo": "recordatorio",
+                                                                   "buscar": True}, accion_tipo="programar")
 
     async def _buscar_web(self, consulta: str, *, presupuesto_s: float) -> tuple[Any, ...]:
         """``web.buscar`` con plazo y publicación de ``web.resultado``."""
@@ -1955,10 +3224,25 @@ class Orquestador:
             texto = f"Recordatorio para {cuando}: {mensaje}."
         return ResultadoAccion(True, texto, {"id": item_id, "tipo": tipo}, accion_tipo="programar")
 
-    async def _accion_pc(self, accion: Any) -> tuple[ResultadoAccion, bool]:
-        """Ejecuta una ``AccionPC`` (fijando antes el objetivo de ``cerrar_ventana``). Devuelve (resultado, error_propio)."""
+    async def _accion_pc(self, accion: Any, *, canal: str = "terminal") -> tuple[ResultadoAccion, bool]:
+        """Ejecuta una ``AccionPC`` (fijando antes el objetivo de ``cerrar_ventana``). Devuelve (resultado, error_propio).
+
+        v0.2 (§C2.14.5): los tipos de ``TIPOS_ACCION_V02`` pasan **una** vez por
+        ``permisos.autorizar`` y los ejecuta ``ControlPC``; nunca ``aura.ejecutar``. El canal
+        queda en ``_CANAL_ACCION`` mientras dura (lo lee ``_ev_permiso_solicitado``).
+        """
+        token = _CANAL_ACCION.set(canal)
+        try:
+            return await self._accion_pc_en_canal(accion, canal)
+        finally:
+            _CANAL_ACCION.reset(token)
+
+    async def _accion_pc_en_canal(self, accion: Any, canal: str) -> tuple[ResultadoAccion, bool]:
+        """Cuerpo de :meth:`_accion_pc` (con ``_CANAL_ACCION`` ya fijado)."""
         if not isinstance(accion, AccionPC):
             return ResultadoAccion(False, "No entendí qué acción ejecutar."), False
+        if accion.tipo in TIPOS_ACCION_V02:
+            return await self._accion_pc_v02(accion, canal)
         if self.aura is None:
             return ResultadoAccion(False, "Control del PC no disponible en esta instalación.",
                                    accion_tipo=accion.tipo), False
@@ -1985,6 +3269,177 @@ class Orquestador:
                         and "no disponible" not in mensaje and "no soportad" not in mensaje)
         return resultado, error_propio
 
+    # --- v0.2: acciones de ControlPC (§C2.8, §C2.12) ------------------------------
+
+    async def _accion_pc_v02(self, accion: AccionPC, canal: str) -> tuple[ResultadoAccion, bool]:
+        """``abrir_destino``/``buscar_en``/``prerrellenar``/``escribir_texto``/``travesura_cursor``.
+
+        Orden: objetivo de ``escribir_texto`` (ventana previa) → compuerta (una vez) → ControlPC
+        → auditoría (``data/acciones_pc.jsonl`` sin el texto) y ``pc.accion``.
+        """
+        tipo = accion.tipo
+        if self.control_pc is None:
+            resultado = ResultadoAccion(False, "Control del PC no disponible en esta instalación.", accion_tipo=tipo)
+            await self._auditar(accion, canal, "no_disponible", "ControlPC no disponible", resultado)
+            return resultado, False
+        if tipo == "escribir_texto":
+            accion, sin_objetivo = self._con_objetivo(accion)
+            if sin_objetivo is not None:
+                await self._auditar(accion, canal, "sin_objetivo", "sin ventana previa", sin_objetivo)
+                return sin_objetivo, False
+        if self.permisos is None:
+            resultado = ResultadoAccion(False, "Acción no autorizada: compuerta de permisos no disponible.",
+                                        accion_tipo=tipo)
+            return resultado, False
+        try:
+            decision = await self.permisos.autorizar(accion)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La compuerta falló con la acción %s: %s", tipo, type(exc).__name__)
+            return ResultadoAccion(False, "Acción no autorizada: la compuerta falló.", accion_tipo=tipo), False
+        if not decision.aprobada:
+            resultado = ResultadoAccion(False, f"Acción no autorizada: {decision.motivo}", accion_tipo=tipo)
+            await self._auditar(accion, canal, decision.veredicto if decision.veredicto != "confirmar" else "rechazada",
+                                decision.motivo, resultado)
+            return resultado, False
+        try:
+            control = await self._ejecutar_control(accion, canal)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("ControlPC falló con la acción %s: %s", tipo, type(exc).__name__, exc_info=True)
+            resultado = ResultadoAccion(False, "La acción falló por un error interno.", accion_tipo=tipo)
+            await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado)
+            return resultado, True
+        resultado = self._resultado_control(control, accion)
+        if tipo == "abrir_destino" and resultado.ok:
+            self._ultimo_destino = (str(accion.args.get("alias") or ""), self._reloj())
+        await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado)
+        return resultado, False
+
+    def _con_objetivo(self, accion: AccionPC) -> tuple[AccionPC, ResultadoAccion | None]:
+        """Rellena el objetivo de ``escribir_texto`` con ``ControlPC.ventana_previa()`` si no lo trae."""
+        args = dict(accion.args)
+        if args.get("pid") is not None and (args.get("hwnd") is not None or args.get("direccion") is not None):
+            return accion, None
+        previa = None
+        obtener = getattr(self.control_pc, "ventana_previa", None)
+        if callable(obtener):
+            try:
+                previa = obtener()
+            except Exception as exc:
+                log.debug("ventana_previa falló: %s", type(exc).__name__)
+        a_args = getattr(previa, "a_args", None)
+        if previa is None or not callable(a_args):
+            return accion, ResultadoAccion(False, "No sé en qué ventana escribir: haz clic en la caja de texto de la app "
+                                                  "y vuelve a pedírmelo.", accion_tipo="escribir_texto")
+        objetivo = {k: v for k, v in dict(a_args()).items() if k in ("hwnd", "pid", "exe", "direccion", "clase")}
+        return AccionPC("escribir_texto", {"texto": args.get("texto"), **objetivo}, accion.descripcion,
+                        origen=accion.origen), None
+
+    @staticmethod
+    def _objetivo_ventana(args: Mapping[str, Any]) -> Any:
+        """``ObjetivoVentana.desde_args`` del módulo de ControlPC (``None`` si no casa o no existe)."""
+        try:
+            modulo = sys.modules.get("lobes.control_pc") or importlib.import_module("lobes.control_pc")
+        except Exception as exc:
+            log.debug("Sin lobes.control_pc para el objetivo (%s)", type(exc).__name__)
+            return None
+        desde_args = getattr(getattr(modulo, "ObjetivoVentana", None), "desde_args", None)
+        if not callable(desde_args):
+            return None
+        try:
+            return desde_args({k: args.get(k) for k in ("hwnd", "pid", "exe", "direccion", "clase")})
+        except Exception as exc:
+            log.debug("ObjetivoVentana.desde_args falló: %s", type(exc).__name__)
+            return None
+
+    async def _ejecutar_control(self, accion: AccionPC, canal: str) -> Any:
+        """Despacha a ``ControlPC`` (la acción ya está autorizada)."""
+        cp = self.control_pc
+        tipo = accion.tipo
+        args = accion.args
+        alias = str(args.get("alias") or "")
+        if tipo == "abrir_destino":
+            return await cp.abrir_destino(alias)
+        if tipo == "buscar_en":
+            return await cp.buscar_en(alias, str(args.get("consulta") or ""))
+        if tipo == "prerrellenar":
+            return await cp.prerrellenar(alias, sanear_texto_accion(args.get("texto")))
+        if tipo == "escribir_texto":
+            objetivo = self._objetivo_ventana(args)
+            if objetivo is None:
+                return ResultadoAccion(False, "No sé en qué ventana escribir: haz clic en la caja de texto de la app "
+                                              "y vuelve a pedírmelo.", accion_tipo=tipo)
+            app = _EXE_SEGURO_RE.sub("", str(args.get("exe") or args.get("clase") or "")).strip()[:40] or "la app"
+            aviso = f"Haz clic en la caja de texto de {app}; escribo en cuanto tenga el foco"
+            if self.broca is not None:
+                try:
+                    aviso = self.broca.frase_local("escribir_haz_clic", self.conectoma.estado(), app=app).texto_plano
+                except Exception as exc:
+                    log.debug("Sin frase escribir_haz_clic: %s", type(exc).__name__)
+            # No se fuerza el foco (§C1.8): el usuario hace clic y ControlPC espera ≤ 10 s.
+            self._aviso_local(aviso, canal)
+            return await cp.escribir_texto(sanear_texto_accion(args.get("texto")), objetivo=objetivo)
+        if tipo == "travesura_cursor":
+            return await cp.empujon_cursor(str(args.get("patron")), int(args.get("amplitud_px") or 0),
+                                           segundos=float(args.get("segundos") or 0.0))
+        return ResultadoAccion(False, "Tipo de acción no soportado por el control del PC.", accion_tipo=tipo)
+
+    @staticmethod
+    def _resultado_control(control: Any, accion: AccionPC) -> ResultadoAccion:
+        """``ResultadoControl`` (o ``ResultadoAccion``) → ``ResultadoAccion`` para Broca, sin el texto."""
+        if isinstance(control, ResultadoAccion):
+            return control
+        ok = bool(getattr(control, "ok", False))
+        mensaje = str(getattr(control, "mensaje", "") or "").strip() or ("Hecho." if ok else "No se pudo completar.")
+        crudos = getattr(control, "datos", None)
+        crudos = crudos if isinstance(crudos, Mapping) else {}
+        datos: dict[str, Any] = {}
+        alias = accion.args.get("alias")
+        if isinstance(alias, str) and alias:
+            datos["destino"] = alias
+            datos["nombre_destino"] = nombre_destino(alias)
+        if crudos.get("abortada_usuario"):
+            datos["abortada_usuario"] = True
+        return ResultadoAccion(ok, mensaje, datos, accion_tipo=accion.tipo)
+
+    async def _auditar(self, accion: AccionPC, canal: str, veredicto: str, motivo: str,
+                       resultado: ResultadoAccion) -> None:
+        """Auditoría de las acciones v0.2 (§C2.12): JSONL privado y ``pc.accion``; nunca el texto ni títulos."""
+        args = accion.args
+        texto = ""
+        if accion.tipo in ("prerrellenar", "escribir_texto"):
+            texto = sanear_texto_accion(args.get("texto"))
+        elif accion.tipo == "buscar_en":
+            texto = str(args.get("consulta") or "")
+        exe = _EXE_SEGURO_RE.sub("", str(args.get("exe") or "")).strip()[:60] or None
+        clase = _EXE_SEGURO_RE.sub("", str(args.get("clase") or "")).strip()[:60] or None
+        alias = str(args.get("alias") or "") or None
+        if resultado.datos.get("abortada_usuario"):
+            estado = "abortada"
+        elif resultado.ok:
+            estado = "ok"
+        elif veredicto in ("denegada", "rechazada"):
+            estado = "denegada"
+        else:
+            estado = "fallo"
+        registro = {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "tipo": accion.tipo, "origen": accion.origen, "canal": canal,
+            "veredicto": str(veredicto)[:20], "motivo": str(motivo or "")[:120],
+            "alias": alias, "exe": exe, "clase": clase,
+            "texto_len": len(texto),
+            "texto_sha256": hashlib.sha256(texto.encode("utf-8")).hexdigest()[:12] if texto else None,
+            "resultado": estado,
+        }
+        self._publicar("pc.accion", {"tipo": accion.tipo, "resultado": estado, "destino": alias or exe or clase})
+        try:
+            await asyncio.to_thread(_anexar_jsonl_privado, self._ruta_datos("acciones_pc.jsonl"), registro)
+        except Exception as exc:
+            log.warning("No se pudo escribir la auditoría de acciones: %s", type(exc).__name__)
+
     async def _instruccion_devolver_llamada(self) -> str:
         trato = self.settings.trato_usuario
         llamada = await self.memoria.ultima_llamada()
@@ -2000,7 +3455,10 @@ class Orquestador:
     # ------------------------------------------------------------------
 
     async def _salida_comando(self, texto: str, canal: str) -> None:
-        """La salida de un comando va a la consola (canal local) o a Telegram."""
+        """La salida de un comando va a la consola (canal local) o a Telegram.
+
+        v0.2: desde el chat de escritorio, a la consola **y** al chat (``escritorio.sistema``, ≤ 4000).
+        """
         if canal == "telegram":
             try:
                 if not await self.riko.enviar_telegram_texto(texto):
@@ -2009,10 +3467,14 @@ class Orquestador:
                 log.warning("Error al responder un comando por Telegram: %s", type(exc).__name__)
         else:
             self.consola.imprimir_sistema(texto)
+            if canal == "escritorio":
+                self._sistema_escritorio(texto)
 
     def _canal_amadeus_local(self, canal: str) -> str:
         if canal == "telegram":
             return "telegram"
+        if canal == "escritorio" and not getattr(self.settings, "escritorio_voz", False):
+            return "terminal"
         return "voz" if (self.presencia.estado().presente and self.riko.voz_disponible) else "terminal"
 
     async def _ejecutar_comando(self, comando: str, resto: str, canal: str) -> None:
@@ -2051,7 +3513,9 @@ class Orquestador:
             if not resto:
                 await self._salida_comando("Uso: /recordar <texto>", canal)
                 return
-            rid = await self.memoria.recordar(redactar(resto, s.secretos()), categoria="hecho", importancia=0.7)
+            # Misma redacción que el turno: con alta entropía en el chat de escritorio (§C2.14.3).
+            rid = await self.memoria.recordar(redactar(resto, s.secretos(), alta_entropia=(canal == "escritorio")),
+                                              categoria="hecho", importancia=0.7)
             await self._salida_comando(f"Anotado en memoria (fragmento #{rid})." if rid
                                        else "No pude guardar ese fragmento.", canal)
         elif comando == "/olvidar":
@@ -2103,14 +3567,23 @@ class Orquestador:
             await self._salida_comando(f"Bitácora: {entrada}" if entrada else "Aún no hay entradas en la bitácora.",
                                        canal)
         elif comando == "/hud":
-            # La URL con token SOLO sale por la consola local (nunca log, bus ni Telegram).
+            # La URL con token SOLO sale por la consola local (nunca log, bus, Telegram ni el chat).
+            if canal != "terminal":
+                await self._salida_comando(MENSAJE_HUD_SOLO_TERMINAL, canal)
+                return
             url = getattr(self.hud, "url", None) if self.hud is not None else None
             self.consola.imprimir_sistema(f"HUD: {url}" if url else "HUD desactivado.")
+        elif comando == "/vision":
+            await self._salida_comando(self._comando_vision(resto), canal)
+        elif comando == "/pantalla":
+            await self._salida_comando(self._comando_pantalla(resto), canal)
+        elif comando == "/travesuras":
+            await self._salida_comando(self._comando_travesuras(resto), canal)
         elif comando == "/logro":
             if not resto:
                 await self._salida_comando("Uso: /logro <texto>", canal)
                 return
-            texto = redactar(resto, s.secretos())
+            texto = redactar(resto, s.secretos(), alta_entropia=(canal == "escritorio"))
             await self.memoria.recordar(texto, categoria="logro", importancia=0.9)
             self._logro_sesion = True
             reply = self.broca.frase_local("logro", estado, mensaje=texto)
@@ -2119,10 +3592,14 @@ class Orquestador:
             await self._salida_comando(f"Comando no disponible: {comando}", canal)
 
     async def _comando_camara(self, resto: str, canal: str) -> None:
+        orden = resto.strip().lower()
         if self.aura is None:
+            if self.vision is not None and orden in ("off", "no", "0", "desactivar", "apagar"):
+                self._apagar_vision_camara()
+                await self._salida_comando("Cámara continua apagada.", canal)
+                return
             await self._salida_comando("Visión no disponible en esta instalación.", canal)
             return
-        orden = resto.strip().lower()
         maestro = self.settings.camara_habilitada
         if orden in ("on", "si", "sí", "1", "activar", "encender"):
             efectivo = self.aura.set_camara(True)
@@ -2134,11 +3611,103 @@ class Orquestador:
                 texto = "No pude habilitar la cámara."
         elif orden in ("off", "no", "0", "desactivar", "apagar"):
             self.aura.set_camara(False)
+            self._apagar_vision_camara()     # §C2.13: también la cámara continua
             texto = "Cámara deshabilitada."
         else:
             actual = "habilitada" if self.aura.camara_habilitada else "deshabilitada"
             texto = f"Cámara {actual} (interruptor maestro RAMS_CAMERA={'1' if maestro else '0'}). Uso: /camara on|off"
         await self._salida_comando(texto, canal)
+
+    # --- v0.2: /vision, /pantalla y /travesuras ---------------------------------
+
+    def _texto_estado_vision(self) -> str:
+        estado = self._estado_vision()
+        if not isinstance(estado, Mapping):
+            return "Visión continua: sin estado todavía."
+        camara = str(estado.get("camara") or "?")
+        pantalla = str(estado.get("pantalla") or "?")
+        fps = estado.get("fps_camara")
+        fps_txt = f" a {formatear_decimal(float(fps), 1)} fps" if isinstance(fps, (int, float)) and fps else ""
+        presente = estado.get("presente")
+        quien = {True: "te veo", False: "no veo a nadie"}.get(presente, "sin datos de presencia")
+        return f"Visión continua: cámara {camara}{fps_txt} · pantalla {pantalla} · {quien}."
+
+    def _comando_vision(self, resto: str) -> str:
+        """``/vision on|off|pausa [min]|estado``."""
+        partes = resto.strip().lower().split()
+        orden = partes[0] if partes else "estado"
+        if self.vision is None:
+            if orden == "pausa" or orden == "off":
+                return self._pausar_vision(None) if orden == "pausa" else "La visión continua no está activa."
+            if not getattr(self.settings, "vision_continua", False):
+                return ("La visión continua está desactivada: pon RAMS_CAMERA=1 y RAMS_VISION_CONTINUA=1 en .env "
+                        "y reinicia (es opt-in y local, sin tokens).")
+            if not getattr(self.settings, "camara_habilitada", False):
+                return "La visión continua necesita la cámara: RAMS_CAMERA=1 en .env y reinicia."
+            return "La visión continua no está disponible (¿falta OpenCV? Revisa /estado)."
+        try:
+            if orden in ("on", "si", "sí", "activar", "encender"):
+                reanudar = getattr(self.vision, "reanudar", None)
+                if callable(reanudar):
+                    reanudar()
+                efectivo = self.vision.set_camara(True)
+                return f"Cámara continua: {efectivo}. Indicador ● CÁMARA ACTIVA mientras esté abierta."
+            if orden in ("off", "no", "apagar", "desactivar"):
+                efectivo = self.vision.set_camara(False)
+                return f"Cámara continua: {efectivo}."
+            if orden == "pausa":
+                minutos: float | None = None
+                if len(partes) > 1:
+                    try:
+                        minutos = float(partes[1].replace(",", "."))
+                    except ValueError:
+                        return "Uso: /vision pausa [minutos]"
+                return self._pausar_vision(minutos)
+            if orden == "estado":
+                return self._texto_estado_vision()
+        except Exception as exc:
+            log.warning("/vision %s falló: %s", orden[:10], type(exc).__name__)
+            return "No pude cambiar la visión continua."
+        return "Uso: /vision on|off|pausa [min]|estado"
+
+    def _comando_pantalla(self, resto: str) -> str:
+        """``/pantalla off|metadatos|pixeles``."""
+        orden = resto.strip().lower()
+        modos = ("off", "metadatos", "pixeles")
+        if orden not in modos:
+            actual = ""
+            estado = self._estado_vision()
+            if isinstance(estado, Mapping) and estado.get("pantalla"):
+                actual = f" Ahora: {estado.get('pantalla')}."
+            return f"Uso: /pantalla off|metadatos|pixeles.{actual}"
+        if self.vision is None:
+            return ("La visión de la pantalla forma parte de la visión continua: RAMS_CAMERA=1 y "
+                    "RAMS_VISION_CONTINUA=1 en .env y reinicia.")
+        try:
+            efectivo = self.vision.set_pantalla(orden)
+        except Exception as exc:
+            log.warning("/pantalla %s falló: %s", orden, type(exc).__name__)
+            return "No pude cambiar el modo de la pantalla."
+        detalle = {"off": "no miro la pantalla",
+                   "metadatos": "solo la app, el título (si no es privado) y si hay vídeo o pantalla completa",
+                   "pixeles": "métricas de la imagen en local (nunca se guardan ni se envían)"}.get(str(efectivo), "")
+        return f"Pantalla: {efectivo}" + (f" ({detalle})." if detalle else ".")
+
+    def _comando_travesuras(self, resto: str) -> str:
+        """``/travesuras on|off`` (sin argumento: el estado)."""
+        orden = resto.strip().lower()
+        if orden in ("on", "si", "sí", "activar"):
+            return self._set_travesuras("on")
+        if orden in ("off", "no", "desactivar"):
+            return self._set_travesuras("off")
+        if not getattr(self.settings, "travesuras_habilitadas", False):
+            return "Travesuras con el cursor real: OFF en la configuración (RAMS_TRAVESURAS=0). Uso: /travesuras on|off"
+        if self._travesuras_efectivas():
+            return "Travesuras activas (di «basta» o pulsa Ctrl+Alt+Shift+Q para pararlas). Uso: /travesuras on|off"
+        hasta = self._travesuras.apagadas_hasta_ts
+        if hasta is not None and self._reloj_pared() < hasta:
+            return f"Travesuras apagadas hasta las {self._fecha_local(hasta).strftime('%H:%M')}. Uso: /travesuras on|off"
+        return "Travesuras apagadas. Uso: /travesuras on|off"
 
     def _texto_estado(self, estado: HomeostaticState) -> str:
         """Texto de ``/estado``: homeostasis, divergencia, presencia y tabla de módulos."""
@@ -2155,6 +3724,19 @@ class Orquestador:
                       f"{formatear_decimal(p.confianza, 2)})")
         lineas.append(f"Sesión: {formatear_duracion(self._duracion_sesion_s())} · "
                       f"{_plural(self._stats['turnos'], 'intercambio', 'intercambios')}")
+        # v0.2: escritorio, "no molestar", travesuras y visión.
+        if self._overlay_conectado:
+            escritorio = "Amadeus Desktop conectado" + (" · visible" if self._overlay_visible else " · en la bandeja")
+        else:
+            escritorio = "Amadeus Desktop sin conectar"
+        molestar = ""
+        if self._no_molestar_activo():
+            motivo = self._no_molestar_publicado[1] if self._no_molestar_publicado else "usuario"
+            molestar = f" · no molestar ({motivo or 'usuario'})"
+        travesuras = "activas" if self._travesuras_efectivas() else "apagadas"
+        lineas.append(f"Escritorio: {escritorio}{molestar} · travesuras {travesuras}")
+        if self.vision is not None:
+            lineas.append(self._texto_estado_vision())
         if self._diagnosticos:
             lineas.append("Módulos:")
             for clave in ("memoria", "conectoma", *_ORDEN_ARRANQUE):
@@ -2171,13 +3753,95 @@ class Orquestador:
 
     def _contexto_proactivo(self, estado: HomeostaticState, modo: str, *, iniciativa: str | None,
                             instruccion: str, presencia: EstadoPresencia,
-                            vision: ResultadoVistazo | None = None) -> ContextoBroca:
+                            vision: ResultadoVistazo | None = None,
+                            busqueda_web: tuple[Any, ...] | None = None) -> ContextoBroca:
+        # v0.2: las iniciativas también llevan la percepción local (app y título corto, rostro…).
         return ContextoBroca(estado, modo_salida=modo, canal_entrada="iniciativa", iniciativa=iniciativa,
                              instruccion_extra=instruccion, presencia=presencia, vision=vision,
-                             nexus=resumen_nexus(self._ultimo_nexus), fecha_hora=ahora_local(self.settings))
+                             busqueda_web=busqueda_web,
+                             nexus=resumen_nexus(self._ultimo_nexus), fecha_hora=ahora_local(self.settings),
+                             **self._extra_percepcion(True))
+
+    def _rostro_reciente(self, p: EstadoPresencia, ventana_s: float = 300.0) -> bool:
+        """Hubo un rostro (vistazo o visión continua) en los últimos ``ventana_s`` segundos."""
+        ts = getattr(p, "ultimo_rostro_ts", None)
+        return isinstance(ts, (int, float)) and time.time() - float(ts) <= ventana_s
+
+    def _curiosidad_web_disponible(self) -> bool:
+        """Cupo de la curiosidad web (§C2.14.7): web activa, ≤ 3 al día y ≥ 2 h desde la última."""
+        if self.web is None or not self.settings.tiene_web:
+            return False
+        ahora = self._reloj_pared()
+        hoy = self._fecha_local(ahora).date()
+        self._curiosidad_web_ts = self._curiosidad_web_ts[-2 * CURIOSIDAD_WEB_MAX_DIA:]
+        de_hoy = [t for t in self._curiosidad_web_ts if self._fecha_local(t).date() == hoy]
+        if len(de_hoy) >= CURIOSIDAD_WEB_MAX_DIA:
+            return False
+        return not self._curiosidad_web_ts or ahora - max(self._curiosidad_web_ts) >= CURIOSIDAD_WEB_SEPARACION_S
+
+    async def _temas_curiosidad_curados(self) -> list[str]:
+        """``persona/temas_curiosidad.json`` (lista curada; se lee una vez, fuera del loop)."""
+        if self._temas_curiosidad is not None:
+            return self._temas_curiosidad
+        datos = await asyncio.to_thread(_leer_json, Path(self.settings.persona_dir) / "temas_curiosidad.json")
+        bruto = datos.get("temas") if isinstance(datos, Mapping) else datos
+        temas = [str(t).strip() for t in (bruto if isinstance(bruto, list) else []) if isinstance(t, str) and t.strip()]
+        self._temas_curiosidad = temas
+        return temas
+
+    async def _elegir_tema_curiosidad(self) -> str | None:
+        """Tema de la curiosidad web: lista curada ∪ recuerdos «preferencia» vividos (nunca perfil.temas)."""
+        candidatos = list(await self._temas_curiosidad_curados())
+        try:
+            recuerdos = await self.memoria.listar_recuerdos(50)
+        except Exception as exc:
+            log.debug("Sin recuerdos para la curiosidad (%s)", type(exc).__name__)
+            recuerdos = []
+        for recuerdo in recuerdos or ():
+            if getattr(recuerdo, "categoria", "") == "preferencia" and getattr(recuerdo, "tipo", "") == "vivido":
+                contenido = str(getattr(recuerdo, "contenido", "") or "").strip()
+                if contenido:
+                    candidatos.append(contenido)
+        if not candidatos:
+            return None
+        frescos = [c for c in candidatos if c not in self._temas_recientes] or candidatos
+        tema = self._rng.choice(frescos)
+        self._temas_recientes.append(tema)
+        return tema
+
+    async def _curiosidad_web(self, estado: HomeostaticState, modo: str,
+                              p: EstadoPresencia) -> tuple[BrocaReply | None, str | None]:
+        """Busca algo curioso (DuckDuckGo sin clave) y lo verbaliza. Devuelve (frase, url https) o (None, None)."""
+        tema = await self._elegir_tema_curiosidad()
+        if not tema:
+            return None, None
+        consulta = redactar(tema, self.settings.secretos(), alta_entropia=True).strip()
+        consulta = consulta[:MAX_CONSULTA_CURIOSIDAD].strip()
+        if not consulta:
+            return None, None
+        self._curiosidad_web_ts.append(self._reloj_pared())     # cuenta el intento (no martillea la red)
+        resultados = await self._buscar_web(consulta, presupuesto_s=8.0)
+        primero = next((r for r in resultados
+                        if len(str(getattr(r, "url", ""))) <= MAX_URL_NOTIFICACION
+                        and _URL_HTTPS_RE.match(str(getattr(r, "url", "")))), None)
+        if primero is None:
+            log.info("Curiosidad web sin resultados útiles; no interrumpo")
+            return None, None
+        instruccion = (f"Por curiosidad buscaste sobre «{consulta}» y encontraste un resultado (en <busqueda_web>). "
+                       "Compártelo en una o dos frases como algo que te llamó la atención; no leas la dirección web")
+        reply = await self.broca.verbalizar(
+            self._contexto_proactivo(estado, modo, iniciativa="curiosidad_web", instruccion=instruccion,
+                                     presencia=p, busqueda_web=(primero,)), None)
+        return reply, str(primero.url)
 
     async def _al_iniciativa(self, evento: Evento) -> None:
-        """Iniciativa del conectoma (§10.21): cuotas antes de Gemini, cámara solo con alguien presente."""
+        """Iniciativa del conectoma (§10.21, v0.2 §C2.14.6-7): reglas deterministas antes de Gemini.
+
+        - ``curiosidad_visual`` sin cámara utilizable y con el usuario presente → ``curiosidad_web``
+          (si hay web y cupo); si no, la regla de la v0.1 (``conversar`` sin cámara).
+        - Presente + overlay disponible + sin "no molestar": aparece (si estaba oculta) y te busca.
+        - Con "no molestar" del sistema activo no interrumpe por voz/terminal.
+        """
         if self._apagando or self.riko is None:
             return
         d = evento.datos
@@ -2186,13 +3850,23 @@ class Orquestador:
         antes, despues = d.get("antes"), d.get("despues")
         p = self.presencia.estado()
         ausente_seguro = self._ausente_seguro(p)
-        if tipo == "curiosidad_visual" and (ausente_seguro or self.aura is None
-                                            or not getattr(self.aura, "camara_habilitada", False)):
-            tipo = "conversar"     # la cámara no parpadea en una habitación vacía
+        if tipo == "curiosidad_visual":
+            camara_ok = (not ausente_seguro and self.aura is not None
+                         and bool(getattr(self.aura, "camara_habilitada", False)))
+            if (p.presente and not ausente_seguro and not (camara_ok and self._rostro_reciente(p))
+                    and self._curiosidad_web_disponible()):
+                tipo = "curiosidad_web"
+            elif not camara_ok:
+                tipo = "conversar"     # la cámara no parpadea en una habitación vacía
         modo, canal = self._canal_proactivo()
+        if canal != "telegram" and self._no_molestar_activo():
+            log.info("Iniciativa %s descartada: «no molestar» activo", tipo)
+            return
         permitido, motivo = self.riko.puede_proactivo(canal=canal, tipo=tipo)
         trato = self.settings.trato_usuario
         reply: BrocaReply | None = None
+        url_curiosa: str | None = None
+        presente = bool(p.presente)
 
         if tipo == "curiosidad_visual":
             r = await self.aura.vistazo("curiosidad")
@@ -2200,15 +3874,26 @@ class Orquestador:
             if r.error is None:
                 self._stats["vistazos"] += 1
             if r.error is None and r.rostro is True and permitido:
-                instruccion = (f"Acabas de mirar por la cámara durante {r.duracion_ms} ms por curiosidad y viste a "
-                               f"{trato}. Coméntalo en una frase y di que ya la apagaste.")
+                self._salir_a_buscar(tipo, presente=presente)
+                if r.duracion_ms == 0:
+                    # Muestra de la visión continua (como_vistazo): la cámara sigue abierta con su
+                    # indicador; decir «ya la apagué» sería falso.
+                    instruccion = (f"Tu visión continua local (la cámara sigue encendida, solo números) ve a "
+                                   f"{trato} frente al computador. Coméntalo en una frase, por curiosidad.")
+                else:
+                    instruccion = (f"Acabas de mirar por la cámara durante {r.duracion_ms} ms por curiosidad y "
+                                   f"viste a {trato}. Coméntalo en una frase y di que ya la apagaste.")
                 reply = await self.broca.verbalizar(
                     self._contexto_proactivo(estado, modo, iniciativa=tipo, instruccion=instruccion,
                                              presencia=p, vision=r), None)
-            elif r.error is None:
+            elif r.error is None and r.duracion_ms > 0:   # la continua no "parpadea": nada que confesar
                 self._vistazos_pendientes += 1
+        elif tipo == "curiosidad_web":
+            if permitido and presente:
+                reply, url_curiosa = await self._curiosidad_web(estado, modo, p)
         elif tipo == "conversar":
             if permitido:
+                self._salir_a_buscar(tipo, presente=presente)
                 instruccion = estado.motivo_iniciativa or str(d.get("motivo") or "") or "aburrimiento sin estímulos"
                 nexus = resumen_nexus(self._ultimo_nexus)
                 if nexus:
@@ -2220,6 +3905,7 @@ class Orquestador:
                     None)
         elif tipo == "descanso":
             if p.presente and permitido:
+                self._salir_a_buscar(tipo, presente=presente)
                 horas = formatear_decimal(self._duracion_sesion_s() / 3600.0, 1)
                 instruccion = (f"Sugiere una pausa con fundamento fisiológico (sin diagnosticar); fatiga "
                                f"{formatear_decimal(estado.fatiga, 2)}; horas activas {horas}.")
@@ -2233,6 +3919,7 @@ class Orquestador:
                 f"Reading Steiner: cambio de línea de mundo {antes_txt} → {despues_txt} (D={estado.divergencia_str()})",
                 categoria="reading_steiner", importancia=0.3)
             if p.presente and permitido:
+                self._salir_a_buscar(tipo, presente=presente)
                 instruccion = (f"Reading Steiner: la línea de mundo pasó de {NOMBRE_CAMPO.get(antes_txt, antes_txt)} "
                                f"a {NOMBRE_CAMPO.get(despues_txt, despues_txt)} (divergencia "
                                f"{estado.divergencia_str()}). Coméntalo en una frase.")
@@ -2249,9 +3936,26 @@ class Orquestador:
             return
         if self._apagando:
             return
+        if url_curiosa is not None:
+            self._compartir_enlace(reply.texto_plano, url_curiosa, presente=presente)
         await self.riko.decir(reply, origen="iniciativa", prioridad=1, canal=canal, motivo=tipo,
                               tipo_iniciativa=tipo)
         self._stats["iniciativas"] += 1
+
+    def _compartir_enlace(self, texto: str, url: str, *, presente: bool) -> None:
+        """Curiosidad web: notificación con enlace (se abre solo con un clic) y Amadeus se asoma."""
+        if (presente and self._overlay_conectado and not self._no_molestar_activo()
+                and _URL_HTTPS_RE.match(url) and len(url) <= MAX_URL_NOTIFICACION):
+            self._orden_escritorio("notificar", texto=str(texto or "")[:MAX_TEXTO_NOTIFICACION], url=url)
+            if self._overlay_disponible():
+                borde = self._rng.choice(("left", "right"))
+                if not self._overlay_visible:
+                    self._orden_escritorio("aparecer", borde=borde, modo="asomarse")
+                self._solicitud_motor("asomarse", "curiosidad_web", borde=borde)
+            return
+        # Sin Amadeus Desktop: el enlace queda en la terminal (y en el chat del HUD, si está abierto).
+        self.consola.imprimir_sistema(f"Enlace: {url}")
+        self._sistema_escritorio(f"Enlace: {url}")
 
     async def _al_alerta(self, evento: Evento) -> None:
         """Alerta crítica de telemetría: plantilla J.A.R.V.I.S. con las cifras exactas (sin LLM)."""
@@ -2420,6 +4124,9 @@ class Orquestador:
                 for item in await self.memoria.vencidos():
                     if self._apagando:
                         break
+                    if item.id in self._agenda_buscar:
+                        await self._entregar_busqueda(item)     # v0.2: "búscame en 10 minutos"
+                        continue
                     categoria = "capsula" if item.tipo == "capsula" else "recordatorio"
                     reply = self.broca.frase_local(categoria, self.conectoma.estado(), mensaje=item.mensaje,
                                                    creada=_fecha_local_desde_iso(item.creado_ts, zona))
@@ -2428,6 +4135,23 @@ class Orquestador:
                     await self.memoria.marcar_entregado(item.id, canal)
             if await self._esperar(30.0):
                 return
+
+    async def _entregar_busqueda(self, item: Any) -> None:
+        """Recordatorio ``buscar=True`` (§C1.6): regla de C1.3 (aparece y te busca; Telegram si no estás)."""
+        p = self.presencia.estado()
+        mensaje = str(getattr(item, "mensaje", "") or "")
+        estado = self.conectoma.estado()
+        if mensaje and mensaje != MENSAJE_BUSCAR_DEFECTO:
+            reply = self.broca.frase_local("recordatorio", estado, mensaje=mensaje)
+        else:
+            reply = self.broca.frase_local("escritorio_te_busca", estado)
+        _modo, canal = self._canal_proactivo()
+        if canal != "telegram":
+            self._salir_a_buscar("recordatorio", presente=bool(p.presente))
+        await self.riko.decir(reply, origen="agenda", prioridad=1, canal=canal, motivo="recordatorio")
+        await self.memoria.marcar_entregado(item.id, canal)
+        self._agenda_buscar.discard(item.id)
+        await self._guardar_agenda_buscar()
 
     async def _bucle_presencia(self) -> None:
         """Cada 5 s actualiza la presencia y, si es ambigua, puede pedir un vistazo de presencia."""
@@ -2440,7 +4164,8 @@ class Orquestador:
                 r = await self.aura.vistazo("presencia")
                 self.presencia.registrar_rostro(r.rostro)
                 if r.error is None:
-                    self._vistazos_pendientes += 1
+                    if r.duracion_ms > 0:              # solo los parpadeos reales de aura se confiesan
+                        self._vistazos_pendientes += 1
                     self._stats["vistazos"] += 1
             if await self._esperar(5.0):
                 return
@@ -2571,7 +4296,11 @@ class Orquestador:
 
         # 4. Cierre de módulos en el orden normativo.
         await self._cerrar_modulo("vtube", self.vtube, limite)
+        await self._cerrar_modulo("motor", self.corteza, limite)        # antes que el avatar: deja el cuerpo en reposo
         await self._cerrar_modulo("avatar3d", self.avatar3d, limite)
+        # v0.2: la visión suelta la cámara en su hilo; ControlPC para sus sondeos; el HUD borra el token.
+        await self._cerrar_modulo("vision", self.vision, limite)
+        await self._cerrar_modulo("control_pc", self.control_pc, limite)
         await self._cerrar_modulo("hud", self.hud, limite)
         await self._cerrar_modulo("control", self.control, limite)
         await self._cerrar_modulo("aura", self.aura, limite)
@@ -2614,11 +4343,12 @@ _MODULOS_P0: Final = ("core.config", "core.bus", "core.contracts", "core.etiquet
                       "core.presence", "lobes.broca_llm", "lobes.riko_megumin_io")
 _MODULOS_OPCIONALES: Final = ("core.flywire_loader", "core.control_server", "lobes.aura_vision_pc",
                               "lobes.nexus_link", "lobes.nexus_mcp_bridge", "lobes.web_researcher",
-                              "lobes.vtube_bridge", "interface.hud_server")
+                              "lobes.vtube_bridge", "lobes.vtuber_ai_bridge", "lobes.corteza_motora",
+                              "interface.hud_server", "lobes.control_pc", "lobes.vision_continua")
 _DEPENDENCIAS_OPCIONALES: Final = ("numpy", "cv2", "psutil", "httpx", "websockets", "edge_tts", "ddgs",
-                                   "sounddevice", "prompt_toolkit")
-_BINARIOS: Final = ("hyprctl", "grim", "pw-play", "paplay", "aplay", "ffmpeg", "mpv", "notify-send", "playerctl",
-                    "wpctl", "nvidia-smi")
+                                   "sounddevice", "soundfile", "prompt_toolkit")
+_BINARIOS: Final = ("hyprctl", "grim", "pw-play", "paplay", "aplay", "ffmpeg", "mpv", "ffplay", "notify-send",
+                    "playerctl", "wpctl", "nvidia-smi")
 
 
 def _imprimir_diag(estado: str, numero: int | None, texto: str) -> None:

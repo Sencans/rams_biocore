@@ -9,13 +9,19 @@ Reglas: los ``__post_init__`` acotan y sanean valores con ``object.__setattr__``
 lanzan por un valor fuera de rango) y los ``a_dict()`` devuelven tipos JSON-serializables
 (tuplas → listas, ``Enum`` → ``.value``).
 
-Dependencias: solo la biblioteca estándar. Sin degradación posible: no toca E/S.
+v0.2 "Amadeus Companion" (``docs/COMPANION.md`` §C2.2): canal local ``escritorio``, iniciativa
+``curiosidad_web``, tipos de acción de ``ControlPC``, catálogos cerrados del escritorio y de la
+visión, ``DESTINOS_BASE``, ``PATRON_TITULO_SENSIBLE`` y ``ContextoBroca.percepcion``.
+
+Dependencias: solo la biblioteca estándar. Sin degradación posible: no toca E/S. No importa
+``core.config`` (``config`` sí importa de aquí: no hay ciclo).
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import re
 import time
 import uuid
 from collections.abc import Mapping
@@ -23,6 +29,7 @@ from dataclasses import dataclass, field, fields
 from datetime import datetime
 from enum import Enum
 from pathlib import PurePath
+from types import MappingProxyType
 from typing import Any, Final, Protocol, runtime_checkable
 
 __all__ = [
@@ -32,8 +39,13 @@ __all__ = [
     "CANALES_SALIDA", "EXP_VALIDOS", "MOTION_VALIDOS", "TONE_VALIDOS", "LANG_VALIDOS",
     "TIPOS_ACCION", "ORIGENES_ACCION", "ORIGENES_UTTERANCE", "CANALES_UTTERANCE",
     "ERRORES_VISTAZO", "DIVERGENCIA_MAX",
+    # constantes v0.2 (§C2.2)
+    "TIPOS_ACCION_V02", "PATRONES_TRAVESURA", "MODOS_PANTALLA", "ESTADOS_VISION",
+    "ACCIONES_ORDEN_ESCRITORIO", "EVENTOS_ESCRITORIO", "CONTROLES_ESCRITORIO",
+    "CONDUCTAS_SOLICITUD", "SAFE_ALIAS_RE", "DESTINOS_BASE", "PATRON_TITULO_SENSIBLE",
+    "CLAVES_PERCEPCION", "TITULO_CORTO_MAX",
     # funciones
-    "formatear_decimal", "banda", "resumen_nexus",
+    "formatear_decimal", "banda", "resumen_nexus", "normalizar_percepcion",
     # tipos
     "HomeostaticState", "Etiquetas", "Segmento", "BrocaReply", "Utterance", "Telemetria",
     "ResultadoVistazo", "EstadoPresencia", "ResultadoWeb", "Recuerdo", "Turno", "ItemAgenda",
@@ -56,10 +68,13 @@ DIVERGENCIA_MAX: Final = 3.999999
 LINEAS_CANONICAS: Final = (0.337337, 0.409431, 0.456914, 0.523307, 0.571024, 0.571046, 1.123581)
 SECUENCIA_ARRANQUE_DIVERGENCIA: Final = (0.571024, 1.129848, 1.048596)   # homenaje (rueda nixie del boot)
 CAMPOS: Final = ("alfa", "steins_gate", "beta", "anomalo")
-INICIATIVAS: Final = ("conversar", "curiosidad_visual", "descanso", "cambio_linea")
+# v0.2: "curiosidad_web" (compartir algo curioso de la web; regla determinista de main, §C2.14.7).
+INICIATIVAS: Final = ("conversar", "curiosidad_visual", "descanso", "cambio_linea", "curiosidad_web")
 MODOS_SALIDA: Final = ("voz", "terminal", "terminal_largo", "telegram")
-CANALES_ENTRADA: Final = ("terminal", "telegram", "nexus")
-CANALES_LOCALES: Final = frozenset({"terminal"})        # cuentan como presencia y tienen todas las capacidades
+# Canales: "escritorio" (chat de Amadeus Desktop y del HUD) es local, como "terminal" (§C2.2).
+CANALES_ENTRADA: Final = ("terminal", "telegram", "nexus", "escritorio")
+CANALES_LOCALES: Final = frozenset({"terminal", "escritorio"})  # cuentan como presencia y tienen todas las capacidades
+# CANALES_SALIDA NO cambia: el chat de escritorio recibe la salida en modo "terminal".
 CANALES_SALIDA: Final = ("voz", "terminal", "telegram")  # canal efectivo de una Utterance
 
 EXP_VALIDOS: Final = ("neutral", "smug", "sonrojo_tsundere", "molesta", "pensativa", "sorprendida",
@@ -69,10 +84,59 @@ MOTION_VALIDOS: Final = ("idle", "asentir", "negar", "ladear_cabeza", "brazos_cr
 TONE_VALIDOS: Final = ("sarcastico", "analitico", "calido", "nervioso", "serio", "jugueton", "somnoliento")
 LANG_VALIDOS: Final = ("es", "en", "ja")
 
-# Solo tipos con productor real (core/intenciones.py o los lóbulos). Sin "comando" ni tipos huérfanos en v0.1.
+# Solo tipos con productor real (core/intenciones.py, main o los lóbulos). Sin "comando" ni tipos huérfanos.
+# v0.2: 13 tipos; los de TIPOS_ACCION_V02 los ejecuta lobes/control_pc.py, nunca aura.ejecutar.
 TIPOS_ACCION: Final = ("lanzar_app", "enfocar_nexus", "ir_workspace", "cerrar_ventana",
-                       "volumen", "media", "captura_pantalla", "vistazo")
-ORIGENES_ACCION: Final = ("usuario", "iniciativa", "nexus", "telegram", "llm")
+                       "volumen", "media", "captura_pantalla", "vistazo",
+                       "abrir_destino", "buscar_en", "prerrellenar", "escribir_texto", "travesura_cursor")
+TIPOS_ACCION_V02: Final = frozenset({"abrir_destino", "buscar_en", "prerrellenar", "escribir_texto",
+                                     "travesura_cursor"})   # van a ControlPC, nunca a aura.ejecutar
+ORIGENES_ACCION: Final = ("usuario", "iniciativa", "nexus", "telegram", "llm")   # NO cambia en la v0.2
+
+# Catálogos cerrados de la v0.2 (§C2.2).
+PATRONES_TRAVESURA: Final = ("empujon", "circulo", "temblor", "hacia_avatar")
+MODOS_PANTALLA: Final = ("off", "metadatos", "pixeles")
+ESTADOS_VISION: Final = ("off", "continua", "pausada", "ocupada", "error", "degradada")
+ACCIONES_ORDEN_ESCRITORIO: Final = ("aparecer", "esconderse", "abrir_chat", "notificar")
+EVENTOS_ESCRITORIO: Final = ("toque", "soltada", "cursor_encima", "mostrada", "ocultada", "chat_abierto")
+CONTROLES_ESCRITORIO: Final = ("no_molestar_on", "no_molestar_off", "basta_travesuras", "pausar_vision")
+CONDUCTAS_SOLICITUD: Final = ("buscar_usuario", "asomarse", "esconderse", "pasear")
+SAFE_ALIAS_RE: Final = re.compile(r"^[a-z0-9_]{1,24}$")
+
+# Metadatos de destinos: si admiten prerrelleno (enlace profundo con borrador) y búsqueda.
+# Cómo se ABRE cada uno en cada sistema vive en lobes/control_pc.py. Inmutable a dos niveles
+# (cada valor también es MappingProxyType).
+DESTINOS_BASE: Final[Mapping[str, Mapping[str, bool]]] = MappingProxyType({
+    clave: MappingProxyType({"prerrelleno": prerrelleno, "busqueda": busqueda})
+    for clave, prerrelleno, busqueda in (
+        ("whatsapp", True, False),
+        ("telegram", True, False),
+        ("x", True, True),
+        ("gmail", True, False),
+        ("correo", True, False),        # mailto:
+        ("instagram", False, False),
+        ("tiktok", False, False),
+        ("facebook", False, False),
+        ("discord", False, False),
+        ("linkedin", False, False),
+        ("youtube", False, True),
+        ("spotify", False, True),
+        ("navegador", False, True),     # búsqueda web en DuckDuckGo
+        ("archivos", False, False),
+    )
+})
+
+# Títulos sensibles: se aplica a títulos en minúsculas y sin tildes (config.titulo_sensible y
+# Settings.pantalla_excluir_re). Base de la regla anti-contraseñas y de la privacidad de la visión.
+PATRON_TITULO_SENSIBLE: Final = (
+    r"contrasena|password|iniciar sesion|sign ?in|log ?in|verificacion|codigo|otp|2fa|token|\bpin\b|"
+    r"banco|bancolombia|nequi|daviplata|\bpse\b|pago|checkout|tarjeta|wallet|binance|"
+    r"incognito|inprivate|private browsing|navegacion privada|keepass|bitwarden|1password")
+
+# Claves permitidas en ContextoBroca.percepcion (las demás se descartan) y largo del título corto.
+CLAVES_PERCEPCION: Final = ("app", "titulo_corto", "video", "pantalla_completa", "rostro", "atencion",
+                            "dist_m")
+TITULO_CORTO_MAX: Final = 60
 
 # Valores documentados en los comentarios de §4.3.3 y §4.3.4 (de apoyo; no normativos aparte).
 ORIGENES_UTTERANCE: Final = ("respuesta", "iniciativa", "agenda", "alerta", "sistema", "nexus")
@@ -869,6 +933,7 @@ class DiagnosticoModulo:
 
     clave: str        # "memoria" | "conectoma" | "broca" | "camara" | "telemetria" | "hyprland" | "nexus" |
                       # "vts" | "voz" | "telegram" | "web" | "hud" | "control"
+                      # v0.2: "escritorio" | "control_pc" | "vision_camara" | "vision_pantalla"
     nombre: str       # nombre para el arranque, p. ej. "Área de Broca (Gemini)"
     estado: EstadoModulo
     detalle: str = ""
@@ -901,6 +966,71 @@ def _tupla_de(valor: Any, tipo: type) -> tuple[Any, ...]:
         return ()
 
 
+_RE_CONTROL_PERCEPCION: Final = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def _texto_percepcion(valor: Any) -> str:
+    """Texto corto de una sola línea (sin caracteres de control, ≤ ``TITULO_CORTO_MAX``); ``None`` ⇒ ``""``."""
+    if valor is None or isinstance(valor, (bytes, bytearray)):
+        return ""
+    texto = _RE_CONTROL_PERCEPCION.sub(" ", str(valor)).strip()
+    return texto[:TITULO_CORTO_MAX].rstrip()
+
+
+def _bool_opcional(valor: Any) -> bool | None:
+    """``None`` o booleano (acepta ``bool``/enteros y tipos con ``__bool__``; texto o NaN ⇒ ``None``)."""
+    if valor is None or isinstance(valor, (str, bytes, bytearray)):
+        return None
+    if isinstance(valor, float) and not math.isfinite(valor):
+        return None
+    try:
+        return bool(valor)
+    except Exception as exc:  # __bool__ roto o ambiguo (p. ej. un array de varios elementos)
+        log.debug("percepcion: valor booleano no válido (%s); uso None", type(exc).__name__)
+        return None
+
+
+def _real_percepcion(valor: Any, minimo: float, maximo: float | None) -> float | None:
+    """Float finito opcional acotado; booleanos y texto ⇒ ``None``."""
+    if isinstance(valor, (bool, str, bytes, bytearray)):
+        return None
+    return _real_opcional(valor, minimo, maximo)
+
+
+def normalizar_percepcion(valor: Any) -> Mapping[str, Any] | None:
+    """Normaliza ``ContextoBroca.percepcion`` (§C2.2) a un ``MappingProxyType`` de solo lectura.
+
+    Conserva **solo** las claves de ``CLAVES_PERCEPCION`` que vengan (no rellena las ausentes):
+    ``app``/``titulo_corto`` → texto de una línea ≤ 60 (``None`` ⇒ ``""``); ``video``,
+    ``pantalla_completa`` y ``rostro`` → ``bool | None``; ``atencion`` → ``float | None`` en 0..1;
+    ``dist_m`` → ``float | None`` ≥ 0. ``None`` o algo que no sea un ``Mapping`` ⇒ ``None``.
+    Nunca lanza.
+    """
+    if valor is None:
+        return None
+    if not isinstance(valor, Mapping):
+        log.debug("percepcion no es un Mapping (%s); se ignora", type(valor).__name__)
+        return None
+    limpio: dict[str, Any] = {}
+    try:
+        for clave in CLAVES_PERCEPCION:
+            if clave not in valor:
+                continue
+            crudo = valor[clave]
+            if clave in ("app", "titulo_corto"):
+                limpio[clave] = _texto_percepcion(crudo)
+            elif clave in ("video", "pantalla_completa", "rostro"):
+                limpio[clave] = _bool_opcional(crudo)
+            elif clave == "atencion":
+                limpio[clave] = _real_percepcion(crudo, 0.0, 1.0)
+            else:  # dist_m
+                limpio[clave] = _real_percepcion(crudo, 0.0, None)
+    except Exception as exc:  # Mapping exótico (get/__contains__ rotos): nunca lanza
+        log.debug("percepcion no legible (%s); se ignora", type(exc).__name__)
+        return None
+    return MappingProxyType(limpio)
+
+
 @dataclass(frozen=True)
 class ContextoBroca:
     """Todo lo que Broca necesita para verbalizar un turno (Broca no decide nada)."""
@@ -928,6 +1058,12 @@ class ContextoBroca:
     iniciativa: str | None = None                       # ∈ INICIATIVAS cuando canal_entrada == "iniciativa"
     publico: bool = False                               # respuesta visible para terceros (chat de colaboración Nexus)
     fecha_hora: datetime | None = None                  # aware, America/Bogota
+    # v0.2 (§C2.2): lo que Amadeus percibe en local, sin tokens ni imágenes. Claves permitidas
+    # (las demás se descartan; se guarda como MappingProxyType):
+    #   app: str ("" si no se sabe) · titulo_corto: str (≤ 60; "" si la ventana es privada)
+    #   video: bool | None · pantalla_completa: bool | None · rostro: bool | None
+    #   atencion: float | None (0..1) · dist_m: float | None
+    percepcion: Mapping[str, Any] | None = field(default=None, hash=False)
 
     def __post_init__(self) -> None:
         poner = object.__setattr__
@@ -948,6 +1084,7 @@ class ContextoBroca:
         poner(self, "alerta_critica", bool(self.alerta_critica))
         poner(self, "despedida_especial", bool(self.despedida_especial))
         poner(self, "publico", bool(self.publico))
+        poner(self, "percepcion", normalizar_percepcion(self.percepcion))
 
 
 # ---------------------------------------------------------------------------

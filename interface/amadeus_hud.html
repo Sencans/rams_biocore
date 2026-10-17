@@ -33,6 +33,12 @@
     --aviso: #ffb020;
     --error: #ff4d4d;
     --led: #ff2a2a;
+    --rine: #2f9e5a;
+    --rine-osc: #1b5e36;
+    --rine-yo: #9be7b0;
+    --rine-yo-txt: #0b2414;
+    --rine-ella-txt: #1a1a1a;
+    --enlace: #8cc8ff;
     --f-nixie: "Nixie One", monospace;
     --f-mono: "Share Tech Mono", ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", monospace;
     --f-sans: system-ui, -apple-system, "Segoe UI", "Noto Sans", Roboto, sans-serif;
@@ -98,7 +104,7 @@
       "escena lateral"
       "medidor sistema"
       "registro registro";
-    gap: 10px; padding: 10px;
+    gap: 10px; padding: 10px 10px 64px; /* abajo: hueco para el lanzador del chat RINE */
     min-height: 100vh;
     max-width: 1600px; margin: 0 auto;
   }
@@ -418,13 +424,117 @@
     100% { text-shadow: none; transform: none; clip-path: inset(0 0 0 0); }
   }
 
+  /* ---------- Indicador 👁 de visión local (vision.estado / pantalla.estado) ---------- */
+  .ojo {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px;
+    border: 1px solid var(--bd); color: var(--txt-d); font-size: 12px; white-space: nowrap;
+  }
+  .ojo.activa { color: var(--bata); border-color: var(--led); box-shadow: 0 0 6px rgba(255, 42, 42, .35); }
+  .ojo.pausada { color: var(--txt-d); border-style: dashed; }
+
+  /* ---------- Chat RINE (/escritorio): mensajería de la línea de mundo, homenaje ---------- */
+  .rine-lanzador {
+    position: fixed; z-index: 41; right: 12px; bottom: 12px;
+    display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 8px 14px;
+    font: 600 13px/1 var(--f-sans); letter-spacing: .16em; color: #fff; cursor: pointer;
+    background: linear-gradient(180deg, var(--rine), var(--rine-osc)); border: 1px solid #5fd08a;
+    border-radius: 20px; box-shadow: 0 4px 16px rgba(0, 0, 0, .45);
+  }
+  .rine-lanzador:focus-visible { outline: 2px solid var(--pri); outline-offset: 2px; }
+  .rine-lanzador .punto-rine { width: 8px; height: 8px; border-radius: 50%; background: rgba(255, 255, 255, .35); }
+  .rine-lanzador.en-linea .punto-rine { background: #c8ffd9; box-shadow: 0 0 6px #c8ffd9; }
+  .rine-insignia {
+    min-width: 20px; padding: 2px 6px; border-radius: 10px; text-align: center; letter-spacing: 0;
+    background: var(--corbata); color: #fff; font: 600 11px/1.2 var(--f-sans);
+  }
+  .rine {
+    position: fixed; z-index: 42; right: 12px; bottom: 12px;
+    width: min(380px, calc(100vw - 24px)); height: min(560px, calc(100vh - 96px));
+    display: flex; flex-direction: column; min-height: 0;
+    background: rgba(9, 14, 24, .97); border: 1px solid var(--rine-osc);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, .55); font-family: var(--f-sans);
+  }
+  .rine-cabecera {
+    display: flex; align-items: center; gap: 10px; padding: 8px 10px;
+    background: linear-gradient(180deg, var(--rine), var(--rine-osc)); color: #fff;
+  }
+  .rine-avatar {
+    flex: 0 0 auto; width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--kurisu); border: 2px solid var(--bata); font: 600 13px/1 var(--f-sans);
+  }
+  .rine-titulo { display: grid; min-width: 0; flex: 1 1 auto; }
+  .rine-titulo h2 { margin: 0; font: 600 14px/1.2 var(--f-sans); letter-spacing: .14em; }
+  .rine-estado { font-size: 12px; color: rgba(255, 255, 255, .85); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rine-cerrar {
+    flex: 0 0 auto; width: 36px; height: 36px; display: grid; place-items: center; cursor: pointer;
+    font: 600 20px/1 var(--f-sans); color: #fff; background: transparent; border: 1px solid rgba(255, 255, 255, .35);
+  }
+  .rine-cerrar:hover { background: rgba(255, 255, 255, .12); }
+  .rine-cerrar:focus-visible { outline: 2px solid #fff; outline-offset: 1px; }
+  .rine-lista {
+    flex: 1 1 auto; min-height: 0; overflow-y: auto; list-style: none; margin: 0; padding: 10px;
+    display: flex; flex-direction: column; gap: 8px; overscroll-behavior: contain;
+    background:
+      radial-gradient(circle at 20% 10%, rgba(47, 158, 90, .07), transparent 40%),
+      rgba(7, 11, 20, .6);
+  }
+  .rine-vacio { margin: auto; color: var(--txt-d); font-size: 13px; text-align: center; padding: 12px; }
+  .msg { display: flex; flex-direction: column; gap: 2px; max-width: 84%; }
+  .msg.ella { align-self: flex-start; }
+  .msg.yo { align-self: flex-end; align-items: flex-end; }
+  .msg.sistema, .msg.permiso { align-self: stretch; max-width: none; }
+  .msg .burbuja {
+    padding: 7px 11px; border-radius: 14px; font: 14px/1.42 var(--f-sans);
+    overflow-wrap: anywhere; white-space: pre-wrap;
+  }
+  .msg.ella .burbuja { background: var(--bata); color: var(--rine-ella-txt); border-top-left-radius: 4px; }
+  .msg.yo .burbuja { background: var(--rine-yo); color: var(--rine-yo-txt); border-top-right-radius: 4px; }
+  .msg.sistema .burbuja {
+    background: rgba(31, 58, 95, .45); color: var(--txt); border-radius: 6px;
+    font: 12.5px/1.45 var(--f-mono); border: 1px dashed var(--bd);
+  }
+  .msg.permiso .burbuja { background: rgba(40, 10, 8, .92); color: var(--bata); border: 1px solid var(--corbata); border-radius: 6px; }
+  .msg.permiso strong { color: var(--aviso); font-weight: 600; }
+  .msg .canal { display: block; font-size: 11px; color: #5a5a5a; margin-bottom: 2px; }
+  .msg time { font: 11px/1.2 var(--f-mono); color: var(--txt-d); padding: 0 4px; }
+  .msg .burbuja a { color: #0b4f8a; text-decoration: underline; word-break: break-all; }
+  .msg.sistema .burbuja a, .msg.permiso .burbuja a { color: var(--enlace); }
+  .vista-previa {
+    display: block; margin: 6px 0 0; padding: 6px 8px; border-left: 3px solid var(--aviso);
+    background: rgba(0, 0, 0, .35); font: 13px/1.4 var(--f-mono); white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .msg .acciones { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .msg .acciones button, .rine-controles button, .rine-form button {
+    min-height: 36px; padding: 6px 12px; cursor: pointer; font: 13px/1.2 var(--f-sans);
+    color: var(--txt); background: rgba(31, 58, 95, .45); border: 1px solid var(--bd);
+  }
+  .msg .acciones .aprobar { border-color: var(--ok); color: #c9ffe1; }
+  .msg .acciones .rechazar { border-color: var(--corbata); color: #ffd0c9; }
+  .msg .acciones button:hover:not(:disabled), .rine-controles button:hover:not(:disabled),
+  .rine-form button:hover:not(:disabled) { border-color: var(--pri); }
+  .msg .acciones button:focus-visible, .rine-controles button:focus-visible,
+  .rine-form button:focus-visible, .rine-form input:focus-visible { outline: 2px solid var(--pri); outline-offset: 2px; }
+  .msg .acciones button:disabled, .rine-controles button:disabled, .rine-form button:disabled,
+  .rine-form input:disabled { opacity: .5; cursor: not-allowed; }
+  .msg .resolucion { display: block; margin-top: 6px; font-size: 12px; color: var(--txt-d); }
+  .rine-escribiendo { min-height: 1.6em; padding: 2px 12px; font-size: 12px; color: var(--txt-d); }
+  .rine-controles { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 8px 6px; }
+  .rine-controles button { flex: 1 1 auto; min-height: 32px; padding: 4px 8px; font-size: 12px; }
+  .rine-controles button[aria-pressed="true"] { background: rgba(95, 168, 255, .22); border-color: var(--pri); color: var(--bata); }
+  .rine-form { display: flex; gap: 8px; padding: 8px; border-top: 1px solid var(--rine-osc); }
+  .rine-form input {
+    flex: 1 1 auto; min-width: 0; min-height: 40px; padding: 8px 10px;
+    font: 16px/1.3 var(--f-sans); color: var(--txt); background: rgba(12, 20, 36, .9); border: 1px solid var(--bd);
+  }
+  .rine-form button[type="submit"] { background: var(--rine-osc); border-color: var(--rine); color: #fff; }
+
   /* ---------- Responsive: por debajo de 720 px las columnas se apilan ---------- */
   @media (max-width: 719.98px) {
     .app {
       grid-template-columns: minmax(0, 1fr);
       grid-template-rows: auto;
       grid-template-areas: "barra" "escena" "lateral" "medidor" "sistema" "registro";
-      gap: 8px; padding: 8px;
+      gap: 8px; padding: 8px 8px 60px;
     }
     .barra .derecha { margin-left: 0; }
     .marco { min-height: 230px; }
@@ -433,6 +543,9 @@
     .permiso { top: auto; bottom: 10px; }
     .medidor { gap: 14px; }
     .tubos { padding: 8px 4px 0; }
+    .rine { left: 8px; right: 8px; bottom: 8px; width: auto; height: min(74vh, 560px); }
+    .rine-lanzador { right: 8px; bottom: 8px; }
+    .ojo { font-size: 11px; }
   }
 
   /* ---------- Movimiento reducido: sin engranajes, rodado nixie ni glitch ---------- */
@@ -487,6 +600,7 @@
     </div>
     <div class="interlocutor" id="interlocutor"></div>
     <div class="derecha">
+      <span class="ojo" id="ojo" role="status" aria-label="Visión local apagada" hidden><span aria-hidden="true">👁</span><span id="ojo-texto"></span></span>
       <div class="senal" id="senal" role="img" aria-label="Señal: sin datos">
         <span></span><span></span><span></span><span></span><em>señal</em>
       </div>
@@ -587,9 +701,39 @@
   <strong>⚠ Confirmación requerida en la terminal</strong>
   <span class="etiqueta-roja" id="permiso-destructiva" hidden>acción destructiva</span>
   <p id="permiso-desc"></p>
+  <p id="permiso-pista" hidden>También puedes responder con los botones del chat RINE.</p>
 </div>
 <div class="avisos" id="avisos" aria-live="polite"></div>
 <div class="destello" id="destello" aria-hidden="true"></div>
+
+<!-- Chat RINE: segundo cliente de /escritorio (token propio recibido por /ws, §C2.4). Oculto hasta
+     que /ws envía el mensaje «escritorio» (solo con RAMS_HUD_CHAT=1 y /escritorio activo, §C1.5). -->
+<button type="button" class="rine-lanzador" id="rine-lanzador" aria-controls="rine" aria-expanded="false" hidden
+        aria-label="Abrir el chat RINE con Amadeus"><span class="punto-rine" aria-hidden="true"></span>RINE<span class="rine-insignia" id="rine-insignia" hidden></span></button>
+<section class="rine" id="rine" aria-label="Chat RINE con Amadeus" hidden>
+  <header class="rine-cabecera">
+    <span class="rine-avatar" aria-hidden="true">K</span>
+    <div class="rine-titulo">
+      <h2 id="rine-nombre">AMADEUS</h2>
+      <span class="rine-estado" id="rine-estado" role="status">chat sin conectar</span>
+    </div>
+    <button type="button" class="rine-cerrar" id="rine-cerrar" aria-label="Cerrar el chat">×</button>
+  </header>
+  <ol class="rine-lista" id="rine-lista" role="log" aria-live="polite" aria-label="Mensajes del chat">
+    <li class="rine-vacio" id="rine-vacio">Escríbele a Amadeus. Las confirmaciones de acciones aparecen aquí con botones.</li>
+  </ol>
+  <div class="rine-escribiendo" id="rine-escribiendo" aria-live="polite"></div>
+  <div class="rine-controles" role="group" aria-label="Controles de Amadeus en el escritorio">
+    <button type="button" id="rine-no-molestar" aria-pressed="false" disabled>No molestar</button>
+    <button type="button" id="rine-quieta" disabled>Quieta</button>
+    <button type="button" id="rine-vision" disabled>Pausar visión</button>
+  </div>
+  <form class="rine-form" id="rine-form" autocomplete="off">
+    <label class="solo-lector" for="rine-texto">Mensaje para Amadeus</label>
+    <input id="rine-texto" type="text" maxlength="2000" placeholder="Escribe a Amadeus…" enterkeyhint="send" disabled>
+    <button type="submit" id="rine-enviar" disabled>Enviar</button>
+  </form>
+</section>
 
 <script>
 (function () {
@@ -1095,19 +1239,29 @@
     iniciarOndas();
   }
 
+  // LED = OR de vision.camara por fuente (§C2.13): «vistazo» (aura, instantáneo) y «continua»
+  // (visión continua, repetido cada 5 s mientras está abierta). Sin fuente = «vistazo».
+  const camaraFuentes = { vistazo: false, continua: false };
   let temporizadorLed = null;
   function alCamara(d) {
     const led = $("led");
+    const fuente = d.fuente === "continua" ? "continua" : "vistazo";
     const activa = d.activa === true;
-    led.classList.toggle("deshabilitada", d.habilitada === false);
+    const antes = camaraFuentes[fuente];
+    camaraFuentes[fuente] = activa;
+    const algunaActiva = camaraFuentes.vistazo || camaraFuentes.continua;
+    led.classList.toggle("deshabilitada", d.habilitada === false && !algunaActiva);
     if (temporizadorLed !== null) { clearTimeout(temporizadorLed); temporizadorLed = null; }
-    if (activa) {
+    if (algunaActiva) {
       // El LED se ve aunque la cámara solo esté abierta unos milisegundos.
       led.classList.add("activa");
-      ui.ledHasta = performance.now() + 1500;
-      poner($("camara-estado"), "Cámara activa");
-      registrar("● CÁMARA ACTIVA", "camara");
+      if (fuente === "vistazo" && activa) { ui.ledHasta = performance.now() + 1500; }
+      poner($("camara-estado"), camaraFuentes.continua ? "Cámara activa (visión continua local)" : "Cámara activa");
+      if (activa && !antes) {
+        registrar("● CÁMARA ACTIVA" + (fuente === "continua" ? " · visión continua" : ""), "camara");
+      }
     } else {
+      // Ninguna fuente abierta: el LED se apaga (respetando el mínimo visible de un vistazo).
       const resto = ui.ledHasta - performance.now();
       if (resto > 0) {
         temporizadorLed = setTimeout(() => { led.classList.remove("activa"); temporizadorLed = null; }, resto);
@@ -1115,13 +1269,60 @@
         led.classList.remove("activa");
       }
       const ms = num(d.duracion_ms);
-      if (ms !== null && ms > 0) {
+      if (fuente === "continua") {
+        poner($("camara-estado"), d.habilitada === false ? "Cámara deshabilitada" : "Cámara apagada");
+        if (antes) { registrar("○ visión continua: cámara cerrada", "off"); }
+      } else if (ms !== null && ms > 0) {
         poner($("camara-estado"), "Cámara apagada (" + Math.round(ms) + " ms)");
         registrar("○ cámara apagada (" + Math.round(ms) + " ms)", "off");
       } else {
         poner($("camara-estado"), d.habilitada === false ? "Cámara deshabilitada" : "Cámara apagada");
       }
     }
+  }
+
+  // Indicador 👁: visión local (sin tokens) según vision.estado y pantalla.estado.
+  const vision = { camara: "off", pantalla: "off", clase: "", privada: false };
+  const NOMBRE_ESTADO_CAMARA = {
+    continua: "cámara continua", degradada: "cámara (degradada)", pausada: "cámara en pausa",
+    ocupada: "cámara ocupada por otra app", error: "cámara con error"
+  };
+  function actualizarOjo() {
+    const el = $("ojo");
+    const camaraViva = vision.camara === "continua" || vision.camara === "degradada";
+    const pantallaViva = vision.pantalla === "metadatos" || vision.pantalla === "pixeles";
+    const visible = vision.camara !== "off" || vision.pantalla !== "off";
+    el.hidden = !visible;
+    el.classList.toggle("activa", camaraViva || pantallaViva);
+    el.classList.toggle("pausada", visible && !camaraViva && !pantallaViva);
+    const partes = [];
+    if (vision.camara !== "off") { partes.push(NOMBRE_ESTADO_CAMARA[vision.camara] || "cámara " + vision.camara); }
+    if (vision.pantalla !== "off") { partes.push("pantalla " + vision.pantalla); }
+    const corto = camaraViva && pantallaViva ? "cámara · pantalla"
+      : camaraViva ? "cámara" : pantallaViva ? "pantalla" : "en pausa";
+    poner($("ojo-texto"), corto);
+    const ventana = vision.privada ? "ventana privada" : (vision.clase ? "ventana: " + vision.clase : "");
+    const detalle = "Visión local sin tokens: " + (partes.join(" · ") || "apagada") + (ventana ? " · " + ventana : "");
+    el.setAttribute("aria-label", detalle);
+    el.setAttribute("title", detalle);
+  }
+  function alVision(d) {
+    vision.camara = cadena(d.camara, 20) || "off";
+    vision.pantalla = cadena(d.pantalla, 20) || "off";
+    actualizarOjo();
+  }
+  function alPantalla(d) {
+    vision.privada = d.privada === true;
+    vision.clase = cadena(d.clase, 60);
+    actualizarOjo();
+  }
+
+  function alAccion(d) {
+    const tipo = cadena(d.tipo, 40) || "acción";
+    const resultado = cadena(d.resultado, 200);
+    const destino = cadena(d.destino, 40);
+    const texto = "Acción del PC: " + tipo + (destino ? " (" + destino + ")" : "") + (resultado ? " → " + resultado : "");
+    registrar(texto, resultado === "ok" ? "ok" : "aviso");
   }
 
   function alPresencia(d) {
@@ -1185,6 +1386,7 @@
     estadoLlamada("finalizada", motivo);
     ocultarPermiso();
     ocultarSuperposicion();
+    cerrarChat("llamada finalizada");
     registrar("LLAMADA FINALIZADA" + (motivo ? " · " + motivo : ""), "aviso");
     if (ws && temporizadorCierreFinal === null) {
       const socket = ws;
@@ -1232,7 +1434,7 @@
     const id = cadena(d.id, 64);
     if (ui.permisoId === null || id === "" || id === ui.permisoId) { ocultarPermiso(); }
     const texto = d.aprobado === true
-      ? "Acción confirmada en la terminal"
+      ? "Acción confirmada"
       : "Acción no autorizada" + (d.motivo ? " · " + cadena(d.motivo, 120) : "");
     aviso(texto, d.aprobado === true ? "ok" : "");
     registrar(texto, d.aprobado === true ? "ok" : "aviso");
@@ -1257,27 +1459,484 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // Chat RINE: cliente de /escritorio con el token propio que llega por /ws (mensaje «escritorio»).
+  // Todo el texto se escribe con textContent; los enlaces solo https:// y se abren tras un clic con
+  // rel="noopener noreferrer". El token nunca se muestra ni se guarda en el DOM.
+  // ------------------------------------------------------------------
+  const ID_CONFIRMACION = /^[0-9a-f]{8}$/;
+  const TOKEN_VALIDO = /^[A-Za-z0-9_-]{16,128}$/;
+  const URL_EN_TEXTO = /https:\/\/[^\s<>"'`\\]+/g;
+  const MAX_MENSAJES_CHAT = 200;
+  const MAX_TEXTO_CHAT = 2000;
+  // Motivos del «no molestar» automático (pc.no_molestar.motivo) para el título del botón.
+  const MOTIVOS_NO_MOLESTAR = new Map([
+    ["presentacion", "una presentación"], ["pantalla_completa", "una app a pantalla completa"],
+    ["ocupado", "el «no molestar» del sistema"], ["juego", "un juego"], ["pantalla", "lo que hay en pantalla"]
+  ]);
+  const chat = {
+    token: null,
+    ws: null,
+    conectado: false,
+    espera: 1000,
+    temporizador: null,
+    disponible: false,          // /ws envió un token válido de /escritorio (RAMS_HUD_CHAT=1)
+    esperandoEscritorio: false, // tras el «hola» de /ws: el siguiente mensaje decide si hay chat
+    abierto: false,
+    preferenciaAbierto: false,  // recordada en localStorage; se aplica cuando el chat existe
+    sinLeer: 0,
+    noMolestar: false,          // estado REAL del «no molestar» del usuario (mensaje no_molestar)
+    travesurasActivas: false,
+    pendientes: new Map(),      // id → { li, botones, resolucion }
+    revision: new Map()         // pendientes de antes de reconectar, a la espera de la instantánea
+  };
+
+  function estadoChat(texto) { poner($("rine-estado"), texto); }
+
+  function habilitarChat(si) {
+    $("rine-texto").disabled = !si;
+    $("rine-enviar").disabled = !si;
+    $("rine-no-molestar").disabled = !si;
+    $("rine-vision").disabled = !si;
+    $("rine-quieta").disabled = !si;
+    $("rine-lanzador").classList.toggle("en-linea", si);
+    $("permiso-pista").hidden = !si;
+    // Solo las confirmaciones vigentes: las que están en revisión siguen bloqueadas hasta que la
+    // instantánea de /escritorio confirme que siguen pendientes.
+    chat.pendientes.forEach((p) => { p.botones.forEach((b) => { b.disabled = !si; }); });
+  }
+
+  function actualizarInsignia() {
+    const insignia = $("rine-insignia");
+    insignia.hidden = chat.sinLeer === 0;
+    poner(insignia, chat.sinLeer > 99 ? "99+" : String(chat.sinLeer));
+    $("rine-lanzador").setAttribute("aria-label", "Abrir el chat RINE con " + ui.nombreIA +
+      (chat.sinLeer ? " (" + chat.sinLeer + " sin leer)" : ""));
+  }
+
+  function abrirChat(abrir, enfocar) {
+    if (!chat.disponible) { return; } // sin RAMS_HUD_CHAT=1 no hay chat que mostrar (§C1.5)
+    chat.abierto = abrir;
+    chat.preferenciaAbierto = abrir;
+    $("rine").hidden = !abrir;
+    $("rine-lanzador").hidden = abrir;
+    $("rine-lanzador").setAttribute("aria-expanded", abrir ? "true" : "false");
+    try { localStorage.setItem("amadeus.rine.abierto", abrir ? "1" : "0"); } catch (e) { /* almacenamiento no disponible */ }
+    if (abrir) {
+      chat.sinLeer = 0;
+      actualizarInsignia();
+      const lista = $("rine-lista");
+      lista.scrollTop = lista.scrollHeight;
+      if (enfocar && !$("rine-texto").disabled) { $("rine-texto").focus(); }
+    } else if (enfocar) {
+      $("rine-lanzador").focus();
+    }
+  }
+
+  // Enlace solo https:// con host; se abre únicamente cuando el usuario hace clic.
+  function crearEnlace(url) {
+    if (url.length > 300) { return null; }
+    let u;
+    try { u = new URL(url); } catch (e) { return null; }
+    if (u.protocol !== "https:" || !u.hostname) { return null; }
+    const a = document.createElement("a");
+    a.href = u.href;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.referrerPolicy = "no-referrer";
+    a.textContent = url;
+    return a;
+  }
+
+  function textoConEnlaces(contenedor, texto) {
+    let ultimo = 0;
+    for (const m of texto.matchAll(URL_EN_TEXTO)) {
+      const url = m[0].replace(/[.,;:!?)\]»”’]+$/, "");
+      const enlace = crearEnlace(url);
+      if (!enlace) { continue; }
+      if (m.index > ultimo) { contenedor.appendChild(document.createTextNode(texto.slice(ultimo, m.index))); }
+      contenedor.appendChild(enlace);
+      ultimo = m.index + url.length;
+    }
+    if (ultimo < texto.length) { contenedor.appendChild(document.createTextNode(texto.slice(ultimo))); }
+  }
+
+  function horaChat() {
+    const f = new Date();
+    return dos(f.getHours()) + ":" + dos(f.getMinutes());
+  }
+
+  // de: "ella" | "yo" | "sistema" | "permiso". Devuelve { li, burbuja }.
+  function mensajeChat(de, texto, etiquetaCanal) {
+    const lista = $("rine-lista");
+    const vacio = $("rine-vacio");
+    if (vacio) { vacio.remove(); }
+    const cerca = lista.scrollHeight - lista.scrollTop - lista.clientHeight < 60;
+    const li = document.createElement("li");
+    li.className = "msg " + de;
+    const burbuja = document.createElement("div");
+    burbuja.className = "burbuja";
+    if (etiquetaCanal) {
+      const canal = document.createElement("span");
+      canal.className = "canal";
+      canal.textContent = etiquetaCanal;
+      burbuja.appendChild(canal);
+    }
+    if (de === "yo") {
+      burbuja.appendChild(document.createTextNode(texto));
+    } else if (texto) {
+      textoConEnlaces(burbuja, texto);
+    }
+    li.appendChild(burbuja);
+    const hora = document.createElement("time");
+    hora.textContent = horaChat();
+    li.appendChild(hora);
+    lista.appendChild(li);
+    while (lista.children.length > MAX_MENSAJES_CHAT) { lista.removeChild(lista.firstChild); }
+    if (cerca || de === "yo") { lista.scrollTop = lista.scrollHeight; }
+    if (!chat.abierto && de !== "yo") { chat.sinLeer += 1; actualizarInsignia(); }
+    return { li: li, burbuja: burbuja };
+  }
+
+  function enviarChat(objeto) {
+    const socket = chat.ws;
+    if (!socket || socket.readyState !== WebSocket.OPEN || !chat.conectado) { return false; }
+    try {
+      socket.send(JSON.stringify(objeto));
+    } catch (e) {
+      console.debug("No se pudo enviar por /escritorio:", e);
+      return false;
+    }
+    return true;
+  }
+
+  function confirmarDesdeChat(id, aprobado, pendiente) {
+    if (!ID_CONFIRMACION.test(id)) { return; }
+    if (!enviarChat({ tipo: "confirmacion", id: id, aprobado: aprobado === true })) {
+      mensajeChat("sistema", "Sin conexión con " + ui.nombreIA + ": no se envió la confirmación.");
+      return;
+    }
+    pendiente.botones.forEach((b) => { b.disabled = true; });
+    poner(pendiente.resolucion, aprobado ? "Enviado: aprobar…" : "Enviado: rechazar…");
+  }
+
+  // Al (re)conectar /escritorio (mensaje «hola»), las confirmaciones mostradas pasan a revisión con
+  // los botones bloqueados: si la instantánea que sigue al «hola» las trae como pendientes vuelven
+  // a estar vigentes; si no, se marcan como caducadas (se resolvieron mientras no había conexión).
+  function revisarPendientes() {
+    chat.pendientes.forEach((p, id) => {
+      p.botones.forEach((b) => { b.disabled = true; });
+      poner(p.resolucion, "Comprobando si sigue pendiente…");
+      chat.revision.set(id, p);
+    });
+    chat.pendientes.clear();
+  }
+
+  function cerrarRevision() {
+    if (chat.revision.size === 0) { return; }
+    chat.revision.forEach((p) => {
+      p.botones.forEach((b) => { b.disabled = true; });
+      poner(p.resolucion, "Ya no está pendiente.");
+    });
+    chat.revision.clear();
+  }
+
+  function revivirPendiente(id) {
+    const p = chat.revision.get(id);
+    chat.revision.delete(id);
+    chat.pendientes.set(id, p);
+    p.botones.forEach((b) => { b.disabled = !chat.conectado; });
+    poner(p.resolucion, p.botones.length ? "" : "Esta confirmación solo se responde en la terminal.");
+  }
+
+  function alPermisoChat(d) {
+    const id = cadena(d.id, 64);
+    if (d.pendiente === true) {
+      if (chat.pendientes.has(id)) { return; } // la instantánea de una reconexión no lo duplica
+      if (chat.revision.has(id)) { revivirPendiente(id); return; }
+      const m = mensajeChat("permiso", "");
+      const titulo = document.createElement("strong");
+      titulo.textContent = "⚠ Confirmación requerida" + (d.destructiva === true ? " · acción destructiva" : "");
+      m.burbuja.appendChild(titulo);
+      m.burbuja.appendChild(document.createTextNode("\n" + cadena(d.descripcion, 300)));
+      if (typeof d.vista_previa === "string" && d.vista_previa) {
+        const vista = document.createElement("span");
+        vista.className = "vista-previa";
+        vista.textContent = cadena(d.vista_previa, 500); // el borrador exacto, solo como texto
+        m.burbuja.appendChild(vista);
+      }
+      const resolucion = document.createElement("span");
+      resolucion.className = "resolucion";
+      const pendiente = { li: m.li, botones: [], resolucion: resolucion };
+      if (ID_CONFIRMACION.test(id)) {
+        const acciones = document.createElement("div");
+        acciones.className = "acciones";
+        const aprobar = document.createElement("button");
+        aprobar.type = "button";
+        aprobar.className = "aprobar";
+        aprobar.textContent = "Aprobar";
+        aprobar.addEventListener("click", () => confirmarDesdeChat(id, true, pendiente));
+        const rechazar = document.createElement("button");
+        rechazar.type = "button";
+        rechazar.className = "rechazar";
+        rechazar.textContent = "Rechazar";
+        rechazar.addEventListener("click", () => confirmarDesdeChat(id, false, pendiente));
+        acciones.appendChild(aprobar);
+        acciones.appendChild(rechazar);
+        m.burbuja.appendChild(acciones);
+        pendiente.botones = [aprobar, rechazar];
+        pendiente.botones.forEach((b) => { b.disabled = !chat.conectado; });
+      } else {
+        resolucion.textContent = "Esta confirmación solo se responde en la terminal.";
+      }
+      m.burbuja.appendChild(resolucion);
+      chat.pendientes.set(id, pendiente);
+      if (!chat.abierto) { abrirChat(true, false); } // una confirmación pendiente siempre se ve
+      return;
+    }
+    const pendiente = chat.pendientes.get(id) || chat.revision.get(id);
+    const texto = d.aprobado === true ? "Aprobada." : "No autorizada.";
+    if (pendiente) {
+      pendiente.botones.forEach((b) => { b.disabled = true; });
+      poner(pendiente.resolucion, texto);
+      chat.pendientes.delete(id);
+      chat.revision.delete(id);
+    } else if (id === "") {
+      [chat.pendientes, chat.revision].forEach((mapa) => {
+        mapa.forEach((p) => { p.botones.forEach((b) => { b.disabled = true; }); poner(p.resolucion, texto); });
+        mapa.clear();
+      });
+    }
+  }
+
+  // «No molestar» del usuario: el botón refleja SIEMPRE el estado que manda R.A.M.S. (mensaje
+  // no_molestar de /escritorio, también en la instantánea al conectar), no un estado local.
+  function pintarNoMolestar(motivoAutomatico) {
+    const boton = $("rine-no-molestar");
+    boton.setAttribute("aria-pressed", chat.noMolestar ? "true" : "false");
+    const auto = MOTIVOS_NO_MOLESTAR.get(motivoAutomatico);
+    boton.title = chat.noMolestar
+      ? "No molestar activado: no te busca por iniciativa propia. Pulsa para quitarlo"
+      : (auto ? "Ahora no te busca por " + auto + " (automático). Pulsa para activar el tuyo"
+        : "Pulsa para que no te busque por iniciativa propia");
+  }
+
+  function alNoMolestarChat(d) {
+    chat.noMolestar = d.usuario === true;
+    pintarNoMolestar(d.activo === true && !chat.noMolestar ? cadena(d.motivo, 24) : "");
+  }
+
+  function alTravesuras(d) {
+    // «Quieta» siempre se puede pulsar: además de apagar las travesuras, la esconde (§C1.12).
+    chat.travesurasActivas = d.activas === true;
+    const hasta = num(d.hasta_ts);
+    $("rine-quieta").title = chat.travesurasActivas
+      ? "Travesuras con el ratón activas: pídele que se quede quieta (y se esconde)"
+      : (hasta !== null ? "Travesuras apagadas hasta las " + horaCorta(hasta) + "; «Quieta» también la esconde"
+        : "Travesuras apagadas; «Quieta» también la esconde");
+  }
+
+  const MANEJADORES_CHAT = new Map([
+    ["hola", (d) => {
+      chat.conectado = true;
+      chat.espera = 1000;
+      const nombre = (typeof d.nombre_ia === "string" && d.nombre_ia) ? cadena(d.nombre_ia, 32) : ui.nombreIA;
+      poner($("rine-nombre"), nombre.toUpperCase());
+      estadoChat("en línea");
+      revisarPendientes();  // antes de habilitar: nada caducado vuelve a ser pulsable
+      habilitarChat(true);
+    }],
+    ["subtitulo", (d) => {
+      const texto = cadena(d.texto, 4000).trim();
+      if (!texto) { return; }
+      mensajeChat("ella", texto, d.canal === "telegram" ? "→ Telegram" : "");
+    }],
+    ["voz", (d) => {
+      poner($("rine-escribiendo"), d.hablando === true ? ui.nombreIA + " está hablando…" : "");
+    }],
+    ["permiso", alPermisoChat],
+    ["sistema", (d) => {
+      const texto = cadena(d.texto, 4000);
+      if (texto) { mensajeChat("sistema", texto); }
+    }],
+    ["travesuras", alTravesuras],
+    ["no_molestar", alNoMolestarChat]
+  ]);
+
+  function procesarChat(crudo) {
+    if (typeof crudo !== "string" || crudo.length > 65536) { return; }
+    let mensaje;
+    try { mensaje = JSON.parse(crudo); } catch (e) { return; }
+    if (!mensaje || typeof mensaje !== "object" || typeof mensaje.tipo !== "string") { return; }
+    // La instantánea llega justo tras el «hola» con el permiso vigente primero: el primer mensaje
+    // que no es «permiso» cierra la revisión (siempre llega «no_molestar», §C2.4).
+    if (mensaje.tipo !== "permiso" && mensaje.tipo !== "hola") { cerrarRevision(); }
+    const manejador = MANEJADORES_CHAT.get(mensaje.tipo);
+    if (!manejador) { return; } // «orden» y «estado» son solo para Amadeus Desktop
+    const datos = (mensaje.datos && typeof mensaje.datos === "object") ? mensaje.datos : {};
+    try { manejador(datos); } catch (e) { console.warn("Chat: error al procesar «" + mensaje.tipo + "»", e); }
+  }
+
+  function conectarChat() {
+    chat.temporizador = null;
+    if (!chat.token || ui.finalizado || chat.ws) { return; }
+    estadoChat("conectando…");
+    let socket;
+    try {
+      socket = new WebSocket(`ws://${location.host}/escritorio?t=${encodeURIComponent(chat.token)}`);
+    } catch (e) {
+      console.debug("No se pudo crear el WebSocket del chat:", e);
+      programarChat();
+      return;
+    }
+    chat.ws = socket;
+    socket.addEventListener("message", (ev) => { if (chat.ws === socket) { procesarChat(ev.data); } });
+    socket.addEventListener("close", () => {
+      if (chat.ws !== socket) { return; }
+      chat.ws = null;
+      chat.conectado = false;
+      habilitarChat(false);
+      poner($("rine-escribiendo"), "");
+      if (ui.finalizado) { estadoChat("llamada finalizada"); return; }
+      programarChat();
+    });
+  }
+
+  function programarChat() {
+    if (chat.temporizador !== null || ui.finalizado || !chat.token) { return; }
+    const ms = chat.espera;
+    chat.espera = Math.min(chat.espera * 2, 30000);
+    estadoChat("desconectado · reintento en " + Math.round(ms / 1000) + " s");
+    chat.temporizador = setTimeout(conectarChat, ms);
+  }
+
+  function cerrarChat(motivo) {
+    if (chat.temporizador !== null) { clearTimeout(chat.temporizador); chat.temporizador = null; }
+    const socket = chat.ws;
+    chat.ws = null;
+    chat.conectado = false;
+    habilitarChat(false);
+    if (socket) {
+      try { socket.close(1000, "fin"); } catch (e) { console.debug("Cierre del chat:", e); }
+    }
+    estadoChat(motivo);
+  }
+
+  // /ws volvió a saludar y NO envió «escritorio» justo después: R.A.M.S. corre sin chat
+  // (RAMS_HUD_CHAT=0 o /escritorio apagado). Se cierra el chat y se ocultan el lanzador y el panel.
+  function chatNoDisponible() {
+    if (!chat.disponible && !chat.token) { return; }
+    chat.disponible = false;
+    chat.token = null;
+    chat.abierto = false;
+    cerrarChat("chat no disponible");
+    $("rine").hidden = true;
+    $("rine-lanzador").hidden = true;
+    $("rine-lanzador").setAttribute("aria-expanded", "false");
+  }
+
+  // Mensaje «escritorio» de /ws: token propio de /escritorio (solo si RAMS_HUD_CHAT=1).
+  function alEscritorio(d) {
+    const token = (typeof d.token === "string" && TOKEN_VALIDO.test(d.token)) ? d.token : null;
+    if (!token || d.url !== "/escritorio") { return; }
+    if (!chat.disponible) {
+      chat.disponible = true; // ahora sí existe el chat: lanzador o panel según la preferencia
+      abrirChat(chat.preferenciaAbierto, false);
+    }
+    if (token === chat.token && (chat.ws || chat.temporizador !== null)) { return; }
+    if (token !== chat.token) {
+      chat.token = token; // R.A.M.S. se reinició: token nuevo
+      chat.espera = 1000;
+      const anterior = chat.ws;
+      chat.ws = null;
+      if (anterior) { try { anterior.close(1000, "token nuevo"); } catch (e) { console.debug("Cierre del chat:", e); } }
+      if (chat.temporizador !== null) { clearTimeout(chat.temporizador); chat.temporizador = null; }
+    }
+    conectarChat();
+  }
+
+  $("rine-lanzador").addEventListener("click", () => abrirChat(true, true));
+  $("rine-cerrar").addEventListener("click", () => abrirChat(false, true));
+  $("rine").addEventListener("keydown", (ev) => { if (ev.key === "Escape") { abrirChat(false, true); } });
+  $("rine-form").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    const entrada = $("rine-texto");
+    const texto = entrada.value.trim();
+    if (!texto) { return; }
+    if (texto.length > MAX_TEXTO_CHAT) {
+      mensajeChat("sistema", "El mensaje es demasiado largo (máximo " + MAX_TEXTO_CHAT + " caracteres).");
+      return;
+    }
+    if (!enviarChat({ tipo: "chat", texto: texto })) {
+      mensajeChat("sistema", "Sin conexión con " + ui.nombreIA + ": el mensaje no se envió.");
+      return;
+    }
+    mensajeChat("yo", texto);
+    entrada.value = "";
+    const boton = $("rine-enviar");
+    boton.disabled = true; // el servidor admite 5 mensajes/s
+    setTimeout(() => { boton.disabled = !chat.conectado; }, 250);
+  });
+  $("rine-no-molestar").addEventListener("click", () => {
+    // Se invierte el estado REAL (el último no_molestar de R.A.M.S.). El aviso de texto lo manda
+    // R.A.M.S. por «sistema» a todos los chats; aquí solo se adelanta el aria-pressed, que el
+    // siguiente mensaje no_molestar confirma (main aplica on/off siempre, §C2.14.9).
+    const activar = !chat.noMolestar;
+    if (!enviarChat({ tipo: "control", accion: activar ? "no_molestar_on" : "no_molestar_off" })) {
+      mensajeChat("sistema", "Sin conexión con " + ui.nombreIA + ": no se cambió «No molestar».");
+      return;
+    }
+    chat.noMolestar = activar;
+    pintarNoMolestar("");
+  });
+  $("rine-quieta").addEventListener("click", () => {
+    if (enviarChat({ tipo: "control", accion: "basta_travesuras" })) {
+      mensajeChat("sistema", "Le pediste que se quede quieta: deja el ratón y se esconde.");
+    }
+  });
+  $("rine-vision").addEventListener("click", () => {
+    if (enviarChat({ tipo: "control", accion: "pausar_vision" })) {
+      mensajeChat("sistema", "Visión en pausa: la cámara se cierra.");
+    }
+  });
+  (function restaurarChat() {
+    // Solo se recuerda la preferencia: lanzador y panel siguen ocultos hasta que /ws mande el
+    // mensaje «escritorio» (sin RAMS_HUD_CHAT=1 nunca aparecen, §C1.5).
+    try { chat.preferenciaAbierto = localStorage.getItem("amadeus.rine.abierto") === "1"; } catch (e) {
+      chat.preferenciaAbierto = false;
+    }
+    pintarNoMolestar("");
+  })();
+
   const MANEJADORES = new Map([
     ["hola", alHola], ["estado", alEstado], ["linea_mundo", alLineaMundo], ["telemetria", alTelemetria],
     ["subtitulo", alSubtitulo], ["voz", alVoz], ["boca", alBoca], ["camara", alCamara],
     ["presencia", alPresencia], ["modulo", alModulo], ["apagado", alApagado], ["llamada", alLlamada],
-    ["consolidacion", alConsolidacion], ["permiso", alPermiso], ["log", alLog], ["control_ack", alControlAck]
+    ["consolidacion", alConsolidacion], ["permiso", alPermiso], ["log", alLog], ["control_ack", alControlAck],
+    ["vision", alVision], ["pantalla", alPantalla], ["accion", alAccion], ["escritorio", alEscritorio]
   ]);
 
   // Tras «apagado» se siguen mostrando subtítulos, voz, registro, etc. (la despedida), pero no
   // lo que reabriría la llamada ni un segundo «apagado» (p. ej. el de hud.cerrar()).
-  const IGNORADOS_TRAS_FIN = new Set(["hola", "apagado", "control_ack"]);
+  const IGNORADOS_TRAS_FIN = new Set(["hola", "apagado", "control_ack", "escritorio"]);
 
   function procesar(crudo) {
     if (typeof crudo !== "string" || crudo.length > 262144) { return; }
     let mensaje;
     try { mensaje = JSON.parse(crudo); } catch (e) { return; }
     if (!mensaje || typeof mensaje !== "object" || typeof mensaje.tipo !== "string") { return; }
+    // R.A.M.S. manda «escritorio» justo DESPUÉS del «hola» de /ws si el chat existe (§C2.4.6):
+    // si el mensaje siguiente al «hola» es otro, esta instancia corre sin chat.
+    if (chat.esperandoEscritorio) {
+      chat.esperandoEscritorio = false;
+      if (mensaje.tipo !== "escritorio") { chatNoDisponible(); }
+    }
     const manejador = MANEJADORES.get(mensaje.tipo);
     if (!manejador) { return; } // tipo desconocido: se ignora
     if (ui.finalizado && IGNORADOS_TRAS_FIN.has(mensaje.tipo)) { return; }
     const datos = (mensaje.datos && typeof mensaje.datos === "object") ? mensaje.datos : {};
     try { manejador(datos); } catch (e) { console.warn("HUD: error al procesar «" + mensaje.tipo + "»", e); }
+    if (mensaje.tipo === "hola") { chat.esperandoEscritorio = true; }
   }
 
   // ------------------------------------------------------------------
@@ -1307,6 +1966,7 @@
       if (ws !== socket) { return; }
       ws = null;
       ui.conectado = false;
+      chat.esperandoEscritorio = false; // se decide con el «hola» de la próxima conexión
       if (ui.finalizado) {
         // El servidor cerró tras la despedida: se apaga la onda y no se reconecta.
         if (temporizadorCierreFinal !== null) { clearTimeout(temporizadorCierreFinal); temporizadorCierreFinal = null; }

@@ -2,17 +2,24 @@
 
 Sin red ni audio: ``httpx.MockTransport`` simula Telegram y ElevenLabs, el avatar y la memoria
 son falsos (la memoria implementa todo ``RegistroLlamadas``), ``imprimir`` se captura y el
-reproductor de audio se sustituye por uno en memoria. Sin pytest-asyncio: ``asyncio.run``.
+reproductor de audio se sustituye por uno en memoria. edge-tts se sustituye por un falso que
+entrega un MP3 real escrito con soundfile (camino sin ffmpeg). Sin pytest-asyncio: ``asyncio.run``.
 """
 
 from __future__ import annotations
 
 import array
 import asyncio
+import io
 import json
 import logging
 import math
-from collections.abc import Callable
+import subprocess
+import sys
+import threading
+import time
+import types
+from collections.abc import AsyncIterator, Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -1333,3 +1340,713 @@ def test_iniciar_cabe_en_el_tope_de_main(tmp_path: Path, monkeypatch: pytest.Mon
         assert diags["voz"].estado.value == "OK" and diags["voz"].detalle == "ElevenLabs"
         assert diags["telegram"].estado.value == "SIN CONEXIÓN"
         assert diags["telegram"].detalle == "sin respuesta en 0.3 s"
+
+
+# ---------------------------------------------------------------------------
+# Voz: edge-tts sin ffmpeg, decodificado con soundfile (Windows: soundfile + sounddevice)
+# ---------------------------------------------------------------------------
+
+
+def _settings_solo_edge(tmp_path: Path) -> Settings:
+    """En línea, sin ElevenLabs ni Telegram: la única voz posible es edge-tts (voz por defecto)."""
+    return cargar_settings(entorno=_entorno_base(tmp_path), offline=False, base_dir=RAIZ)
+
+
+def _mp3_senoide(segundos: float = 1.0, sr: int = 24000, canales: int = 1) -> bytes:
+    """MP3 real (MPEG Layer III) escrito en memoria por soundfile; sin red ni edge-tts."""
+    sf = pytest.importorskip("soundfile")
+    np_ = pytest.importorskip("numpy")
+    t = np_.arange(int(segundos * sr)) / sr
+    senal = 0.4 * np_.sin(2 * np_.pi * 220 * t)
+    if canales > 1:
+        senal = np_.stack([senal * (1.0 - 0.3 * c) for c in range(canales)], axis=1)
+    buf = io.BytesIO()
+    sf.write(buf, senal.astype(np_.float32), sr, format="MP3")
+    return buf.getvalue()
+
+
+def _edge_falso(monkeypatch: pytest.MonkeyPatch, mp3: bytes) -> list[dict[str, str]]:
+    """``edge_tts`` falso: ``Communicate(...).stream()`` entrega ``mp3`` en trozos (nunca sale a la red)."""
+    llamadas: list[dict[str, str]] = []
+
+    class Communicate:
+        def __init__(self, texto: str, voz: str, *, rate: str = "+0%", pitch: str = "+0Hz") -> None:
+            llamadas.append({"texto": texto, "voz": voz, "rate": rate, "pitch": pitch})
+
+        async def stream(self) -> AsyncIterator[dict[str, Any]]:
+            for inicio in range(0, len(mp3), 700):
+                yield {"type": "audio", "data": mp3[inicio:inicio + 700]}
+            yield {"type": "WordBoundary", "offset": 0, "text": "fin"}
+
+    monkeypatch.setattr(riko_mod, "edge_tts", types.SimpleNamespace(Communicate=Communicate))
+    return llamadas
+
+
+def _audio_edge(monkeypatch: pytest.MonkeyPatch, *, soundfile: bool,
+                mp3_argv: list[str] | None = None, ffmpeg: bool = False) -> ReproductorFalso:
+    """Reproductor PCM falso; soundfile «instalado» o no; mpv/ffplay y ffmpeg opcionales (falsos)."""
+    reproductor = _audio_falso(monkeypatch)
+    monkeypatch.setattr(riko_mod, "SOUNDFILE_INSTALADO", soundfile)
+    if mp3_argv is not None:
+        monkeypatch.setattr(riko_mod, "_argv_reproductor_mp3", lambda: list(mp3_argv))
+    if ffmpeg:
+        monkeypatch.setattr(riko_mod.shutil, "which",
+                            lambda nombre, *a, **k: "/usr/bin/ffmpeg" if nombre == "ffmpeg" else None)
+    return reproductor
+
+
+def _espiar_soundfile(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Anota el hilo de cada decodificación con soundfile (debe ser el executor ``rams-audio``)."""
+    hilos: list[str] = []
+    original = riko_mod._mp3_a_pcm_soundfile
+
+    def espia(mp3: bytes) -> tuple[bytes, int]:
+        hilos.append(threading.current_thread().name)
+        return original(mp3)
+
+    monkeypatch.setattr(riko_mod, "_mp3_a_pcm_soundfile", espia)
+    return hilos
+
+
+def _espiar_mp3(monkeypatch: pytest.MonkeyPatch, riko: RikoMeguminIO) -> list[bytes]:
+    """Sustituye la reproducción por mpv/ffplay (nunca lanza procesos ni suena)."""
+    reproducidos: list[bytes] = []
+
+    async def reproducir_mp3(mp3: bytes, palabras: int, *,
+                             al_empezar: Callable[[], None] | None = None) -> float:
+        reproducidos.append(mp3)
+        if al_empezar is not None:
+            al_empezar()
+        return 0.8
+
+    monkeypatch.setattr(riko, "_reproducir_mp3", reproducir_mp3)
+    return reproducidos
+
+
+def _rms_s16(pcm: bytes) -> float:
+    muestras = array.array("h", pcm)
+    if sys.byteorder == "big":
+        muestras.byteswap()
+    return math.sqrt(sum(m * m for m in muestras) / max(1, len(muestras)))
+
+
+def test_soundfile_se_detecta_sin_importarlo() -> None:
+    """Cargar el módulo no importa soundfile (ni sounddevice): solo ``find_spec``."""
+    codigo = ("import sys, lobes.riko_megumin_io as r; "
+              "print(r.SOUNDFILE_INSTALADO, 'soundfile' in sys.modules, 'sounddevice' in sys.modules)")
+    salida = subprocess.run([sys.executable, "-c", codigo], cwd=str(RAIZ), capture_output=True,
+                            text=True, timeout=120, check=True).stdout.split()
+    assert salida[1:] == ["False", "False"]
+    assert salida[0] in ("True", "False")
+
+
+def test_mp3_a_pcm_soundfile_y_bloques() -> None:
+    """Decodifica un MP3 estéreo real a s16le mono y lo trocea en bloques de 100 ms."""
+    mp3 = _mp3_senoide(0.5, canales=2)
+    pcm, sr = riko_mod._mp3_a_pcm_soundfile(mp3)
+    assert sr == 24000
+    assert abs(len(pcm) / (2 * sr) - 0.5) < 0.05              # mono: 2 bytes por muestra
+    assert _rms_s16(pcm) > 4000                               # audio real, no silencio ni basura
+
+    async def trocear() -> list[bytes]:
+        return [b async for b in riko_mod._bloques_pcm(pcm, sr)]
+
+    bloques = asyncio.run(trocear())
+    assert b"".join(bloques) == pcm
+    assert all(len(b) == 4800 for b in bloques[:-1]) and 0 < len(bloques[-1]) <= 4800
+
+
+def test_edge_sin_ffmpeg_suena_con_soundfile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin ffmpeg ni mpv/ffplay pero con soundfile: Salome suena por el reproductor PCM con lip-sync."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    mp3 = _mp3_senoide(1.0)
+    llamadas = _edge_falso(monkeypatch, mp3)
+    hilos = _espiar_soundfile(monkeypatch)
+    avatar = AvatarFalso()
+    memoria = MemoriaFalsa()
+    bus, eventos = _bus_con_eventos()
+    riko, captura = _crear(_settings_solo_edge(tmp_path), bus=bus, avatar=avatar, memoria=memoria)
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].estado.value == "DEGRADADO"
+        assert diagnosticos["voz"].detalle == "edge-tts es-CO-SalomeNeural · soundfile + falso"
+        assert riko.voz_disponible is True
+        await riko.decir(_reply("Hola, soy Amadeus."), origen="sistema", canal="voz")
+        assert await riko.vaciar(10.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert captura.textos == ["Hola, soy Amadeus."]
+    assert [ll["voz"] for ll in llamadas] == ["es-CO-SalomeNeural"]
+    assert hilos and all(h.startswith("rams-audio") for h in hilos)   # nunca en el event loop
+    assert reproductor.sr == 24000 and reproductor.cerrado and not reproductor.abortado
+    assert abs(len(reproductor.datos) / (2 * 24000) - 1.0) < 0.05     # duración del MP3: 1 s
+    assert _rms_s16(bytes(reproductor.datos)) > 4000                  # PCM int16 de verdad
+    assert avatar.bocas and max(avatar.bocas) > 0.2 and avatar.cierres >= 1
+    assert any(e.nombre == "voz.nivel_boca" and e.datos["valor"] > 0 for e in eventos)
+    fin = next(e.datos for e in eventos if e.nombre == "voz.fin")
+    assert fin["motor"] == "edge" and fin["duracion_s"] > 0.8
+    assert memoria.turnos[0]["canal"] == "voz"
+
+
+def test_diagnostico_windows_soundfile_y_sounddevice(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    _audio_edge(monkeypatch, soundfile=True)
+    monkeypatch.setattr(riko_mod, "_detectar_reproductor_pcm", lambda excluir=frozenset(): "sounddevice")
+    _edge_falso(monkeypatch, b"")
+    riko, _ = _crear(_settings_solo_edge(tmp_path))
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].estado.value == "DEGRADADO"
+        assert diagnosticos["voz"].detalle == "edge-tts es-CO-SalomeNeural · soundfile + sounddevice"
+        assert riko.voz_disponible is True
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+
+
+def test_edge_sin_soundfile_ni_ffmpeg_ni_mpv_sigue_en_texto(tmp_path: Path,
+                                                            monkeypatch: pytest.MonkeyPatch) -> None:
+    """Comportamiento anterior: sin decodificador ni mpv/ffplay, edge-tts no suena y el texto sigue."""
+    reproductor = _audio_edge(monkeypatch, soundfile=False)
+    llamadas = _edge_falso(monkeypatch, _mp3_senoide(0.3))
+    memoria = MemoriaFalsa()
+    riko, captura = _crear(_settings_solo_edge(tmp_path), memoria=memoria)
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].estado.value == "DEGRADADO"
+        assert diagnosticos["voz"].detalle == "edge-tts necesita soundfile, ffmpeg, mpv o ffplay"
+        assert riko.voz_disponible is False
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola.")) is None
+        await riko.decir(_reply("Solo texto."), origen="sistema", canal="voz")
+        assert await riko.vaciar(5.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert captura.textos == ["Solo texto."]
+    assert llamadas == [] and not reproductor.datos
+    assert memoria.turnos[0]["canal"] == "terminal"
+
+
+def test_edge_sin_soundfile_usa_mpv_como_antes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=False, mp3_argv=["/usr/bin/mpv", "-"])
+    mp3 = _mp3_senoide(0.3)
+    _edge_falso(monkeypatch, mp3)
+    riko, _ = _crear(_settings_solo_edge(tmp_path))
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].detalle == "edge-tts es-CO-SalomeNeural · mpv"
+        assert riko.voz_disponible is True
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola.")) == 0.8
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert reproducidos == [mp3] and not reproductor.datos
+
+
+def test_edge_prefiere_soundfile_a_mpv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=True, mp3_argv=["C:/mpv/mpv.EXE", "-"])
+    _edge_falso(monkeypatch, _mp3_senoide(0.4))
+    hilos = _espiar_soundfile(monkeypatch)
+    riko, _ = _crear(_settings_solo_edge(tmp_path))
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> float | None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].detalle == "edge-tts es-CO-SalomeNeural · soundfile + falso"
+        duracion = await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola."))
+        await riko.cerrar()
+        return duracion
+
+    duracion = asyncio.run(escenario())
+    assert duracion is not None and abs(duracion - 0.4) < 0.05
+    assert len(hilos) == 1 and reproducidos == [] and reproductor.datos
+
+
+def test_edge_prefiere_ffmpeg_en_streaming(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=True, mp3_argv=["/usr/bin/mpv", "-"], ffmpeg=True)
+    _edge_falso(monkeypatch, _mp3_senoide(0.3))
+    hilos = _espiar_soundfile(monkeypatch)
+    riko, _ = _crear(_settings_solo_edge(tmp_path))
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+    consumido = bytearray()
+
+    async def decodificar_ffmpeg(fuente: AsyncIterator[bytes]) -> AsyncIterator[bytes]:
+        async for parte in fuente:            # el MP3 llega en streaming, sin esperar al final
+            consumido.extend(parte)
+        yield _pcm_senoide(0.3)
+
+    monkeypatch.setattr(riko, "_decodificar_mp3", decodificar_ffmpeg)
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].detalle == "edge-tts es-CO-SalomeNeural · ffmpeg + falso"
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola."))
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert consumido and hilos == [] and reproducidos == []
+    assert bytes(reproductor.datos) == _pcm_senoide(0.3)
+
+
+def _subtitulos(eventos: list[Evento]) -> list[tuple[str, str]]:
+    return [(e.datos["texto"], e.datos["canal"]) for e in eventos if e.nombre == "salida.subtitulo"]
+
+
+def _detalles_voz(eventos: list[Evento]) -> list[str]:
+    return [e.datos["detalle"] for e in eventos
+            if e.nombre == "sistema.modulo" and e.datos["clave"] == "voz"]
+
+
+def _sin_mp3_en_libsndfile(monkeypatch: pytest.MonkeyPatch) -> None:
+    """libsndfile anterior a 1.1 (la del sistema, sin wheel con librería): carga, pero no lee MP3."""
+    sf = pytest.importorskip("soundfile")
+    formatos = {k: v for k, v in sf.available_formats().items() if k != "MP3"}
+    monkeypatch.setattr(sf, "available_formats", lambda: dict(formatos))
+
+    def leer_sin_mp3(*_a: Any, **_k: Any) -> Any:
+        raise sf.LibsndfileError(1, prefix="Error opening <_io.BytesIO>: ")   # formato no reconocido
+
+    monkeypatch.setattr(sf, "read", leer_sin_mp3)
+
+
+def _edge_lento(monkeypatch: pytest.MonkeyPatch, mp3: bytes, orden: list[str], *,
+                espera: float | dict[str, float] = 0.2) -> None:
+    """``edge_tts`` falso que tarda ``espera`` s (por texto, si es un dict) en entregar el MP3.
+
+    Anota en ``orden`` el inicio (``edge:texto``), el final (``edge_fin:texto``) y la cancelación
+    (``edge_cancelado:texto``) de cada síntesis. Nunca sale a la red.
+    """
+
+    class Communicate:
+        def __init__(self, texto: str, voz: str, **_: str) -> None:
+            self.texto = texto
+
+        async def stream(self) -> AsyncIterator[dict[str, Any]]:
+            orden.append(f"edge:{self.texto}")
+            try:
+                await asyncio.sleep(espera.get(self.texto, 0.0) if isinstance(espera, dict) else espera)
+                for inicio in range(0, len(mp3), 700):
+                    await asyncio.sleep(0)
+                    yield {"type": "audio", "data": mp3[inicio:inicio + 700]}
+            except (asyncio.CancelledError, GeneratorExit):
+                orden.append(f"edge_cancelado:{self.texto}")
+                raise
+            orden.append(f"edge_fin:{self.texto}")
+
+    monkeypatch.setattr(riko_mod, "edge_tts", types.SimpleNamespace(Communicate=Communicate))
+
+
+def _anotar_reproductor(reproductor: ReproductorFalso, orden: list[str]) -> None:
+    """Anota en ``orden`` cuándo se abre (empieza a sonar), se cierra y se aborta el reproductor."""
+    abrir, cerrar, abortar = reproductor.abrir, reproductor.cerrar, reproductor.abortar
+
+    async def abrir_anotado(sr: int) -> None:
+        orden.append("abrir")
+        await abrir(sr)
+
+    async def cerrar_anotado() -> None:
+        orden.append("cerrar")
+        await cerrar()
+
+    async def abortar_anotado() -> None:
+        orden.append("abortar")
+        await abortar()
+
+    reproductor.abrir = abrir_anotado          # type: ignore[method-assign]
+    reproductor.cerrar = cerrar_anotado        # type: ignore[method-assign]
+    reproductor.abortar = abortar_anotado      # type: ignore[method-assign]
+
+
+def _anotar_subtitulos(bus: BusEventos, orden: list[str]) -> None:
+    bus.suscribir("salida.subtitulo",
+                  lambda e: orden.append(f"sub:{e.datos['canal']}:{e.datos['texto']}"))
+
+
+def _dos_segmentos() -> BrocaReply:
+    return BrocaReply(segmentos=(
+        Segmento(Etiquetas("seria", "brazos_cruzados", "analitico"), "Hola."),
+        Segmento(Etiquetas("sonrojo_tsundere", "mirar_a_otro_lado", "nervioso"), "Soy Amadeus."),
+    ))
+
+
+# --- Sincronía de los subtítulos de voz con el audio (labios del visor de VTuber AI Studio) ---
+
+
+def test_subtitulo_de_voz_sale_cuando_empieza_el_audio_y_se_anticipa_el_mp3(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Con soundfile, el subtítulo «voz» de cada segmento sale al abrir el reproductor, nunca antes
+    de tener el MP3 completo; y el MP3 del segundo segmento se descarga mientras suena el primero."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    orden: list[str] = []
+    _anotar_reproductor(reproductor, orden)
+    _edge_lento(monkeypatch, _mp3_senoide(0.4), orden, espera=0.2)
+    bus, eventos = _bus_con_eventos()
+    _anotar_subtitulos(bus, orden)
+    memoria = MemoriaFalsa()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus, memoria=memoria)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        await riko.decir(_dos_segmentos(), origen="sistema", canal="voz")
+        assert await riko.vaciar(10.0)
+        assert riko._mp3_anticipados == {}
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    sin_edge = [o for o in orden if not o.startswith("edge")]
+    assert sin_edge == ["abrir", "sub:voz:Hola.", "cerrar", "abrir", "sub:voz:Soy Amadeus.", "cerrar"]
+    assert orden.index("edge_fin:Hola.") < orden.index("abrir")      # el MP3 entero antes de sonar
+    # Anticipación: una sola síntesis por segmento y la segunda empieza mientras suena la primera.
+    assert orden.count("edge:Hola.") == 1 and orden.count("edge:Soy Amadeus.") == 1
+    assert orden.index("sub:voz:Hola.") < orden.index("edge:Soy Amadeus.") < orden.index("cerrar")
+    assert not any(o.startswith("edge_cancelado") for o in orden)
+    assert memoria.turnos[0]["canal"] == "voz"
+
+
+def test_subtitulo_elevenlabs_sale_al_abrir_el_reproductor(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_falso(monkeypatch)
+    orden: list[str] = []
+    _anotar_reproductor(reproductor, orden)
+    bus, _ = _bus_con_eventos()
+    _anotar_subtitulos(bus, orden)
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte, bus=bus)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        await riko.decir(_dos_segmentos(), origen="sistema", canal="voz")
+        assert await riko.vaciar(10.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert orden == ["abrir", "sub:voz:Hola.", "cerrar", "abrir", "sub:voz:Soy Amadeus.", "cerrar"]
+    assert len(transporte.eleven("/stream")) == 2
+
+
+def test_subtitulo_con_mpv_sale_al_lanzar_el_reproductor(tmp_path: Path,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    _audio_edge(monkeypatch, soundfile=False, mp3_argv=["/usr/bin/mpv", "-"])
+    orden: list[str] = []
+    _edge_lento(monkeypatch, _mp3_senoide(0.3), orden, espera=0.1)
+    bus, _ = _bus_con_eventos()
+    _anotar_subtitulos(bus, orden)
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus)
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        await riko.decir(_reply("Hola."), origen="sistema", canal="voz")
+        assert await riko.vaciar(5.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert len(reproducidos) == 1
+    assert orden == ["edge:Hola.", "edge_fin:Hola.", "sub:voz:Hola."]
+
+
+def test_silenciar_durante_la_descarga_corta_sin_esperar_a_edge(tmp_path: Path,
+                                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un corte mientras llega el MP3 se atiende enseguida (no al terminar la síntesis) y el subtítulo
+    sale con canal «voz»: fue un corte, no una voz que faltó, así que el visor no habla por su cuenta."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    orden: list[str] = []
+    _edge_lento(monkeypatch, _mp3_senoide(0.3), orden, espera=5.0)
+    bus, eventos = _bus_con_eventos()
+    riko, captura = _crear(_settings_solo_edge(tmp_path), bus=bus)
+
+    async def escenario() -> float:
+        await riko.iniciar()
+        await riko.decir(_reply("Hola."), origen="sistema", canal="voz")
+        entrega = asyncio.create_task(riko.vaciar(10.0))
+        await asyncio.sleep(0.3)
+        riko.set_silencio(True)
+        t0 = time.monotonic()
+        assert await entrega
+        espera = time.monotonic() - t0
+        await riko.cerrar()
+        return espera
+
+    espera = asyncio.run(escenario())
+    assert espera < 1.0
+    assert "edge_cancelado:Hola." in orden and not reproductor.datos
+    assert captura.textos == ["Hola."]
+    assert _subtitulos(eventos) == [("Hola.", "voz")]
+
+
+def test_corte_cancela_la_descarga_anticipada(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    orden: list[str] = []
+    _anotar_reproductor(reproductor, orden)
+    _edge_lento(monkeypatch, _mp3_senoide(0.6), orden, espera={"Hola.": 0.0, "Soy Amadeus.": 5.0})
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus)
+
+    def silenciar_con_la_boca_abierta(evento: Evento) -> None:   # ya suena el primer segmento
+        if evento.datos["valor"] > 0:
+            riko.set_silencio(True)
+
+    bus.suscribir("voz.nivel_boca", silenciar_con_la_boca_abierta)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        await riko.decir(_dos_segmentos(), origen="sistema", canal="voz")
+        assert await riko.vaciar(10.0)
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert riko._mp3_anticipados == {}
+        assert "edge_cancelado:Soy Amadeus." in orden       # cancelada al acabar la utterance
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert orden.index("abrir") < orden.index("edge:Soy Amadeus.") < orden.index("abortar")
+    assert orden.count("abrir") == 1                          # el segundo segmento no suena
+    assert _subtitulos(eventos) == [("Hola.", "voz"), ("Soy Amadeus.", "voz")]
+
+
+def test_silencio_antes_de_empezar_no_anticipa_nada(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """Si la voz se corta justo al empezar, no se descarga el MP3 siguiente para nada."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    orden: list[str] = []
+    _anotar_reproductor(reproductor, orden)
+    _edge_lento(monkeypatch, _mp3_senoide(0.3), orden, espera=0.0)
+    bus, _ = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus)
+    bus.suscribir("salida.subtitulo", lambda e: riko.set_silencio(True))
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        await riko.decir(_dos_segmentos(), origen="sistema", canal="voz")
+        assert await riko.vaciar(10.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert "edge:Soy Amadeus." not in orden and orden.count("abrir") == 1
+
+
+# --- soundfile que no sirve: se descarta (iniciar, primera frase o fallos seguidos) ---
+
+
+def test_edge_soundfile_que_no_carga_se_descarta_al_iniciar(tmp_path: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """soundfile «instalado» pero roto: iniciar lo descarta y el diagnóstico ya dice ffplay."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True, mp3_argv=["/usr/bin/ffplay", "-"])
+    mp3 = _mp3_senoide(0.3)
+    llamadas = _edge_falso(monkeypatch, mp3)
+    monkeypatch.setitem(sys.modules, "soundfile", None)      # «import soundfile» → ImportError
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus)
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].detalle == "edge-tts es-CO-SalomeNeural · ffplay"
+        assert riko._soundfile is False and riko.voz_disponible is True
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola.")) == 0.8
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert len(llamadas) == 1 and reproducidos == [mp3] and not reproductor.datos
+    assert _detalles_voz(eventos) == ["edge-tts es-CO-SalomeNeural · ffplay"]
+
+
+def test_edge_soundfile_que_deja_de_cargar_cae_a_mpv(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """Si soundfile falla después de iniciar, el mismo MP3 va por ffplay sin volver a sintetizar."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True, mp3_argv=["/usr/bin/ffplay", "-"])
+    mp3 = _mp3_senoide(0.3)
+    llamadas = _edge_falso(monkeypatch, mp3)
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus)
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        assert riko._soundfile is True
+        monkeypatch.setitem(sys.modules, "soundfile", None)
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola.")) == 0.8
+        assert riko._soundfile is False and riko.voz_disponible is True
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert len(llamadas) == 1 and reproducidos == [mp3] and not reproductor.datos
+    assert _detalles_voz(eventos) == ["edge-tts es-CO-SalomeNeural · soundfile + falso",
+                                      "edge-tts es-CO-SalomeNeural · ffplay"]
+
+
+def test_libsndfile_sin_mp3_se_descarta_al_iniciar(tmp_path: Path,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    """libsndfile < 1.1 sin mpv/ffplay: no hay voz desde el arranque, no se sintetiza nada para nada
+    y los subtítulos salen por «terminal» (el visor 3D puede leerlos con la voz del navegador)."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    _sin_mp3_en_libsndfile(monkeypatch)
+    llamadas = _edge_falso(monkeypatch, _mp3_senoide(0.3))
+    memoria = MemoriaFalsa()
+    bus, eventos = _bus_con_eventos()
+    riko, captura = _crear(_settings_solo_edge(tmp_path), bus=bus, memoria=memoria)
+
+    async def escenario() -> None:
+        diagnosticos = {d.clave: d for d in await riko.iniciar()}
+        assert diagnosticos["voz"].detalle == "edge-tts necesita soundfile, ffmpeg, mpv o ffplay"
+        assert riko._soundfile is False and riko.voz_disponible is False
+        for i in range(3):
+            await riko.decir(_reply(f"Frase {i}."), origen="sistema", canal="voz")
+            assert await riko.vaciar(5.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert llamadas == [] and not reproductor.datos
+    assert captura.textos == ["Frase 0.", "Frase 1.", "Frase 2."]
+    assert [c for _, c in _subtitulos(eventos)] == ["terminal"] * 3
+    assert [t["canal"] for t in memoria.turnos] == ["terminal"] * 3
+    assert _detalles_voz(eventos) == ["edge-tts necesita soundfile, ffmpeg, mpv o ffplay"]
+
+
+def test_libsndfile_sin_mp3_descubierta_en_la_primera_frase(tmp_path: Path,
+                                                           monkeypatch: pytest.MonkeyPatch) -> None:
+    """La comprobación de iniciar no llega a tiempo (sin alargar iniciar): la primera decodificación
+    la repite, descarta soundfile y esa frase sale por «terminal»; la siguiente ni se sintetiza."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    _sin_mp3_en_libsndfile(monkeypatch)
+    monkeypatch.setattr(riko_mod, "TIMEOUT_VALIDAR_SOUNDFILE_S", 0.05)
+    cargas: list[str] = []
+    original = riko_mod._soundfile_con_mp3
+
+    def carga(*_a: Any) -> Any:
+        cargas.append(threading.current_thread().name)
+        if len(cargas) == 1:
+            time.sleep(1.0)              # libsndfile en frío, más lento que el tope de iniciar
+        return original()
+
+    monkeypatch.setattr(riko_mod, "_soundfile_con_mp3", carga)
+    llamadas = _edge_falso(monkeypatch, _mp3_senoide(0.3))
+    memoria = MemoriaFalsa()
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus, memoria=memoria)
+
+    async def escenario() -> float:
+        t0 = time.monotonic()
+        await riko.iniciar()
+        duracion_iniciar = time.monotonic() - t0
+        assert riko._soundfile is True and riko.voz_disponible is True
+        for i in range(2):
+            await riko.decir(_reply(f"Frase {i}."), origen="sistema", canal="voz")
+            assert await riko.vaciar(10.0)
+        assert riko._soundfile is False and riko.voz_disponible is False
+        await riko.cerrar()
+        return duracion_iniciar
+
+    assert asyncio.run(escenario()) < 0.8
+    assert len(cargas) == 2 and all(h.startswith("rams-audio") for h in cargas)
+    assert len(llamadas) == 1 and not reproductor.datos
+    assert _subtitulos(eventos) == [("Frase 0.", "terminal"), ("Frase 1.", "terminal")]
+    assert [t["canal"] for t in memoria.turnos] == ["terminal", "terminal"]
+    assert _detalles_voz(eventos) == ["edge-tts es-CO-SalomeNeural · soundfile + falso",
+                                      "edge-tts necesita soundfile, ffmpeg, mpv o ffplay"]
+
+
+def test_soundfile_que_nunca_decodifica_se_descarta(tmp_path: Path,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    """libsndfile dice que lee MP3 pero cada lectura falla: tras MAX_FALLOS_SOUNDFILE seguidas se
+    descarta y deja de sintetizarse para nada."""
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    sf = pytest.importorskip("soundfile")
+
+    def leer_roto(*_a: Any, **_k: Any) -> Any:
+        raise sf.LibsndfileError(1, prefix="Error opening <_io.BytesIO>: ")
+
+    monkeypatch.setattr(sf, "read", leer_roto)
+    llamadas = _edge_falso(monkeypatch, _mp3_senoide(0.3))
+    memoria = MemoriaFalsa()
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus, memoria=memoria)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        assert riko.voz_disponible is True
+        for i in range(5):
+            await riko.decir(_reply(f"Frase {i}."), origen="sistema", canal="voz")
+            assert await riko.vaciar(5.0)
+        assert riko._soundfile is False and riko.voz_disponible is False
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert len(llamadas) == riko_mod.MAX_FALLOS_SOUNDFILE and not reproductor.datos
+    assert [c for _, c in _subtitulos(eventos)] == ["terminal"] * 5
+    assert [t["canal"] for t in memoria.turnos] == ["terminal"] * 5
+    assert _detalles_voz(eventos)[-1] == "edge-tts necesita soundfile, ffmpeg, mpv o ffplay"
+
+
+def test_mp3_ilegible_para_soundfile_va_por_mpv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=True, mp3_argv=["/usr/bin/mpv", "-"])
+    sf = pytest.importorskip("soundfile")
+    mp3 = _mp3_senoide(0.3)
+
+    def leer_roto(*_a: Any, **_k: Any) -> Any:
+        raise sf.LibsndfileError(1, prefix="Error opening <_io.BytesIO>: ")
+
+    monkeypatch.setattr(sf, "read", leer_roto)
+    llamadas = _edge_falso(monkeypatch, mp3)
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_solo_edge(tmp_path), bus=bus)
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        await riko.decir(_reply("Hola."), origen="sistema", canal="voz")
+        assert await riko.vaciar(5.0)
+        assert riko._fallos_soundfile == 1 and riko._soundfile is True
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert len(llamadas) == 1 and reproducidos == [mp3] and not reproductor.datos
+    assert _subtitulos(eventos) == [("Hola.", "voz")]
+
+
+def test_decodificacion_que_no_termina_cae_a_mpv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=True, mp3_argv=["/usr/bin/mpv", "-"])
+    mp3 = _mp3_senoide(0.3)
+    _edge_falso(monkeypatch, mp3)
+    monkeypatch.setattr(riko_mod, "TIMEOUT_DECODIFICAR_S", 0.05)
+    original = riko_mod._mp3_a_pcm_soundfile
+
+    def lenta(datos: bytes) -> tuple[bytes, int]:
+        time.sleep(0.5)
+        return original(datos)
+
+    monkeypatch.setattr(riko_mod, "_mp3_a_pcm_soundfile", lenta)
+    riko, _ = _crear(_settings_solo_edge(tmp_path))
+    reproducidos = _espiar_mp3(monkeypatch, riko)
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola.")) == 0.8
+        assert riko._fallos_soundfile == 1 and riko._soundfile is True
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert reproducidos == [mp3] and not reproductor.datos
+
+
+def test_soundfile_valido_reinicia_los_fallos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    reproductor = _audio_edge(monkeypatch, soundfile=True)
+    _edge_falso(monkeypatch, _mp3_senoide(0.3))
+    riko, _ = _crear(_settings_solo_edge(tmp_path))
+
+    async def escenario() -> None:
+        await riko.iniciar()
+        assert riko._soundfile is True
+        riko._fallos_soundfile = riko_mod.MAX_FALLOS_SOUNDFILE - 1
+        assert await riko._hablar_edge("Hola.", Segmento(Etiquetas(), "Hola."))
+        assert riko._fallos_soundfile == 0 and riko._soundfile is True
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+    assert reproductor.datos

@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Amadeus Overlay (stub de smoke)</title>
+</head>
+<body>
+  <!--
+    Stub del visor para `npm run smoke` (COMPANION.md §C2.7.8). Se carga por file:// en una ventana
+    oculta. Comprueba que el preload expuso window.amadeusDesktop v3 completo y, cuando el main le
+    manda overlay:order{relayout}, responde "ok" por IPC con reportAvatar (una caja válida que el
+    main acepta tras validar el emisor).
+  -->
+  <script>
+    (() => {
+      const d = window.amadeusDesktop;
+      const funciones = ['setInteractive', 'reportAvatar', 'hidden', 'openChat', 'event',
+        'onCursor', 'onOrder', 'onVisibility'];
+      if (!d || d.version !== 3 || !funciones.every((f) => typeof d[f] === 'function')) {
+        document.title = 'stub: API incompleta';
+        return; // sin respuesta: el smoke falla por tiempo
+      }
+      d.onVisibility(() => {});
+      d.onCursor(() => {});
+      d.onOrder((o) => {
+        if (!o || o.accion !== 'relayout') return;
+        d.reportAvatar({ x: 10, y: 20, w: 340, h: 600 });
+        d.setInteractive(false);
+      });
+    })();
+  </script>
+</body>
+</html>

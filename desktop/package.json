@@ -1,0 +1,22 @@
+{
+  "name": "amadeus-desktop",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Amadeus Desktop: overlay transparente con el avatar de Amadeus, bandeja, chat y enlace con R.A.M.S. BIO-CORE.",
+  "main": "main.js",
+  "desktopName": "amadeus-desktop.desktop",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "start": "electron .",
+    "start:x11": "electron . --ozone-platform=x11",
+    "smoke": "electron . --smoke",
+    "test": "node --test test/",
+    "icono": "node scripts/generar-icono.js"
+  },
+  "devDependencies": {
+    "electron": "44.8.0"
+  }
+}

@@ -48,6 +48,8 @@ FMT_EJEMPLO: dict[str, Any] = {
     "creada": "1 de octubre de 2026", "ms": 312, "n": 2, "titulo": "Título", "motivo": "aburrimiento 0,78",
     "descripcion": "cerrar kitty", "cmd": "python3 train.py", "duracion": "5 min", "n_turnos": 41,
     "n_fragmentos": 120, "n_llamadas": 2, "n_consolidaciones": 3,
+    # v0.2
+    "app": "YouTube", "destino": "WhatsApp",
 }
 
 PLACEHOLDERS_DEFECTO = {"usuario", "rango", "nombre_ia", "hora", "divergencia", "campo"}
@@ -73,6 +75,18 @@ PLACEHOLDERS_CATEGORIA: dict[str, set[str]] = {
 # «programar_falta_*» hacen la pregunta de un recordatorio a medias (CONTRATO de cierre).
 PLACEHOLDERS_EXTRA: dict[str, set[str]] = {"aviso": {"motivo"}, "programar_falta_hora": {"mensaje"},
                                            "programar_falta_mensaje": {"cuando"}}
+# v0.2 (docs/COMPANION.md §C3 "Grupo orquestacion"): categorías nuevas y sus placeholders específicos.
+PLACEHOLDERS_V02: dict[str, set[str]] = {
+    "iniciativa_curiosidad_web": {"motivo"}, "iniciativa_conversar_app": {"app"},
+    "escritorio_aparece": set(), "escritorio_te_busca": set(), "travesura_cursor": set(),
+    "basta_travesuras": set(), "vision_pausada": set(), "prerrellenar_confirma": set(),
+    "escribir_confirma": set(), "escribir_haz_clic": {"app"}, "accion_abrir_ok": {"destino"},
+    "confirmacion_pendiente_chat": set(), "sin_borrador": set(), "sin_borrador_sin_llm": set(),
+    # Vistazo servido por la visión continua (la cámara sigue abierta: nunca «ya la apagué»).
+    "vistazo_presente_continua": set(), "vistazo_ausente_continua": set(),
+    "iniciativa_curiosidad_visual_continua": set(),
+}
+PLACEHOLDERS_EXTRA.update(PLACEHOLDERS_V02)
 
 RE_PLACEHOLDER = re.compile(r"\{([a-z_]+)\}")
 
@@ -782,6 +796,39 @@ def test_respuesta_local_categorias(settings_prueba, estado_neutral, correr) -> 
     assert "aburrimiento 0,78" in iniciativa.texto_plano and "{" not in iniciativa.texto_plano
 
 
+def test_vistazo_de_la_vision_continua_no_dice_que_apago_la_camara(settings_prueba, estado_neutral,
+                                                                   correr) -> None:
+    """``VisionContinua.como_vistazo`` devuelve ``duracion_ms == 0``: la cámara sigue encendida."""
+    textos = _frases()["categorias"]
+    for v in ((k + 0.5) / 10 for k in range(10)):
+        broca = BrocaLLM(settings_prueba, rng=RngFijo(v))
+        presente = correr(broca.verbalizar(ContextoBroca(estado_neutral, vision=ResultadoVistazo(
+            rostro=True, n_rostros=1, duracion_ms=0, motivo="usuario")), "¿me ves?"))
+        assert presente.texto_plano in {e["texto"] for e in textos["vistazo_presente_continua"]}
+        ausente = correr(broca.verbalizar(ContextoBroca(estado_neutral, vision=ResultadoVistazo(
+            rostro=False, duracion_ms=0, motivo="usuario")), "¿me ves?"))
+        assert ausente.texto_plano in {e["texto"] for e in textos["vistazo_ausente_continua"]}
+        iniciativa = correr(broca.verbalizar(ContextoBroca(
+            estado_neutral, canal_entrada="iniciativa", iniciativa="curiosidad_visual",
+            vision=ResultadoVistazo(rostro=True, n_rostros=1, duracion_ms=0, motivo="curiosidad")), None))
+        assert iniciativa.texto_plano in {e["texto"] for e in textos["iniciativa_curiosidad_visual_continua"]}
+        for reply in (presente, ausente, iniciativa):
+            assert "apagu" not in reply.texto_plano.lower() and "0 milisegundos" not in reply.texto_plano
+    # Un parpadeo real de aura (> 0 ms) conserva sus frases de la v0.1.
+    parpadeo = correr(BrocaLLM(settings_prueba, rng=RngFijo(0.0)).verbalizar(ContextoBroca(
+        estado_neutral, vision=ResultadoVistazo(rostro=True, duracion_ms=312, motivo="usuario")), "¿me ves?"))
+    assert "312" in parpadeo.texto_plano
+    # En el prompt de Gemini, un atributo avisa de que la cámara sigue abierta (y el parpadeo no).
+    broca = BrocaLLM(settings_prueba)
+    sugeridas = sugerir_etiquetas(estado_neutral)
+    continua = broca.construir_contexto(ContextoBroca(estado_neutral, vision=ResultadoVistazo(
+        rostro=True, duracion_ms=0, motivo="usuario")), sugeridas, False)
+    assert '<vision rostro="si" duracion_ms="0" fuente="continua" camara_sigue_abierta="si" />' in continua
+    real = broca.construir_contexto(ContextoBroca(estado_neutral, vision=ResultadoVistazo(
+        rostro=True, duracion_ms=312, motivo="usuario")), sugeridas, False)
+    assert '<vision rostro="si" duracion_ms="312" />' in real
+
+
 def test_regreso_local_menciona_solo_cifras_reales(settings_prueba, estado_neutral, correr) -> None:
     # Regla 15 / B.2: llamadas si N > 0 y consolidaciones solo si M > 0 (nunca «0 fragmentos»).
     valores = [(k + 0.5) / 10 for k in range(10)]
@@ -1075,7 +1122,7 @@ def test_frases_json_categorias_tsundere_y_alerta() -> None:
     assert all(e["exp"] == "avergonzada" and "qué pena" in e["texto"].lower() for e in categorias["error_propio"])
     # C.2: las iniciativas empiezan justificando la interrupción (regla 14).
     for nombre in ("iniciativa_conversar", "iniciativa_curiosidad_visual", "iniciativa_descanso",
-                   "iniciativa_cambio_linea"):
+                   "iniciativa_cambio_linea", "iniciativa_curiosidad_web", "iniciativa_conversar_app"):
         for entrada in categorias[nombre]:
             assert re.match(r"(Perdón|Interrump)", entrada["texto"]), (nombre, entrada["texto"])
     # La pausa sugerida no da por hecho que es de noche (la iniciativa puede llegar a cualquier hora).
@@ -1135,3 +1182,103 @@ def test_frase_local_no_repite_la_ultima_de_la_categoria(settings_prueba, estado
     unica = BrocaLLM(settings_prueba, rng=RngFijo(0.0))
     unica._frases = {"generico": [{"texto": "Sigo aquí.", "exp": "neutral", "motion": "idle", "tone": "analitico"}]}
     assert unica.frase_local("generico").texto_plano == unica.frase_local("generico").texto_plano == "Sigo aquí."
+
+
+# ---------------------------------------------------------------------------
+# v0.2 (docs/COMPANION.md §C3 "Grupo orquestacion"): percepción y categorías nuevas
+# ---------------------------------------------------------------------------
+
+
+def test_categorias_v02_en_el_banco() -> None:
+    categorias = _frases()["categorias"]
+    for nombre, especificos in PLACEHOLDERS_V02.items():
+        entradas = categorias.get(nombre)
+        assert entradas and len(entradas) >= 3, nombre
+        for entrada in entradas:
+            assert entrada["exp"] in EXP_VALIDOS and entrada["motion"] in MOTION_VALIDOS, nombre
+            assert entrada["tone"] in TONE_VALIDOS, nombre
+            usados = set(RE_PLACEHOLDER.findall(entrada["texto"]))
+            assert usados <= PLACEHOLDERS_DEFECTO | especificos, (nombre, usados)
+        if especificos:      # el dato propio de la categoría aparece en todas sus frases
+            for entrada in entradas:
+                assert especificos <= set(RE_PLACEHOLDER.findall(entrada["texto"])), (nombre, entrada["texto"])
+    # La travesura es tsundere (con alternativas sin sonrojo para cuando no hay presupuesto).
+    exps = {e["exp"] for e in categorias["travesura_cursor"]}
+    assert "sonrojo_tsundere" in exps and exps - {"sonrojo_tsundere"}
+
+
+def test_categorias_v02_sin_placeholders_sueltos(settings_prueba, estado_neutral) -> None:
+    for nombre in PLACEHOLDERS_V02:
+        for k in range(4):
+            broca = BrocaLLM(settings_prueba, rng=RngFijo((k + 0.5) / 4))
+            for reply in (broca.frase_local(nombre, estado_neutral, **FMT_EJEMPLO),
+                          broca.frase_local(nombre, estado_neutral), broca.frase_local(nombre)):
+                assert reply.texto_plano and _sin_llaves(reply.texto_plano), (nombre, reply.texto_plano)
+                assert all(es_valida(s.etiquetas) for s in reply.segmentos), nombre
+    broca = BrocaLLM(settings_prueba, rng=RngFijo(0.0))
+    assert "chrome.exe" in broca.frase_local("escribir_haz_clic", estado_neutral, app="chrome.exe").texto_plano
+    assert "WhatsApp" in broca.frase_local("accion_abrir_ok", estado_neutral, destino="WhatsApp").texto_plano
+
+
+def test_percepcion_en_el_prompt_solo_app_y_titulo(settings_prueba, estado_neutral) -> None:
+    broca = BrocaLLM(settings_prueba)
+    sugeridas = sugerir_etiquetas(estado_neutral)
+    percepcion = {"app": "chrome", "titulo_corto": "YouTube - <b>Gatos</b> \"live\"", "video": True,
+                  "pantalla_completa": False, "rostro": True, "atencion": 0.7, "dist_m": 0.6}
+    texto = broca.construir_contexto(ContextoBroca(estado_neutral, percepcion=percepcion), sugeridas, False)
+    lineas = [linea for linea in texto.splitlines() if linea.startswith("<percepcion")]
+    assert len(lineas) == 1
+    linea = lineas[0]
+    assert 'app="chrome"' in linea and "titulo=\"YouTube - ‹b›Gatos‹/b› 'live'\"" in linea
+    assert 'nota="DATOS"' in linea
+    for prohibido in ("video", "atencion", "dist", "rostro", "pantalla_completa", "<b>"):
+        assert prohibido not in linea, prohibido
+    # Sin percepción, ventana privada sin app, o modo público: no hay línea.
+    assert "<percepcion" not in broca.construir_contexto(ContextoBroca(estado_neutral), sugeridas, False)
+    vacia = ContextoBroca(estado_neutral, percepcion={"app": "", "titulo_corto": "", "video": True})
+    assert "<percepcion" not in broca.construir_contexto(vacia, sugeridas, False)
+    publica = ContextoBroca(estado_neutral, percepcion=percepcion, publico=True)
+    assert "<percepcion" not in broca.construir_contexto(publica, sugeridas, False)
+    # La percepción va dentro del bloque de contexto del cuerpo de Gemini.
+    cuerpo = broca.construir_cuerpo(ContextoBroca(estado_neutral, percepcion=percepcion), "hola", None, sugeridas,
+                                    False)
+    assert '<percepcion nota="DATOS" app="chrome"' in cuerpo["contents"][-1]["parts"][0]["text"]
+
+
+def test_iniciativa_conversar_app_en_local(settings_prueba, estado_neutral, correr) -> None:
+    broca = BrocaLLM(settings_prueba, rng=RngFijo(0.3))
+    con_app = ContextoBroca(estado_neutral, canal_entrada="iniciativa", iniciativa="conversar",
+                            instruccion_extra="aburrimiento 0,78", percepcion={"app": "YouTube"})
+    reply = correr(broca.verbalizar(con_app, None))
+    textos_app = [e["texto"] for e in _frases()["categorias"]["iniciativa_conversar_app"]]
+    assert "YouTube" in reply.texto_plano and _sin_llaves(reply.texto_plano)
+    assert any(reply.texto_plano.startswith(t.split("{app}")[0][:20]) for t in textos_app)
+    sin_app = ContextoBroca(estado_neutral, canal_entrada="iniciativa", iniciativa="conversar",
+                            instruccion_extra="aburrimiento 0,78", percepcion={"app": ""})
+    otra = correr(BrocaLLM(settings_prueba, rng=RngFijo(0.3)).verbalizar(sin_app, None))
+    assert "YouTube" not in otra.texto_plano and _sin_llaves(otra.texto_plano)
+
+
+def test_iniciativa_curiosidad_web_en_local(settings_prueba, estado_neutral, correr) -> None:
+    broca = BrocaLLM(settings_prueba, rng=RngFijo(0.1))
+    hallazgo = ResultadoWeb("Neuronas de la mosca que navegan", "https://www.ejemplo.org/mosca", "snippet", "ddgs")
+    ctx = ContextoBroca(estado_neutral, canal_entrada="iniciativa", iniciativa="curiosidad_web",
+                        instruccion_extra="Por curiosidad buscaste sobre «x» y encontraste un resultado",
+                        busqueda_web=(hallazgo,))
+    reply = correr(broca.verbalizar(ctx, None))
+    assert "«Neuronas de la mosca que navegan» (ejemplo.org)" in reply.texto_plano
+    assert "Por curiosidad buscaste" not in reply.texto_plano and _sin_llaves(reply.texto_plano)
+    assert "https://" not in reply.texto_plano          # la URL va a la notificación, no a la voz
+
+
+def test_accion_abrir_destino_usa_su_frase(settings_prueba, estado_neutral, correr) -> None:
+    broca = BrocaLLM(settings_prueba, rng=RngFijo(0.0))
+    abierto = ResultadoAccion(True, "Abrí WhatsApp.", {"destino": "whatsapp", "nombre_destino": "WhatsApp"},
+                              accion_tipo="abrir_destino")
+    reply = correr(broca.verbalizar(ContextoBroca(estado_neutral, accion=abierto), "abre whatsapp"))
+    textos = [e["texto"].replace("{destino}", "WhatsApp") for e in _frases()["categorias"]["accion_abrir_ok"]]
+    assert reply.texto_plano in textos
+    # Una acción sin nombre de destino sigue la fila genérica (accion_ok / accion_denegada).
+    fallo = ResultadoAccion(False, "No encontré WhatsApp en este sistema.", accion_tipo="abrir_destino")
+    texto_fallo = correr(broca.verbalizar(ContextoBroca(estado_neutral, accion=fallo), "abre whatsapp")).texto_plano
+    assert "No encontré WhatsApp en este sistema." in texto_fallo

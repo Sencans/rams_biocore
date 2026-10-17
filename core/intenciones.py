@@ -6,7 +6,17 @@ Qué hace (sin LLM, núcleo del principio "No-LLM centric", §8):
   sistema, vistazo de cámara, acciones sobre el PC…). Las ``AccionPC`` nacen SOLO aquí, a
   partir del texto del usuario, siempre con ``origen="usuario"`` (§9.1).
 - Aplica las **capacidades por canal**: desde Telegram o Nexus no se puede mirar, escuchar ni
-  actuar sobre el PC; esas intenciones salen como ``bloqueada_canal`` (§9.3).
+  actuar sobre el PC; esas intenciones salen como ``bloqueada_canal`` (§9.3). El chat de
+  escritorio (canal ``escritorio``, v0.2) es local: hereda todo lo de la terminal.
+- v0.2 (``docs/COMPANION.md`` §C3 "Grupo orquestacion"): abrir apps y webs del catálogo
+  ``DESTINOS_BASE`` (``abrir_destino``), buscar dentro de ellas (``buscar_en``), dejar un
+  borrador prerrellenado (``prerrellenar``) o teclear en la ventana anterior
+  (``escribir_texto``), publicar el último borrador de Amadeus (``publicar_borrador``),
+  "búscame en 10 minutos" (``recordatorio_personal``), llamar o despedir a Amadeus del
+  escritorio (``escritorio_venir``/``escritorio_vete``), cortar las travesuras
+  (``basta_travesuras``) y pausar la cámara (``vision_pausa``). Las frases cortas ("ven",
+  "basta"…) solo cuentan como **mensaje completo** (reglas ancladas). ``args["alias"]`` es
+  siempre la **clave** del catálogo (los sinónimos de ``RAMS_DESTINOS`` se traducen aquí).
 - ``parsear_cuando`` interpreta expresiones de tiempo en español ("a las 6 pm", "en 20
   minutos", "mañana a las 8", "el 2026-12-24") y ``detectar_evento_social`` reconoce apodos,
   cumplidos, saludos, despedidas, tristeza… (§4.4.4).
@@ -27,6 +37,11 @@ from datetime import time as dtime
 from typing import Any, Final
 
 from core.contracts import CANALES_LOCALES, AccionPC
+
+try:  # v0.2 (grupo base): catálogo cerrado de destinos
+    from core.contracts import DESTINOS_BASE
+except ImportError:  # contratos v0.1: sin catálogo (las reglas de destinos no casan nunca)
+    DESTINOS_BASE = {}  # type: ignore[assignment]
 
 __all__ = [
     "Intencion",
@@ -55,7 +70,13 @@ TIPOS_INTENCION: Final = (
     "ninguna", "comando", "buscar_web", "reporte_sistema", "recordar", "programar",
     "programar_incompleto", "mirar_pantalla", "vistazo", "accion_pc", "memoria_consulta",
     "bloqueada_canal",
+    # v0.2
+    "publicar_borrador", "recordatorio_personal", "escritorio_venir", "escritorio_vete",
+    "basta_travesuras", "vision_pausa",
 )
+
+# Mensaje de un recordatorio personal sin texto ("búscame en 10 minutos").
+MENSAJE_BUSCAR_DEFECTO: Final = "Me pediste que te buscara"
 
 
 @dataclass(frozen=True)
@@ -79,9 +100,14 @@ class Intencion:
 
 COMANDOS: Final = ("/ayuda", "/salir", "/estado", "/divergencia", "/memoria", "/recordar", "/olvidar",
                    "/agenda", "/camara", "/silencio", "/colgar", "/buscar", "/reporte", "/bitacora",
-                   "/devolver_llamada", "/hud", "/logro")
+                   "/devolver_llamada", "/hud", "/logro",
+                   # v0.2: solo canales locales (terminal y chat de escritorio)
+                   "/vision", "/pantalla", "/travesuras")
 
-# Capacidades por canal de entrada (normativo). "terminal" puede todo.
+# Capacidades por canal de entrada (normativo). Los canales locales (terminal y escritorio)
+# pueden todo. Telegram NO gana capacidades en la v0.2 (§C2.12): ninguna intención nueva,
+# tampoco el recordatorio personal ("llámame en 10 minutos"), porque al vencer mueve el avatar
+# en el escritorio (aparecer + buscar_usuario). Por Telegram sigue valiendo "recuérdame en …".
 INTENCIONES_POR_CANAL: Final[dict[str, frozenset[str]]] = {
     "telegram": frozenset({"ninguna", "comando", "buscar_web", "recordar", "programar", "programar_incompleto",
                            "memoria_consulta", "reporte_sistema"}),
@@ -612,6 +638,227 @@ _ORDEN_MEDIA: Final = {
     "cancion anterior": ("anterior", "volver a la canción anterior"),
 }
 
+# ---------------------------------------------------------------------------
+# Reglas v0.2 (docs/COMPANION.md §C3 "Grupo orquestacion"), sobre texto normalizado
+# ---------------------------------------------------------------------------
+
+_AMADEUS: Final = r"(?:amadeus|kurisu|asistente)"
+_VOCATIVO_INICIO: Final = rf"(?:(?:oye|hey|ey|hola),? )?(?:{_AMADEUS},? )?"
+_VOCATIVO_FIN: Final = rf"(?:,? {_AMADEUS})?(?:,? (?:por favor|porfa))?[.!]*"
+# Frases cortas: solo valen como mensaje COMPLETO (anclas ^…$).
+_RE_VENIR: Final = re.compile(
+    rf"^{_VOCATIVO_INICIO}(?:ven|ven aca|ven aqui|veni|aparece|aparecete|sal|sal ya|asomate)"
+    rf"{_VOCATIVO_FIN}$")
+_RE_VETE: Final = re.compile(
+    rf"^{_VOCATIVO_INICIO}(?:vete|vete ya|escondete|ocultate|desaparece)(?: un rato)?{_VOCATIVO_FIN}$")
+_RE_BASTA: Final = re.compile(
+    rf"^{_VOCATIVO_INICIO}(?:basta|basta ya|ya basta|quieta|quieta ya|quieta ahi|para ya|ya para"
+    r"|deja (?:el|mi) (?:mouse|raton|cursor)|suelta (?:el|mi) (?:mouse|raton|cursor)"
+    rf"|deja (?:el|mi) (?:mouse|raton|cursor) en paz){_VOCATIVO_FIN}$")
+_RE_VISION_PAUSA: Final = re.compile(
+    rf"^{_VOCATIVO_INICIO}(?:deja de mirarme|deja de verme|no me mires|no me veas|cierra los ojos)"
+    r"(?: (?:por|durante) (?P<n>\d{1,4}|un|una|media) ?(?P<u>minutos?|min|horas?|h))?"
+    rf"{_VOCATIVO_FIN}$")
+# "búscame / llámame en 10 minutos (para …)".
+_RE_BUSCAME: Final = re.compile(
+    r"^(?:buscame|llamame|ven a buscarme|ven por mi|vuelve a buscarme)[,:]?\s+(?P<resto>.+)$")
+# "ponlo / pásalo / publícalo en <alias>": el último borrador de Amadeus.
+_RE_PUBLICAR: Final = re.compile(
+    r"^(?:ponlo|ponla|pasalo|pasala|publicalo|publicala|mandalo|mandala|copialo|pegalo|subelo|postealo)"
+    r"\s+(?:en|a|al|por)\s+(?:el |la |mi )?(?P<alias>[a-z0-9_]+)[.!]*$")
+# "abre whatsapp y escríbele a mamá: …" (una sola línea).
+_RE_ABRIR_Y_ESCRIBIR: Final = re.compile(
+    r"^(?:abre|abreme|lanza|pon)\s+(?:el |la |mi )?(?P<alias>[a-z0-9_]+)\s+y\s+"
+    r"(?:escribele|escribeles|escribe|mandale|enviale|ponle|pon|publica)(?:\s+a\s+(?P<dest>[^:,]+?))?"
+    r"(?:\s*[:,]\s*|\s+que\s+|\s+diciendo\s+)(?P<texto>.+)$")
+# "escríbele a X por <alias>: …", "mándale un mensaje a X por <alias> que …".
+_RE_PRERRELLENAR: Final = re.compile(
+    r"^(?:escribele|escribeles|mandale|enviale|manda|envia|escribe)"
+    r"(?:\s+un\s+(?:mensaje|correo|mail|whatsapp|tweet|post|dm))?(?:\s+a\s+(?P<dest>[^:,]+?))?"
+    r"\s+(?:por|en|al)\s+(?:el |la |mi )?(?P<alias>[a-z0-9_]+)"
+    r"(?:\s*[:,]\s*|\s+que\s+|\s+diciendo\s+)(?P<texto>.+)$")
+# "pon en <alias>: …".
+_RE_PONER_EN: Final = re.compile(
+    r"^(?:pon|publica|postea|escribe)\s+en\s+(?:el |la |mi )?(?P<alias>[a-z0-9_]+)\s*[:,]\s*(?P<texto>.+)$")
+# "escribe ahí / aquí: …" (ventana previa).
+_RE_ESCRIBIR_AQUI: Final = re.compile(
+    r"^(?:escribe|escribelo|teclea|pon|ponlo|pega)\s+(?:ahi|aqui|alli|aca)"
+    r"(?:\s*[:,]\s*|\s+que\s+|\s+)(?P<texto>.+)$")
+# "escríbele (a X): …" sin destino: tras "abre whatsapp" (mensajes consecutivos) o en la ventana previa.
+_RE_ESCRIBELE: Final = re.compile(
+    r"^(?:escribele|escribeles|mandale|enviale|respondele|contestale)(?:\s+a\s+(?P<dest>[^:,]+?))?"
+    r"(?:\s*[:,]\s*|\s+que\s+|\s+diciendo\s+)(?P<texto>.+)$")
+# "busca <consulta> en <alias>", "pon <canción> en spotify".
+_RE_BUSCAR_EN: Final = re.compile(
+    r"^(?:busca|buscame|buscar|pon|ponme|reproduce)\s+(?P<q>.+?)\s+(?:en|por)\s+(?:el |la |mi )?"
+    r"(?P<alias>[a-z0-9_]+)[.!]*$")
+# "abre / pon / lanza <alias>" (sustituye a la regla _RE_LANZAR de la v0.1: catálogo → RAMS_APPS).
+_RE_ABRIR: Final = re.compile(
+    r"^(?:abre|abrir|abreme|lanza|ejecuta|pon|ponme|inicia|arranca)\s+(?:el |la |mi |un |una )?"
+    r"(?P<alias>[a-z0-9_]+)[.!]*$")
+
+# Sinónimos de serie (se suman a los de RAMS_DESTINOS, que tienen prioridad). Nunca nombres de
+# navegadores concretos: "abre firefox" sigue siendo una app de RAMS_APPS.
+SINONIMOS_DESTINO: Final[Mapping[str, str]] = {
+    "twitter": "x", "wasap": "whatsapp", "wasa": "whatsapp", "whats": "whatsapp", "wpp": "whatsapp",
+    "insta": "instagram", "ig": "instagram", "face": "facebook", "fb": "facebook", "yt": "youtube",
+    "mail": "correo", "email": "correo", "explorador": "archivos",
+}
+NOTA_ESCRIBIR_DESPUES: Final = "escribir_despues"
+
+
+def _destino(alias: str, destinos: Mapping[str, str]) -> str | None:
+    """Clave de ``DESTINOS_BASE`` para ``alias`` (sinónimo de ``destinos`` o de serie), o ``None``."""
+    if not alias:
+        return None
+    clave = destinos.get(alias)
+    if clave is None:
+        clave = SINONIMOS_DESTINO.get(alias)
+    return clave if isinstance(clave, str) and clave in DESTINOS_BASE else None
+
+
+def _admite(clave: str, capacidad: str) -> bool:
+    """``DESTINOS_BASE[clave][capacidad]`` sin lanzar."""
+    meta = DESTINOS_BASE.get(clave)
+    return bool(meta.get(capacidad)) if isinstance(meta, Mapping) else False
+
+
+def _nombre_destino(clave: str) -> str:
+    """Nombre para la descripción de la acción (la clave; nunca lleva el texto del usuario).
+
+    La descripción que ve el usuario en una confirmación la escribe la compuerta de permisos.
+    """
+    return clave
+
+
+def _tramo_original(originales: list[str], normalizadas: list[str], inicio: int, fin: int) -> str:
+    """Palabras originales del tramo ``[inicio, fin)`` del texto normalizado (cortes por palabra).
+
+    Si un extremo cae a mitad de palabra, devuelve el tramo normalizado (nunca pierde contenido).
+    """
+    texto_norm = " ".join(normalizadas)
+    if not (0 <= inicio < fin <= len(texto_norm)):
+        return ""
+    en_borde_inicio = inicio == 0 or texto_norm[inicio - 1] == " "
+    en_borde_fin = fin == len(texto_norm) or texto_norm[fin] == " "
+    if not (en_borde_inicio and en_borde_fin):
+        return texto_norm[inicio:fin].strip()
+    primera = texto_norm[:inicio].count(" ")
+    ultima = texto_norm[:fin].count(" ") + 1
+    return " ".join(originales[primera:ultima]).strip()
+
+
+def _texto_de(originales: list[str], normalizadas: list[str], inicio: int) -> str:
+    """Texto que dicta el usuario a partir de ``inicio`` (original, sin comillas que lo envuelvan)."""
+    texto = _limpiar_fragmento(_original_desde(originales, normalizadas, inicio))
+    if len(texto) >= 2 and texto[0] in "\"'«“" and texto[-1] in "\"'»”":
+        texto = texto[1:-1].strip()
+    return texto
+
+
+def _minutos_pausa(m: re.Match[str]) -> float | None:
+    """Minutos de "no me mires por N minutos" (``None`` = sin plazo)."""
+    bruto = m.group("n")
+    if bruto is None:
+        return None
+    cantidad = {"un": 1.0, "una": 1.0, "media": 0.5}.get(bruto)
+    if cantidad is None:
+        cantidad = float(int(bruto))
+    unidad = m.group("u") or "min"
+    return cantidad * (60.0 if unidad.startswith("h") else 1.0)
+
+
+def _recordatorio_personal(originales: list[str], normalizadas: list[str], ahora: datetime,
+                           tecnica: bool) -> Intencion | None:
+    """"búscame en 10 minutos (para …)" → ``recordatorio_personal{vence, mensaje}`` o ``None``."""
+    originales, normalizadas = _sin_relleno_inicial(originales, normalizadas)
+    if not normalizadas:
+        return None
+    reconocida, vence = _analizar_cuando(" ".join(normalizadas), ahora)
+    mensaje = ""
+    if not reconocida:
+        for fin in range(len(normalizadas) - 1, 0, -1):
+            reconocida, vence = _analizar_cuando(" ".join(normalizadas[:fin]), ahora)
+            if reconocida:
+                resto = originales[fin:]
+                if resto and normalizar(resto[0]).strip(",:") in ("para", "que", "y", "a", "porque"):
+                    resto = resto[1:]
+                mensaje = _limpiar_mensaje(resto).rstrip(".!?…").strip()
+                break
+    if not reconocida or vence is None:
+        return None
+    return Intencion("recordatorio_personal", {"vence": vence, "mensaje": mensaje or MENSAJE_BUSCAR_DEFECTO,
+                                               "con_mensaje": bool(mensaje)},
+                     explicacion_tecnica=tecnica)
+
+
+def _clasificar_v02(original: str, originales: list[str], normalizadas: list[str], ahora: datetime,
+                    destinos: Mapping[str, str], tecnica: bool) -> Intencion | None:
+    """Reglas de la v0.2 que van antes de las búsquedas web (gana la primera que casa)."""
+    texto = " ".join(normalizadas)
+
+    m = _RE_PUBLICAR.match(texto)
+    if m:
+        clave = _destino(m.group("alias"), destinos)
+        if clave is not None:
+            return Intencion("publicar_borrador", {"alias": clave}, explicacion_tecnica=tecnica)
+
+    m = _RE_ABRIR_Y_ESCRIBIR.match(texto)
+    if m:
+        clave = _destino(m.group("alias"), destinos)
+        texto_usuario = _texto_de(originales, normalizadas, m.start("texto"))
+        if clave is not None and texto_usuario:
+            nombre = _nombre_destino(clave)
+            if _admite(clave, "prerrelleno"):
+                return _accion("prerrellenar", {"alias": clave, "texto": texto_usuario}, f"borrador en {nombre}",
+                               tecnica)
+            # Sin prerrelleno no se teclea a ciegas en una app que aún se está abriendo: se abre y
+            # Amadeus pide el "escribe ahí: …" cuando el usuario tenga la caja de texto delante.
+            intencion = _accion("abrir_destino", {"alias": clave}, f"abrir {nombre}", tecnica)
+            return Intencion("accion_pc", {**intencion.args, "nota": NOTA_ESCRIBIR_DESPUES},
+                             explicacion_tecnica=tecnica)
+
+    for patron in (_RE_PRERRELLENAR, _RE_PONER_EN):
+        m = patron.match(texto)
+        if not m:
+            continue
+        clave = _destino(m.group("alias"), destinos)
+        texto_usuario = _texto_de(originales, normalizadas, m.start("texto"))
+        if clave is None or not texto_usuario:
+            continue
+        nombre = _nombre_destino(clave)
+        if _admite(clave, "prerrelleno"):
+            return _accion("prerrellenar", {"alias": clave, "texto": texto_usuario}, f"borrador en {nombre}",
+                           tecnica)
+        # Sin enlace de prerrelleno (Instagram, TikTok, Discord…): teclear en la ventana previa.
+        intencion = _accion("escribir_texto", {"texto": texto_usuario}, f"escribir en {nombre}", tecnica)
+        return Intencion("accion_pc", {**intencion.args, "destino": clave}, explicacion_tecnica=tecnica)
+
+    m = _RE_ESCRIBIR_AQUI.match(texto)
+    if m:
+        texto_usuario = _texto_de(originales, normalizadas, m.start("texto"))
+        if texto_usuario:
+            return _accion("escribir_texto", {"texto": texto_usuario}, "escribir en la ventana anterior", tecnica)
+
+    m = _RE_ESCRIBELE.match(texto)
+    if m:
+        texto_usuario = _texto_de(originales, normalizadas, m.start("texto"))
+        if texto_usuario:
+            intencion = _accion("escribir_texto", {"texto": texto_usuario}, "escribir en la ventana anterior",
+                                tecnica)
+            # main puede convertirlo en prerrelleno si el usuario acaba de abrir una app que lo admite.
+            return Intencion("accion_pc", {**intencion.args, "sin_alias": True}, explicacion_tecnica=tecnica)
+
+    m = _RE_BUSCAR_EN.match(texto)
+    if m:
+        clave = _destino(m.group("alias"), destinos)
+        if clave is not None and _admite(clave, "busqueda"):
+            consulta = _limpiar_fragmento(_tramo_original(originales, normalizadas, m.start("q"), m.end("q")))
+            if consulta:
+                return _accion("buscar_en", {"alias": clave, "consulta": consulta},
+                               f"buscar en {_nombre_destino(clave)}", tecnica)
+    return None
+
 
 def _accion(tipo: str, args: Mapping[str, Any], descripcion: str, tecnica: bool) -> Intencion:
     """Intención ``accion_pc`` con su ``AccionPC`` (siempre ``origen="usuario"``)."""
@@ -619,14 +866,43 @@ def _accion(tipo: str, args: Mapping[str, Any], descripcion: str, tecnica: bool)
                      explicacion_tecnica=tecnica)
 
 
+def _lanzar_app_permitido(plataforma: str | None) -> bool:
+    """Los alias de ``RAMS_APPS`` (``lanzar_app``) solo se ejecutan en Linux (Hyprland).
+
+    ``plataforma=None`` (llamada sin contexto, p. ej. el autodiagnóstico) no restringe.
+    """
+    return plataforma is None or str(plataforma).startswith("linux")
+
+
 def _clasificar(original: str, originales: list[str], normalizadas: list[str], ahora: datetime,
-                apps: Mapping[str, str], tecnica: bool) -> Intencion:
-    """Aplica la tabla de reglas de §10.12 en orden; gana la primera."""
+                apps: Mapping[str, str], tecnica: bool, destinos: Mapping[str, str] | None = None,
+                plataforma: str | None = None) -> Intencion:
+    """Aplica la tabla de reglas de §10.12 (ampliada en la v0.2) en orden; gana la primera."""
     texto = " ".join(normalizadas)
+    if destinos is None:
+        destinos = {clave: clave for clave in DESTINOS_BASE}
 
     comando = parsear_comando(original)
     if comando is not None:
         return Intencion("comando", {"comando": comando[0], "resto": comando[1]}, explicacion_tecnica=tecnica)
+
+    # v0.2: frases cortas ancladas (mensaje completo).
+    if _RE_BASTA.match(texto):
+        return Intencion("basta_travesuras", {}, explicacion_tecnica=tecnica)
+    if _RE_VENIR.match(texto):
+        return Intencion("escritorio_venir", {}, explicacion_tecnica=tecnica)
+    if _RE_VETE.match(texto):
+        return Intencion("escritorio_vete", {}, explicacion_tecnica=tecnica)
+    m = _RE_VISION_PAUSA.match(texto)
+    if m:
+        return Intencion("vision_pausa", {"minutos": _minutos_pausa(m)}, explicacion_tecnica=tecnica)
+
+    m = _RE_BUSCAME.match(texto)
+    if m:
+        indice = texto[:m.start("resto")].count(" ")
+        personal = _recordatorio_personal(originales[indice:], normalizadas[indice:], ahora, tecnica)
+        if personal is not None:
+            return personal
 
     m = _RE_PROGRAMAR.match(texto)
     if m:
@@ -643,6 +919,11 @@ def _clasificar(original: str, originales: list[str], normalizadas: list[str], a
         contenido = _limpiar_fragmento(_original_desde(originales, normalizadas, m.start("x")))
         if contenido:
             return Intencion("recordar", {"contenido": contenido}, explicacion_tecnica=tecnica)
+
+    # v0.2: destinos, borradores y tecleo (antes de la búsqueda web: "busca X en YouTube").
+    v02 = _clasificar_v02(original, originales, normalizadas, ahora, destinos, tecnica)
+    if v02 is not None:
+        return v02
 
     m = _RE_BUSCAR.match(texto)
     if m:
@@ -662,8 +943,16 @@ def _clasificar(original: str, originales: list[str], normalizadas: list[str], a
     if _RE_VISTAZO.search(texto):
         return Intencion("vistazo", {}, explicacion_tecnica=tecnica)
 
+    # v0.2: "abre <alias>": primero el catálogo de destinos; si no, un alias de RAMS_APPS
+    # (lanzar_app, solo Linux). Si no es ninguno de los dos, siguen las demás reglas ("pon pausa").
+    m = _RE_ABRIR.match(texto)
+    if m:
+        alias = m.group("alias")
+        clave = _destino(alias, destinos)
+        if clave is not None:
+            return _accion("abrir_destino", {"alias": clave}, f"abrir {_nombre_destino(clave)}", tecnica)
     m = _RE_LANZAR.match(texto)
-    if m and m.group("app") in apps:
+    if m and m.group("app") in apps and _lanzar_app_permitido(plataforma):
         app = m.group("app")
         return _accion("lanzar_app", {"alias": app}, f"abrir {app}", tecnica)
 
@@ -699,15 +988,21 @@ def _clasificar(original: str, originales: list[str], normalizadas: list[str], a
 
 
 def enrutar(texto: str, *, ahora: datetime, apps: Mapping[str, str] | None = None,
-            canal: str = "terminal") -> Intencion:
+            canal: str = "terminal", destinos: Mapping[str, str] | None = None,
+            plataforma: str | None = None) -> Intencion:
     """Decide la intención de ``texto`` con reglas locales y aplica las capacidades del canal.
 
     - Las reglas se evalúan sobre ``normalizar(texto)`` en el orden de §10.12; los argumentos
-      que citan al usuario (consulta, contenido, mensaje) salen del texto **original**.
+      que citan al usuario (consulta, contenido, mensaje, texto a escribir) salen del texto
+      **original**.
     - ``explicacion_tecnica`` es ``True`` si el texto pide una explicación y tiene más de 8 palabras.
+    - ``destinos`` (v0.2): ``Settings.destinos_permitidos`` (sinónimo → clave de ``DESTINOS_BASE``);
+      ``None`` = solo las claves del catálogo (más los sinónimos de serie). ``plataforma``
+      (``sys.platform``): los alias de ``RAMS_APPS`` solo dan ``lanzar_app`` en Linux; ``None`` no
+      restringe.
     - Si ``canal`` no es local y la intención no está permitida allí, devuelve
       ``Intencion("bloqueada_canal", {"tipo_original": t, "comando": c | None})``. Un canal
-      desconocido se trata como ``nexus``.
+      desconocido se trata como ``nexus``. ``escritorio`` es local (hereda lo de la terminal).
 
     Nunca lanza: ante un error inesperado devuelve ``ninguna`` (bloqueada si el canal no la admite).
     """
@@ -716,7 +1011,8 @@ def enrutar(texto: str, *, ahora: datetime, apps: Mapping[str, str] | None = Non
     texto_norm = " ".join(normalizadas)
     tecnica = bool(_RE_TECNICA.search(texto_norm)) and len(normalizadas) > 8
     try:
-        intencion = _clasificar(original, originales, normalizadas, ahora, apps or {}, tecnica)
+        intencion = _clasificar(original, originales, normalizadas, ahora, apps or {}, tecnica,
+                                destinos=destinos, plataforma=plataforma)
     except Exception as exc:  # defensa: el enrutador nunca tumba un turno
         log.warning("Error inesperado al enrutar (%s); uso la intención 'ninguna'", type(exc).__name__)
         intencion = Intencion("ninguna", {}, explicacion_tecnica=tecnica)
