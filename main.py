@@ -148,6 +148,7 @@ _NOMBRES_MODULO: Final = {
     "hyprland": "Hyprland",
     "nexus": "Nexus IDE",
     "vts": "Puente VTube Studio",
+    "avatar3d": "Avatar 3D (VTuber AI Studio)",
     "voz": "Salida de voz",
     "telegram": "Mensajería (Telegram/RINE)",
     "web": "Investigación web",
@@ -156,12 +157,12 @@ _NOMBRES_MODULO: Final = {
 }
 
 # Orden fijo de las líneas de módulos en el arranque (maqueta de §6.4).
-_ORDEN_ARRANQUE: Final = ("broca", "camara", "telemetria", "hyprland", "vts", "voz", "telegram", "web",
+_ORDEN_ARRANQUE: Final = ("broca", "camara", "telemetria", "hyprland", "vts", "avatar3d", "voz", "telegram", "web",
                           "nexus", "hud", "control")
 
 # Tarea supervisada → clave de diagnóstico que pasa a DEGRADADO si se desactiva.
 _CLAVE_TAREA: Final = {"conectoma": "conectoma", "salida": "voz", "telemetria": "telemetria",
-                       "hyprland": "hyprland", "nexus": "nexus", "vts": "vts",
+                       "hyprland": "hyprland", "nexus": "nexus", "vts": "vts", "avatar3d": "avatar3d",
                        "telegram_entrada": "telegram", "salieri": "memoria", "agenda": "memoria"}
 
 _MESES: Final = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
@@ -525,7 +526,11 @@ class Consola:
         Sin TTY (o con ``prompt_toolkit`` activo) imprime directamente ``a → b → c``.
         """
         valores = [str(v) for v in valores]
-        if not (self.es_tty and self.ansi) or self._en_prompt_toolkit or not valores:
+        # "\r" solo vuelve al inicio de la fila física: si la línea no cabe en el ancho de la
+        # terminal, se parte en dos y la animación deja basura repetida. En ese caso, sin animar.
+        visible = len(re.sub(r"\x1b\[[0-9;]*m", "", prefijo)) + len(" → ".join(valores))
+        no_cabe = visible >= shutil.get_terminal_size((80, 24)).columns
+        if not (self.es_tty and self.ansi) or self._en_prompt_toolkit or not valores or no_cabe:
             self._emitir(prefijo + " → ".join(self._color(v, "nixie") for v in valores))
             return
         azar = random.Random()
@@ -792,6 +797,7 @@ class Orquestador:
         self.broca: Any = None
         self.web: Any = None
         self.vtube: Any = None
+        self.avatar3d: Any = None
         self.aura: Any = None
         self.permisos: Any = None
         self.presencia: Any = None
@@ -927,6 +933,11 @@ class Orquestador:
                                               lambda cls: cls(s, self.bus))
         self.web = self._construir_opcional("lobes.web_researcher", "WebResearcher", ("web",),
                                             lambda cls: cls(s, cliente=self._cliente))
+        # Avatar 3D VRM (VTuber AI Studio): escucha el bus; no sustituye a VTube Studio.
+        if getattr(s, "vtuber_ai_habilitado", False):
+            self.avatar3d = self._construir_opcional(
+                "lobes.vtuber_ai_bridge", "VTuberAIBridge", ("avatar3d",),
+                lambda cls: cls(s, self.bus, cliente=self._cliente))
 
         # 9. Presencia.
         clase_presencia = _importar_obligatorio("core.presence", "RastreadorPresencia")
@@ -1050,6 +1061,8 @@ class Orquestador:
             trabajos.append((("hud",), self.hud.iniciar, 4.0))
         if self.control is not None:
             trabajos.append((("control",), self.control.iniciar, 4.0))
+        if self.avatar3d is not None:
+            trabajos.append((("avatar3d",), self.avatar3d.iniciar, 4.0))
         resultados = await asyncio.gather(*(self._medir(f, t) for _c, f, t in trabajos))
 
         por_clave: dict[str, DiagnosticoModulo] = {}
@@ -1078,6 +1091,9 @@ class Orquestador:
             tiempos[clave] = time.monotonic() - self._inicio_mono
         if not s.vts_habilitado:
             por_clave["vts"] = DiagnosticoModulo("vts", _NOMBRES_MODULO["vts"], EstadoModulo.OFF, "deshabilitado")
+        if not getattr(s, "vtuber_ai_habilitado", False):
+            por_clave["avatar3d"] = DiagnosticoModulo("avatar3d", _NOMBRES_MODULO["avatar3d"], EstadoModulo.OFF,
+                                                      "deshabilitado")
         for clave, diag in self._diag_ausentes.items():
             por_clave.setdefault(clave, diag)
             tiempos.setdefault(clave, time.monotonic() - self._inicio_mono)
@@ -1182,9 +1198,14 @@ class Orquestador:
         coincidencia = re.search(r":(\d{1,5})(?:/|$)", self.settings.vts_url)
         if coincidencia:
             puerto_vts = int(coincidencia.group(1))
+        puerto_avatar = 3939
+        coincidencia = re.search(r":(\d{1,5})/?$", str(getattr(self.settings, "vtuber_ai_url", "")))
+        if coincidencia:
+            puerto_avatar = int(coincidencia.group(1))
         etiquetas = {
             "broca": "Área de Broca (Gemini)", "camara": "Lóbulo visual (cámara)", "telemetria": "Telemetría",
-            "hyprland": "Hyprland", "vts": f"Puente VTube Studio :{puerto_vts}", "voz": "Salida de voz",
+            "hyprland": "Hyprland", "vts": f"Puente VTube Studio :{puerto_vts}",
+            "avatar3d": f"Avatar 3D VTuber AI Studio :{puerto_avatar}", "voz": "Salida de voz",
             "telegram": "Mensajería (Telegram/RINE)", "web": "Investigación web", "nexus": "Nexus IDE",
             "hud": "HUD", "control": "Socket de control (MCP)",
         }
@@ -1239,6 +1260,7 @@ class Orquestador:
             ("nexus", lambda: self.aura.nexus.bucle_vigilancia(self.parar, self.bus),
              self.aura is not None and getattr(self.aura, "nexus", None) is not None),
             ("vts", lambda: self.vtube.bucle_reconexion(self.parar), self.vtube is not None and s.vts_habilitado),
+            ("avatar3d", lambda: self.avatar3d.bucle(self.parar), self.avatar3d is not None),
             ("telegram_entrada", lambda: self.riko.bucle_telegram_entrada(self.parar, self._manejar_telegram),
              s.tiene_telegram and s.telegram_polling),
             ("salieri", lambda: self.memoria.bucle_compresor(self.parar, presente=self._usuario_presente), True),
@@ -2549,6 +2571,7 @@ class Orquestador:
 
         # 4. Cierre de módulos en el orden normativo.
         await self._cerrar_modulo("vtube", self.vtube, limite)
+        await self._cerrar_modulo("avatar3d", self.avatar3d, limite)
         await self._cerrar_modulo("hud", self.hud, limite)
         await self._cerrar_modulo("control", self.control, limite)
         await self._cerrar_modulo("aura", self.aura, limite)

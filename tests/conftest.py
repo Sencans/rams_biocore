@@ -157,6 +157,8 @@ def _entorno_prueba(tmp_path: Path) -> dict[str, str]:
         "RAMS_CTL_PORT": "0",
         "RAMS_CTL_TOKEN_FILE": str(tmp_path / "ctl_token"),
         "VTS_ENABLED": "0",
+        # Que los tests nunca muevan un VTuber AI Studio real que esté corriendo en :3939.
+        "VTUBER_AI_ENABLED": "0",
         "RAMS_CAMERA": "0",
         "RAMS_TELEGRAM_POLL": "0",
         "RAMS_CONNECTOME_SEED": "7",

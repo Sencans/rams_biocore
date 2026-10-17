@@ -114,6 +114,8 @@ _RE_VOZ_EDGE: Final = re.compile(r"^[A-Za-z0-9\-]{3,80}$")
 _RE_ZONA: Final = re.compile(r"^[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*$")
 _RE_REGION_WEB: Final = re.compile(r"^[a-z]{2,3}-[a-z]{2,3}$")
 _RE_WS_URL: Final = re.compile(r"^wss?://\S+$")
+_RE_URL_LOCAL: Final = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?/?$")
+_RE_LANG_BCP47: Final = re.compile(r"^[a-z]{2,3}(-[A-Z]{2})?$")
 _RE_HOST: Final = re.compile(r"^[A-Za-z0-9.\-:\[\]]{1,253}$")
 _RE_HHMM: Final = re.compile(r"^(\d{1,2}):(\d{2})$")
 _RE_SALIDA_11L: Final = re.compile(r"^(?:pcm_)?(\d+)$", re.IGNORECASE)
@@ -196,6 +198,11 @@ class Settings:
     vts_url: str = "ws://localhost:8001"
     vts_plugin_nombre: str = "RAMS BioCore"
     vts_plugin_desarrollador: str = "Sencans"
+    # Avatar 3D VRM en VTuber AI Studio (HTTP local; lobes/vtuber_ai_bridge.py).
+    vtuber_ai_habilitado: bool = True
+    vtuber_ai_url: str = "http://127.0.0.1:3939"
+    vtuber_ai_tts: bool = True          # sin voz propia, habla la voz del navegador
+    vtuber_ai_lang: str = "es-MX"
     camara_habilitada: bool = False
     camara_indice: int = 0
     camara_intervalo_min_s: float = 90.0
@@ -868,6 +875,10 @@ def _cargar_settings(
         vts_url=lector.texto("VTS_URL", "ws://localhost:8001", patron=_RE_WS_URL),
         vts_plugin_nombre=lector.texto("VTS_PLUGIN_NAME", "RAMS BioCore", largo=(3, 32)),
         vts_plugin_desarrollador=lector.texto("VTS_PLUGIN_DEVELOPER", "Sencans", largo=(3, 32)),
+        vtuber_ai_habilitado=lector.booleano("VTUBER_AI_ENABLED", True),
+        vtuber_ai_url=lector.texto("VTUBER_AI_URL", "http://127.0.0.1:3939", patron=_RE_URL_LOCAL),
+        vtuber_ai_tts=lector.booleano("VTUBER_AI_TTS", True),
+        vtuber_ai_lang=lector.texto("VTUBER_AI_LANG", "es-MX", patron=_RE_LANG_BCP47),
         camara_habilitada=lector.booleano("RAMS_CAMERA", False),
         camara_indice=lector.entero("RAMS_CAMERA_INDEX", 0, minimo=0, maximo=63),
         camara_intervalo_min_s=lector.real("RAMS_CAMERA_MIN_INTERVAL_S", 90.0, minimo=0.0),

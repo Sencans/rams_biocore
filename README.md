@@ -349,6 +349,21 @@ espacios se validan con expresiones regulares y las apps solo salen de `RAMS_APP
 
 En Arch, VTube Studio se ejecuta con Steam/Proton.
 
+### 8.1 Avatar 3D en el navegador (VTuber AI Studio)
+
+Alternativa sin VTube Studio: un avatar VRM que se mueve por HTTP (`lobes/vtuber_ai_bridge.py`).
+1. Arranca VTuber AI Studio (`node server.js` en su carpeta) y abre `http://localhost:3939`.
+   Haz **un clic** en la página para que el navegador permita el audio.
+2. Arranca R.A.M.S. En el arranque verás `Avatar 3D VTuber AI Studio :3939 ... OK (1 visor(es))`.
+3. Cada respuesta de Amadeus llega al avatar como una secuencia: la expresión (`[EXP]`, p. ej.
+   `smug` → sonrisa + ojos relajados), el gesto o la pose (`[MOTION]`: asentir, brazos cruzados,
+   mirar a otro lado…) y el habla con globo y labios. La prosodia sale de `[TONE]`. En reposo,
+   la cara sigue a la homeostasis del conectoma.
+4. Si R.A.M.S. no tiene voz propia, la pone el navegador (`VTUBER_AI_TTS=1`). Con ElevenLabs
+   activo, el avatar solo mueve los labios y la voz sale de R.A.M.S.
+
+Si el servidor usa otro puerto: `VTUBER_AI_URL=http://127.0.0.1:3940`.
+
 ## 9. Nexus IDE
 
 **Servidor MCP** (Nexus → Ajustes → «Servidores MCP»):
