@@ -4,6 +4,9 @@ const assert = require('node:assert/strict');
 const {
   crearEscritorio, validarConfirmacion, validarUrlHttps, datosEscalares, textoSeguro, UrlsOfrecidas,
   ESPERA_SALIDA_MS, ESPERA_CAJA_MS, ESPERA_APARECER_MS, INTERVALO_CURSOR_ENCIMA_MS,
+  validarTarjeta, validarTarjetaCerrada, validarDecisionTarjeta,
+  MAX_CODIGO, MAX_CUERPO, MAX_SALIDA, MAX_HALLAZGOS, MAX_TARJETAS, MAX_BYTES_DECISION, RE_HUELLA,
+  CLASES_TARJETA, BOTONES_TARJETA, DECISIONES_TARJETA, NIVELES_RIESGO,
 } = require('../lib/mapeo');
 
 /**
@@ -27,6 +30,7 @@ function banco({ listo = true, wsAbierto = true } = {}) {
   const estadoChat = { visible: false, enfocado: false };
   const b = {
     llamadas,
+    envios: [], // {obj, maxBytes} de cada enviarWs
     reloj,
     estadoChat,
     listo,
@@ -53,7 +57,8 @@ function banco({ listo = true, wsAbierto = true } = {}) {
     overlayListo: () => b.listo,
     enviarOverlay: (canal, datos) => llamadas.push(['overlay', canal, datos]),
     enviarChat: (canal, datos) => llamadas.push(['chat', canal, datos]),
-    enviarWs: (obj) => {
+    enviarWs: (obj, maxBytes) => {
+      b.envios.push({ obj, maxBytes }); // también los que no salen: se comprueba el tope pedido
       if (!b.wsAbierto) return false;
       llamadas.push(['ws', obj]);
       return true;
@@ -645,4 +650,250 @@ test('mapeo: datosEscalares y textoSeguro', () => {
   assert.deepEqual(datosEscalares(undefined), {});
   assert.equal(textoSeguro(5, 10), '');
   assert.equal(textoSeguro('a\tb\u0001', 10), 'a\tb');
+});
+
+// ------------------------------------------------------------------ tarjetas aprobables (v0.2.2, §12–§13)
+
+const H = 'ab'.repeat(32);
+const SECCIONES = {
+  correo: () => ({ para: ['ana@example.com'], cc: [], cco: [], asunto: 'Informe', cuerpo: 'Hola Ana,\n\tadjunto.',
+    adjuntos: [{ nombre: 'informe.pdf', bytes: 2048, carpeta: 'documentos' }], problemas: [], avisos: [], listo: true }),
+  drive: () => ({ op: 'subir', paso: 1, archivo: null, local: { nombre: 'plan.xlsx', bytes: 2100000, carpeta: 'documentos' },
+    carpeta_destino: 'Trabajo', compartir: null, problemas: [], listo: true }),
+  script: () => ({ lenguaje: 'powershell', plataforma: 'windows', codigo: 'Get-ChildItem\n', explicacion: 'Lista',
+    efectos: ['solo lee'], requisitos: [], nivel: 'bajo', ejecutable: true, motivo_no_ejecutable: '', metodo: 'ast',
+    hallazgos: [], hallazgos_omitidos: 0, habilidad: null, habilidad_cambiada: false, ejecuciones: 0 }),
+  salida: () => ({ script_id: '5c1a7e00', lenguaje: 'powershell', codigo_salida: 0, tiempo_agotado: false,
+    duracion_s: 1.25, stdout: '42\n', stderr: '', recortada: false, carpeta: 'taller/5c1a7e00' }),
+};
+const BOTONES = { correo: ['aprobar', 'editar', 'descartar'], drive: ['aprobar', 'descartar'],
+  script: ['aprobar', 'guardar', 'copiar', 'descartar'], salida: ['descartar'] };
+
+function tarjeta(clase = 'correo', { id = '0a1b2c3d', version = 1, seccion, ...resto } = {}) {
+  const t = { id, clase, version, sha256: H, titulo: `Tarjeta de ${clase}`, resumen: 'Revísala', aviso: '',
+    botones: [...BOTONES[clase]], caduca_ts: 1800000000, canal_origen: 'escritorio',
+    estado: clase === 'salida' ? 'info' : 'pendiente', correo: null, drive: null, script: null, salida: null, ...resto };
+  t[clase] = seccion || SECCIONES[clase]();
+  return t;
+}
+const conSeccion = (clase, cambios) => tarjeta(clase, { seccion: { ...SECCIONES[clase](), ...cambios } });
+const msgTarjeta = (t) => ({ tipo: 'tarjeta', datos: t });
+const NO_MOLESTAR = (activo, usuario) => ({ tipo: 'no_molestar', datos: { activo, motivo: usuario ? 'usuario' : 'juego', usuario } });
+
+test('mapeo/tarjetas: constantes iguales a core/contracts.py', () => {
+  assert.deepEqual([MAX_CODIGO, MAX_CUERPO, MAX_SALIDA, MAX_HALLAZGOS, MAX_TARJETAS, MAX_BYTES_DECISION],
+    [24576, 10000, 8192, 20, 4, 61440]);
+  assert.deepEqual(CLASES_TARJETA, ['correo', 'drive', 'script', 'salida']);
+  assert.deepEqual(BOTONES_TARJETA, ['aprobar', 'aprobar_publico', 'editar', 'guardar', 'copiar', 'descartar']);
+  assert.deepEqual(DECISIONES_TARJETA, ['aprobar', 'aprobar_publico', 'editar', 'guardar', 'descartar']);
+  assert.deepEqual(NIVELES_RIESGO, ['bajo', 'medio', 'alto', 'critico']);
+  assert.ok(RE_HUELLA.test(H) && !RE_HUELLA.test('AB'.repeat(32)));
+});
+
+test('mapeo/tarjetas: validarTarjeta — esquema exacto, informativos recortados, aprobables intactos', () => {
+  const t = validarTarjeta({ ...tarjeta('correo'), extra: 'x', titulo: 'T'.repeat(200), drive: { op: 'subir' },
+    botones: ['aprobar', 'copiar', 'aprobar', 'volar', 'descartar'], canal_origen: 'nexus', estado: 'cerrada' });
+  assert.deepEqual(Object.keys(t).sort(), ['aviso', 'botones', 'caduca_ts', 'canal_origen', 'clase', 'correo', 'drive',
+    'estado', 'id', 'resumen', 'salida', 'script', 'sha256', 'titulo', 'version']);
+  assert.equal(t.titulo.length, 120);
+  assert.deepEqual(t.botones, ['aprobar', 'descartar']);
+  assert.equal(t.canal_origen, 'escritorio');
+  assert.equal(t.estado, 'pendiente');
+  assert.equal(t.drive, null);
+  assert.equal(t.correo.cuerpo, 'Hola Ana,\n\tadjunto.');
+  // En el tope: intactos (en .length = unidades UTF-16).
+  const cuerpo = '😀'.repeat(5000);
+  assert.equal(validarTarjeta(conSeccion('correo', { cuerpo })).correo.cuerpo, cuerpo);
+  const codigo = 'x'.repeat(MAX_CODIGO);
+  assert.equal(validarTarjeta(conSeccion('script', { codigo })).script.codigo, codigo);
+  // Crítico: nunca ejecutable y sin «aprobar» ni «guardar».
+  const critico = validarTarjeta(conSeccion('script', { nivel: 'critico', ejecutable: true }));
+  assert.equal(critico.script.ejecutable, false);
+  assert.deepEqual(critico.botones, ['copiar', 'descartar']);
+  // Hallazgos: ≤ 20, de más a menos grave; el resto (y los inválidos) suman a hallazgos_omitidos.
+  const hallazgos = Array.from({ length: 25 }, (_v, i) => ({ nivel: i % 2 ? 'alto' : 'bajo', categoria: 'red', linea: i, detalle: 'd' }));
+  hallazgos.push({ nivel: 'raro', categoria: 'red' });
+  const s = validarTarjeta(conSeccion('script', { hallazgos, hallazgos_omitidos: 2 })).script;
+  assert.equal(s.hallazgos.length, 20);
+  assert.equal(s.hallazgos_omitidos, 2 + 1 + 5);
+  assert.deepEqual(s.hallazgos.slice(0, 12).map((h) => h.nivel), Array(12).fill('alto'));
+  // Salida → info.
+  assert.equal(validarTarjeta(tarjeta('salida')).estado, 'info');
+});
+
+test('mapeo/tarjetas: un campo aprobable fuera de tope → null (NUNCA se recorta)', () => {
+  const casos = [
+    ['correo', { cuerpo: 'x'.repeat(10001) }],
+    ['correo', { cuerpo: `${'a'.repeat(9999)}😀` }],     // 10 001 unidades UTF-16
+    ['correo', { asunto: 'x'.repeat(201) }],
+    ['correo', { para: ['x'.repeat(255)] }],
+    ['correo', { para: 'ana@example.com' }],
+    ['correo', { cc: Array(50).fill('a@b.co') }],         // 51 direcciones
+    ['correo', { adjuntos: Array(6).fill({ nombre: 'a', bytes: 1, carpeta: 'd' }) }],
+    ['correo', { adjuntos: [{ nombre: 'n'.repeat(256), bytes: 1, carpeta: 'd' }] }],
+    ['correo', { cuerpo: 7 }],
+    ['script', { codigo: 'x'.repeat(MAX_CODIGO + 1) }],
+    ['script', { codigo: null }],
+    ['drive', { local: { nombre: 'n'.repeat(256), bytes: 1, carpeta: 'd' } }],
+    ['drive', { compartir: { con: 'c'.repeat(255), rol: 'reader', publico: false } }],
+  ];
+  for (const [clase, cambios] of casos) assert.equal(validarTarjeta(conSeccion(clase, cambios)), null, JSON.stringify(cambios).slice(0, 60));
+  for (const malo of [{ id: '0A1B2C3D' }, { clase: 'otra' }, { version: 0 }, { version: '1' }, { sha256: 'x' }]) {
+    assert.equal(validarTarjeta({ ...tarjeta('correo'), ...malo }), null);
+  }
+  assert.equal(validarTarjeta(conSeccion('drive', { op: 'borrar' })), null);
+  assert.equal(validarTarjeta(conSeccion('drive', { paso: 3 })), null);
+  assert.equal(validarTarjeta(conSeccion('script', { nivel: 'extremo' })), null);
+  assert.equal(validarTarjeta(null), null);
+  assert.deepEqual(validarTarjetaCerrada({ id: '0a1b2c3d', clase: 'correo', estado: 'cerrada', resultado: 'enviado', motivo: 'ok', x: 1 }),
+    { id: '0a1b2c3d', clase: 'correo', estado: 'cerrada', resultado: 'enviado', motivo: 'ok' });
+  assert.equal(validarTarjetaCerrada({ id: '0a1b2c3d', clase: 'correo', estado: 'cerrada', resultado: 'volado' }), null);
+});
+
+test('mapeo/tarjetas: validarDecisionTarjeta — reglas de §12.3, nunca recorta', () => {
+  const v = { version: 3 };
+  assert.deepEqual(validarDecisionTarjeta('0a1b2c3d', H, 'aprobar', v), { id: '0a1b2c3d', sha256: H, decision: 'aprobar', version: 3 });
+  assert.deepEqual(validarDecisionTarjeta('0a1b2c3d', H, 'guardar', { ...v, nombre: '  limpiar  ' }),
+    { id: '0a1b2c3d', sha256: H, decision: 'guardar', version: 3, nombre: 'limpiar' });
+  const campos = { cuerpo: '😀'.repeat(5000), para: 'x'.repeat(2600), asunto: '€'.repeat(200), adjuntos: 'a.pdf, b.pdf' };
+  assert.deepEqual(validarDecisionTarjeta('0a1b2c3d', H, 'editar', { ...v, campos }).campos, campos);
+  // «descartar» no ejecuta nada: la versión es opcional (compatibilidad); el resto, obligatoria.
+  assert.deepEqual(validarDecisionTarjeta('0a1b2c3d', H, 'descartar'), { id: '0a1b2c3d', sha256: H, decision: 'descartar' });
+  const malos = [
+    ['0A1B2C3D', H, 'aprobar', v], ['0a1b2c3d', 'x', 'aprobar', v], ['0a1b2c3d', H, 'copiar', v],
+    ['0a1b2c3d', H, 'aprobar'], ['0a1b2c3d', H, 'aprobar_publico', {}], ['0a1b2c3d', H, 'aprobar', { version: 0 }],
+    ['0a1b2c3d', H, 'aprobar', { version: 1.5 }], ['0a1b2c3d', H, 'aprobar', { version: '1' }],
+    ['0a1b2c3d', H, 'aprobar', { version: 2 ** 31 }], ['0a1b2c3d', H, 'descartar', { version: -1 }],
+    ['0a1b2c3d', H, 'guardar', { nombre: 'x' }], ['0a1b2c3d', H, 'editar', { campos: { cuerpo: 'x' } }],
+    ['0a1b2c3d', H, 'aprobar', { ...v, nombre: 'x' }], ['0a1b2c3d', H, 'descartar', { campos: {} }],
+    ['0a1b2c3d', H, 'guardar', v], ['0a1b2c3d', H, 'guardar', { ...v, nombre: '   ' }],
+    ['0a1b2c3d', H, 'guardar', { ...v, nombre: 'n'.repeat(41) }],
+    ['0a1b2c3d', H, 'guardar', { ...v, nombre: 'a\nb' }], ['0a1b2c3d', H, 'editar', v], ['0a1b2c3d', H, 'editar', { ...v, campos: null }],
+    ['0a1b2c3d', H, 'editar', { ...v, campos: { firma: 'x' } }], ['0a1b2c3d', H, 'editar', { ...v, campos: { cuerpo: 'x'.repeat(10001) } }],
+    ['0a1b2c3d', H, 'editar', { ...v, campos: { cuerpo: `${'😀'.repeat(5000)}x` } }],
+    ['0a1b2c3d', H, 'editar', { ...v, campos: { para: 'x'.repeat(2601) } }], ['0a1b2c3d', H, 'editar', { ...v, campos: { asunto: 'a\nb' } }],
+    ['0a1b2c3d', H, 'editar', { ...v, campos: { cuerpo: 'a\rb' } }], ['0a1b2c3d', H, 'editar', { ...v, campos: { cuerpo: 5 } }],
+    ['0a1b2c3d', H, 'editar', { ...v, campos: { cuerpo: 'Hola\u000bAna' } }], ['0a1b2c3d', H, 'editar', { ...v, campos: { asunto: 'Informe\tQ3' } }],
+  ];
+  for (const args of malos) assert.equal(validarDecisionTarjeta(...args), null, JSON.stringify(args).slice(0, 80));
+  assert.ok(validarDecisionTarjeta('0a1b2c3d', H, 'editar', { ...v, campos: { cuerpo: 'línea\n\tsangrada' } }));
+});
+
+test('mapeo/tarjetas: una pendiente NUEVA → chat:tarjeta y chat.showInactive() (nunca focus); repetida o info no reabre', () => {
+  const b = banco();
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  assert.equal(b.esc.alMensajeWs(msgTarjeta(tarjeta('correo'))), true);
+  assert.deepEqual(b.ipc('chat:tarjeta').map((t) => [t.id, t.estado]), [['0a1b2c3d', 'pendiente']]);
+  assert.deepEqual(b.nombres().filter((n) => n.startsWith('chat.')), ['chat.showInactive']);
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('correo', { version: 2 })));        // misma id: no vuelve a abrir
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('salida', { id: '5a11da00' })));    // informativa: no abre
+  assert.deepEqual(b.nombres().filter((n) => n.startsWith('chat.')), ['chat.showInactive']);
+  assert.equal(b.ipc('chat:tarjeta').length, 3);
+  // Con «no molestar» (del usuario o automático) no se abre el chat.
+  b.esc.alMensajeWs(NO_MOLESTAR(true, false));
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('drive', { id: '00000003' })));
+  b.esc.alMensajeWs(NO_MOLESTAR(true, true));
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '00000004' })));
+  assert.deepEqual(b.nombres().filter((n) => n.startsWith('chat.')), ['chat.showInactive']);
+  assert.ok(!b.nombres().includes('chat.focus') && !b.nombres().includes('chat.show'));
+  assert.equal(b.esc.estado().tarjetas, 4);
+  // Inválida: no sale.
+  assert.equal(b.esc.alMensajeWs(msgTarjeta(conSeccion('correo', { cuerpo: 'x'.repeat(10001) }))), false);
+});
+
+test('mapeo/tarjetas: versión vieja ignorada, igual reemplaza; cerrada → chat:tarjeta cerrada y deja de estar vigente', () => {
+  const b = banco();
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '5c1a7e00', version: 3 })));
+  assert.equal(b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '5c1a7e00', version: 2 }))), false);
+  assert.equal(b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '5c1a7e00', version: 3, aviso: 'Cambió' }))), true);
+  assert.equal(b.ipc('chat:tarjeta').at(-1).aviso, 'Cambió');
+  assert.equal(b.esc.codigoDeTarjeta('5c1a7e00'), 'Get-ChildItem\n');
+  b.esc.alMensajeWs({ tipo: 'tarjeta', datos: { id: '5c1a7e00', clase: 'script', estado: 'cerrada', resultado: 'descartado', motivo: '' } });
+  assert.deepEqual(b.ipc('chat:tarjeta').at(-1), { id: '5c1a7e00', clase: 'script', estado: 'cerrada', resultado: 'descartado', motivo: '' });
+  assert.equal(b.esc.codigoDeTarjeta('5c1a7e00'), null);
+  assert.equal(b.esc.estado().tarjetas, 0);
+});
+
+test('mapeo/tarjetas: codigoDeTarjeta solo de una tarjeta de SCRIPT vigente', () => {
+  const b = banco();
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('correo')));
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '5c1a7e00' })));
+  assert.equal(b.esc.codigoDeTarjeta('0a1b2c3d'), null);           // un correo no se copia
+  assert.equal(b.esc.codigoDeTarjeta('5c1a7e00'), 'Get-ChildItem\n');
+  for (const malo of ['5C1A7E00', '5c1a7e0', null, 42, { id: '5c1a7e00' }]) assert.equal(b.esc.codigoDeTarjeta(malo), null);
+});
+
+test('mapeo/tarjetas: revisión tras reconectar — la que vuelve sigue vigente; la que no, «ya no está vigente»', () => {
+  const b = banco();
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('correo')));
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '5c1a7e00' })));
+  b.esc.alDesconectado();
+  b.llamadas.length = 0;
+  // instantánea: hola, tarjetas vigentes (solo el correo), no_molestar
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  assert.equal(b.esc.codigoDeTarjeta('5c1a7e00'), null);           // en revisión: no se copia
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('correo')));
+  assert.equal(b.ipc('chat:tarjeta').length, 1);                     // aún en revisión
+  b.esc.alMensajeWs(NO_MOLESTAR(false, false));
+  assert.deepEqual(b.ipc('chat:tarjeta').at(-1), { id: '5c1a7e00', clase: 'script', estado: 'cerrada', resultado: 'caducado',
+    motivo: '', caducada: true });
+  assert.ok(!b.nombres().includes('chat.showInactive'));            // la que vuelve no reabre el chat
+  b.avanzar(10_000);
+  assert.equal(b.ipc('chat:tarjeta').length, 2);
+  // Con un permiso y una tarjeta en revisión, ni `permiso` ni `tarjeta` cierran la revisión.
+  b.esc.alDesconectado();
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  b.esc.alMensajeWs(PEND('deadbeef'));
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('drive', { id: '00000003' })));
+  assert.equal(b.ipc('chat:tarjeta').filter((t) => t.caducada).length, 1);
+  b.esc.alMensajeWs({ tipo: 'travesuras', datos: { activas: false } });
+  assert.deepEqual(b.ipc('chat:tarjeta').filter((t) => t.caducada).map((t) => t.id), ['5c1a7e00', '0a1b2c3d']);
+});
+
+test('mapeo/tarjetas: alChatCargado reenvía las vigentes (de la más vieja a la más nueva) antes del estado', () => {
+  const b = banco();
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('correo')));
+  b.esc.alMensajeWs(msgTarjeta(tarjeta('script', { id: '5c1a7e00' })));
+  b.llamadas.length = 0;
+  b.esc.alChatCargado();
+  assert.deepEqual(b.ipc('chat:tarjeta').map((t) => t.id), ['0a1b2c3d', '5c1a7e00']);
+  assert.deepEqual(b.llamadas.map((l) => l[1]), ['chat:tarjeta', 'chat:tarjeta', 'chat:status']);
+});
+
+test('mapeo/tarjetas: alDecidirTarjeta envía con maxBytes 61440; los demás envíos, sin maxBytes', () => {
+  const b = banco();
+  b.esc.alConectado();                                   // hola_app y evento
+  b.esc.alMensajeWs({ tipo: 'hola', datos: {} });
+  b.esc.alChatSend('hola');
+  b.esc.alConfirmar('deadbeef', true);
+  b.esc.control('no_molestar_on', 'chat');
+  b.esc.alEventoOverlay('toque', {});
+  const campos = { cuerpo: '€'.repeat(10000), para: '€'.repeat(2600), cc: '€'.repeat(2600), cco: '€'.repeat(2600),
+    asunto: '€'.repeat(200), adjuntos: '€'.repeat(1000) };   // el «editar» más grande posible (≈ 57 KB)
+  assert.equal(b.esc.alDecidirTarjeta('0a1b2c3d', H, 'editar', { campos, version: 2 }), true);
+  assert.equal(b.esc.alDecidirTarjeta('0a1b2c3d', H, 'aprobar', { version: 3 }), true);
+  const decisiones = b.envios.filter((e) => e.obj.tipo === 'tarjeta_decision');
+  assert.deepEqual(decisiones.map((e) => e.maxBytes), [61440, 61440]);
+  assert.deepEqual(decisiones[0].obj, { tipo: 'tarjeta_decision', id: '0a1b2c3d', sha256: H, decision: 'editar', version: 2, campos });
+  assert.deepEqual(decisiones[1].obj, { tipo: 'tarjeta_decision', id: '0a1b2c3d', sha256: H, decision: 'aprobar', version: 3 });
+  assert.ok(Buffer.byteLength(JSON.stringify(decisiones[0].obj), 'utf8') > 8192);
+  const otros = b.envios.filter((e) => e.obj.tipo !== 'tarjeta_decision');
+  assert.deepEqual([...new Set(otros.map((e) => e.obj.tipo))].sort(), ['chat', 'confirmacion', 'control', 'evento', 'hola_app']);
+  assert.ok(otros.every((e) => e.maxBytes === undefined));
+  // Inválida: false sin enviar nada (también un «aprobar» sin la versión que se ve).
+  const n = b.envios.length;
+  assert.equal(b.esc.alDecidirTarjeta('0a1b2c3d', H, 'editar', { campos: { cuerpo: 'x'.repeat(10001) }, version: 2 }), false);
+  assert.equal(b.esc.alDecidirTarjeta('0a1b2c3d', H, 'copiar', { version: 2 }), false);
+  assert.equal(b.esc.alDecidirTarjeta('0a1b2c3d', H, 'aprobar'), false);
+  assert.equal(b.envios.length, n);
+});
+
+test('mapeo/tarjetas: alDecidirTarjeta sin WebSocket → false', () => {
+  const b = banco({ wsAbierto: false });
+  assert.equal(b.esc.alDecidirTarjeta('0a1b2c3d', H, 'descartar'), false);
+  assert.equal(b.ws().length, 0);
 });

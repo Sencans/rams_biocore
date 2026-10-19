@@ -8,6 +8,7 @@ asíncronas usan ``asyncio.run`` (fixture ``correr`` de tests/conftest.py).
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import inspect
 import json
 import math
@@ -130,6 +131,7 @@ def _vision(settings: Settings, bus: BusEventos | None = None, **kwargs: Any) ->
 
 
 def test_fuente_sin_persistencia_ni_red() -> None:
+    # La foto que pide el usuario (instantanea_jpeg) la codifica lobes.capturas: aquí no hay imencode.
     crudo = Path(inspect.getsourcefile(vc_mod) or "").read_bytes()
     fuente = crudo.decode("utf-8")
     for prohibido in ("imwrite", "imencode", "VideoWriter", "ImageGrab", "pytesseract", "base64", "httpx",
@@ -1332,3 +1334,304 @@ def test_con_terceros_no_se_mide_la_atencion() -> None:
         integ.muestra(_m(k / 3, n=2, dist=0.5))
         integ.tick(k / 3)
     assert integ.atencion < sola
+
+
+# ---------------------------------------------------------------------------
+# instantanea_jpeg: la foto que el usuario pide (grupo telegram, v0.2.1)
+# ---------------------------------------------------------------------------
+
+
+def test_instantanea_jpeg_api() -> None:
+    assert inspect.iscoroutinefunction(VisionContinua.instantanea_jpeg)
+    firma = inspect.signature(VisionContinua.instantanea_jpeg)
+    assert firma.parameters["calidad"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert firma.parameters["calidad"].default == 85 and firma.parameters["max_lado"].default == 1600
+
+
+def test_instantanea_jpeg_del_ultimo_cuadro_y_nunca_en_pausa(settings_vision: Settings, bus: BusEventos,
+                                                             correr, monkeypatch: pytest.MonkeyPatch) -> None:
+    pytest.importorskip("cv2")
+    import lobes.capturas as cap_mod
+
+    hilos: list[str] = []
+    codificar_real = cap_mod.codificar_jpeg
+
+    def codificar(imagen: Any, **kw: Any) -> Any:
+        hilos.append(threading.current_thread().name)
+        return codificar_real(imagen, **kw)
+
+    monkeypatch.setattr(cap_mod, "codificar_jpeg", codificar)
+    eventos = _eventos(bus, "*")
+    vision = _vision(settings_vision.con(vision_fps=5.0), bus, fabrica_captura=lambda indice: CapturaFalsa())
+    vision._crear_detector = lambda tam: (None, None)  # type: ignore[method-assign]
+
+    async def principal() -> dict[str, Any]:
+        datos: dict[str, Any] = {"antes": await vision.instantanea_jpeg()}   # sin iniciar: nada
+        await vision.iniciar()
+        assert await _esperar(lambda: vision._ultima_cam is not None and vision._cuadro is not None)
+        datos["foto"] = await vision.instantanea_jpeg(calidad=70, max_lado=320)
+        # Cuadro viejo (el hilo se atascó): no se manda una foto de hace rato.
+        vision._guardar_cuadro = lambda gen, cuadro: None  # type: ignore[method-assign]
+        with vision._cerrojo_cuadro:
+            vision._cuadro_ts -= 60.0
+        datos["vieja"] = await vision.instantanea_jpeg()
+        del vision._guardar_cuadro
+        # Autopausa por app de llamada: la cámara es de la llamada.
+        vision._aplicar_entorno(vision._reloj(), {"app": "zoom"})
+        datos["llamada"] = await vision.instantanea_jpeg()
+        vision._llamada_hasta = -math.inf
+        vision._aplicar_entorno(vision._reloj(), {})
+        # "Deja de mirarme": nada, y el cuadro se suelta enseguida.
+        assert await _esperar(lambda: vision._cam_abierta and vision._cuadro is not None)
+        vision.pausar()
+        datos["pausada"] = await vision.instantanea_jpeg()
+        assert await _esperar(lambda: vision._hilo_cam is None)
+        datos["cuadro_tras_pausa"] = vision._cuadro
+        await vision.cerrar()
+        datos["cerrada"] = await vision.instantanea_jpeg()
+        datos["cuadro_final"] = vision._cuadro
+        return datos
+
+    datos = correr(principal())
+    assert datos["antes"] is None
+    foto = datos["foto"]
+    assert isinstance(foto, bytes) and foto.startswith(b"\xff\xd8")
+    assert cap_mod.dimensiones_jpeg(foto) == (320, 240)
+    assert hilos and all(h != threading.main_thread().name for h in hilos)   # codificado en el executor
+    assert datos["vieja"] is None
+    assert datos["llamada"] is None and datos["pausada"] is None and datos["cerrada"] is None
+    assert datos["cuadro_tras_pausa"] is None and datos["cuadro_final"] is None
+    _verificar_payloads(eventos)                                  # al bus nunca salen bytes
+    assert not any(isinstance(v, (bytes, bytearray)) for _, d in eventos for v in d.values())
+
+
+def test_instantanea_jpeg_sin_camara_continua(settings_prueba: Settings, correr) -> None:
+    vision = _vision(settings_prueba)                             # RAMS_CAMERA=0: nunca hay cuadro
+    assert correr(vision.instantanea_jpeg()) is None
+    vision._cam_abierta = True                                    # aunque se fuerce, sin opt-in no hay foto
+    vision._cuadro = np.zeros((10, 10, 3), dtype=np.uint8)
+    vision._cuadro_ts = time.monotonic()
+    assert correr(vision.instantanea_jpeg()) is None
+
+
+# ---------------------------------------------------------------------------
+# Pausa del usuario frente a la autopausa (fotos pedidas por Telegram)
+# ---------------------------------------------------------------------------
+
+
+def test_pausada_por_usuario_distingue_la_autopausa(settings_vision: Settings) -> None:
+    """La autopausa también da estado().camara == "pausada", pero no es un "deja de mirarme"."""
+    reloj = Reloj(0.0)
+    vision = _vision(settings_vision, reloj=reloj)
+    assert vision.pausada_por_usuario() is False
+    for entorno in ({"bloqueada": True}, {"juego": True}, {"bateria_pct": 10.0, "cargando": False}):
+        vision._aplicar_entorno(reloj.t, entorno)
+        assert vision.estado().camara == "pausada" and vision._autopausa
+        assert vision.pausada_por_usuario() is False, entorno
+    vision._aplicar_entorno(reloj.t, {})
+    vision.pausar(30.0)
+    assert vision.pausada_por_usuario() is True and vision.estado().camara == "pausada"
+    reloj.t = 31.0
+    assert vision.pausada_por_usuario() is False                 # la pausa caducó
+    vision.pausar()                                               # hasta reanudar
+    reloj.t = 10_000.0
+    assert vision.pausada_por_usuario() is True
+    vision.reanudar()
+    assert vision.pausada_por_usuario() is False
+
+
+# ---------------------------------------------------------------------------
+# Win32: ventanas visibles en una región (API falsa: nunca toca el escritorio real)
+# ---------------------------------------------------------------------------
+
+
+class _RectFalso(ctypes.Structure):
+    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+
+class _User32Falso:
+    def __init__(self, ventanas: dict[int, dict[str, Any]], *, enum_falla: bool = False) -> None:
+        self.ventanas = ventanas
+        self.enum_falla = enum_falla
+
+    def EnumWindows(self, retrollamada: Any, lparam: Any) -> int:  # noqa: N802 - API de Win32
+        if self.enum_falla:
+            return 0
+        for hwnd in self.ventanas:
+            if not retrollamada(hwnd, lparam):
+                return 0
+        return 1
+
+    def IsWindowVisible(self, hwnd: int) -> int:  # noqa: N802
+        return int(self.ventanas[hwnd].get("visible", True))
+
+    def IsIconic(self, hwnd: int) -> int:  # noqa: N802
+        return int(self.ventanas[hwnd].get("minimizada", False))
+
+    def GetWindowRect(self, hwnd: int, ref: Any) -> int:  # noqa: N802
+        rect = ref._obj
+        rect.left, rect.top, rect.right, rect.bottom = self.ventanas[hwnd]["rect"]
+        return 1
+
+    def GetWindowTextW(self, hwnd: int, buffer: Any, n: int) -> int:  # noqa: N802
+        buffer.value = self.ventanas[hwnd].get("titulo", "")
+        return len(buffer.value)
+
+    def GetClassNameW(self, hwnd: int, buffer: Any, n: int) -> int:  # noqa: N802
+        buffer.value = self.ventanas[hwnd].get("clase", "")
+        return len(buffer.value)
+
+    def GetWindowThreadProcessId(self, hwnd: int, ref: Any) -> int:  # noqa: N802
+        ref._obj.value = self.ventanas[hwnd].get("pid", 0)
+        return 1
+
+
+class _Kernel32Falso:
+    def __init__(self, exes: dict[int, str]) -> None:
+        self.exes = exes
+        self.aperturas: list[int] = []
+
+    def OpenProcess(self, acceso: int, heredar: bool, pid: int) -> int:  # noqa: N802
+        self.aperturas.append(pid)
+        return pid
+
+    def QueryFullProcessImageNameW(self, manejador: int, banderas: int, buffer: Any, ref: Any) -> int:  # noqa: N802
+        buffer.value = self.exes[manejador]
+        return 1
+
+    def CloseHandle(self, manejador: int) -> int:  # noqa: N802
+        return 1
+
+
+class _DwmFalso:
+    def __init__(self, ventanas: dict[int, dict[str, Any]]) -> None:
+        self.ventanas = ventanas
+
+    def DwmGetWindowAttribute(self, hwnd: int, atributo: int, ref: Any, tam: int) -> int:  # noqa: N802
+        ventana = self.ventanas[hwnd]
+        if atributo == 14:                                        # DWMWA_CLOAKED
+            ref._obj.value = 1 if ventana.get("oculta") else 0
+            return 0
+        if atributo == 9 and ventana.get("marco") is not None:   # DWMWA_EXTENDED_FRAME_BOUNDS
+            rect = ref._obj
+            rect.left, rect.top, rect.right, rect.bottom = ventana["marco"]
+            return 0
+        return -2147024809                                        # E_INVALIDARG: se usa GetWindowRect
+
+
+def _win32_falso(ventanas: dict[int, dict[str, Any]], *, dwm: bool = True,
+                 enum_falla: bool = False) -> tuple[Any, _Kernel32Falso]:
+    win = object.__new__(vc_mod._Win32)
+    kernel = _Kernel32Falso({10: "C:\\Programas\\Code.exe", 11: "C:\\Programas\\KeePassXC.exe",
+                             12: "C:\\Windows\\explorer.exe"})
+    win._ct = ctypes
+    win._wt = types.SimpleNamespace(DWORD=ctypes.c_uint32)
+    win._RECT = _RectFalso
+    win._WNDENUMPROC = lambda funcion: funcion
+    win._u = _User32Falso(ventanas, enum_falla=enum_falla)
+    win._k = kernel
+    win._d = _DwmFalso(ventanas) if dwm else None
+    return win, kernel
+
+
+_MONITOR = {"left": 0, "top": 0, "width": 1920, "height": 1080}
+_VENTANAS: dict[int, dict[str, Any]] = {
+    1: {"titulo": "Visual Studio Code", "clase": "Chrome_WidgetWin_1", "pid": 10,
+        "rect": (-8, -8, 1928, 1048), "marco": (0, 0, 1920, 1040)},
+    2: {"titulo": "Ventana invisible", "visible": False, "pid": 12, "rect": (0, 0, 800, 600)},
+    3: {"titulo": "Minimizada", "minimizada": True, "pid": 12, "rect": (-32000, -32000, -31840, -31972)},
+    4: {"titulo": "Otro escritorio virtual", "oculta": True, "pid": 12, "rect": (0, 0, 800, 600),
+        "marco": (0, 0, 800, 600)},
+    5: {"titulo": "Maximizada en el otro monitor", "pid": 12, "rect": (1912, -8, 4488, 1448),
+        "marco": (1920, 0, 4480, 1440)},
+    6: {"titulo": "Sin área", "pid": 12, "rect": (100, 100, 100, 300), "marco": (100, 100, 100, 300)},
+    7: {"titulo": "Base.kdbx - KeePassXC", "clase": "Qt5QWindowIcon", "pid": 11, "rect": (500, 200, 1200, 800)},
+    8: {"titulo": "Terminal", "clase": "Chrome_WidgetWin_1", "pid": 10, "rect": (0, 0, 640, 480),
+        "marco": (0, 0, 640, 480)},
+}
+
+
+def test_win32_ventanas_visibles_en_la_region() -> None:
+    win, kernel = _win32_falso(_VENTANAS)
+    visibles = win.ventanas_visibles(_MONITOR)
+    assert visibles == [
+        {"app": "code", "titulo": "Visual Studio Code", "clase": "Chrome_WidgetWin_1"},
+        {"app": "keepassxc", "titulo": "Base.kdbx - KeePassXC", "clase": "Qt5QWindowIcon"},   # sin DWM: GetWindowRect
+        {"app": "code", "titulo": "Terminal", "clase": "Chrome_WidgetWin_1"},
+    ]
+    assert sorted(kernel.aperturas) == [10, 11]                  # un OpenProcess por proceso
+    # La maximizada del monitor de al lado sí sale en ESE monitor.
+    otro = win.ventanas_visibles({"left": 1920, "top": 0, "width": 2560, "height": 1440})
+    assert [v["titulo"] for v in otro] == ["Maximizada en el otro monitor"]
+
+
+def test_win32_ventanas_visibles_sin_dwm_y_fallos() -> None:
+    # Sin DWM: los bordes invisibles de GetWindowRect y las ventanas ocultas cuentan (ante la duda, se miran).
+    win, _ = _win32_falso(_VENTANAS, dwm=False)
+    titulos = [v["titulo"] for v in win.ventanas_visibles(_MONITOR)]
+    assert "Otro escritorio virtual" in titulos and "Maximizada en el otro monitor" in titulos
+    assert "Ventana invisible" not in titulos and "Minimizada" not in titulos
+    # Falla cerrada: más ventanas que el máximo, EnumWindows roto o región no válida ⇒ None.
+    assert win.ventanas_visibles(_MONITOR, maximo=3) is None
+    roto, _ = _win32_falso(_VENTANAS, enum_falla=True)
+    assert roto.ventanas_visibles(_MONITOR) is None
+    for region in ({}, {"left": 0, "top": 0, "width": 0, "height": 1080}, {"left": "x", "top": 0}):
+        assert win.ventanas_visibles(region) is None
+
+
+# ---------------------------------------------------------------------------
+# Socket de Hyprland: respuestas grandes en varios trozos
+# ---------------------------------------------------------------------------
+
+
+class _LectorTrozos:
+    def __init__(self, datos: bytes, trozo: int) -> None:
+        self.datos = datos
+        self.trozo = trozo
+
+    async def read(self, n: int = -1) -> bytes:
+        tam = min(self.trozo, n if n > 0 else len(self.datos))
+        parte, self.datos = self.datos[:tam], self.datos[tam:]
+        return parte
+
+
+class _EscritorFalso:
+    def __init__(self) -> None:
+        self.escrito = b""
+        self.cerrado = False
+
+    def write(self, datos: bytes) -> None:
+        self.escrito += datos
+
+    async def drain(self) -> None:
+        return None
+
+    def close(self) -> None:
+        self.cerrado = True
+
+    async def wait_closed(self) -> None:
+        return None
+
+
+def test_consulta_hypr_socket_lee_hasta_el_final(correr, monkeypatch: pytest.MonkeyPatch) -> None:
+    clientes = [{"class": f"app{i}", "title": "x" * 100, "workspace": {"id": i % 4}} for i in range(800)]
+    respuestas: dict[str, bytes] = {"actual": json.dumps(clientes).encode("utf-8")}
+    escritores: list[_EscritorFalso] = []
+
+    async def abrir(ruta: str) -> tuple[_LectorTrozos, _EscritorFalso]:
+        escritores.append(_EscritorFalso())
+        return _LectorTrozos(respuestas["actual"], 4096), escritores[-1]
+
+    monkeypatch.setattr(vc_mod, "_ruta_socket_hypr", lambda: Path("hypr") / "firma" / ".socket.sock")
+    monkeypatch.setattr(asyncio, "open_unix_connection", abrir, raising=False)
+    assert len(respuestas["actual"]) > 65536                      # llega en muchos trozos
+    assert correr(vc_mod._consulta_hypr_socket("j/clients")) == clientes
+    assert escritores[-1].escrito == b"j/clients" and escritores[-1].cerrado
+    respuestas["actual"] = b"Invalid"                             # sin ventana activa, p. ej.
+    assert correr(vc_mod._consulta_hypr_socket("j/activewindow")) is None
+    respuestas["actual"] = b"[" + b" " * (vc_mod.MAX_RESPUESTA_HYPR + 10) + b"]"
+    assert correr(vc_mod._consulta_hypr_socket("j/monitors")) is None   # demasiado grande
+    antes = len(escritores)
+    assert correr(vc_mod._consulta_hypr_socket("j/dispatch exec x")) is None   # solo lecturas permitidas
+    assert len(escritores) == antes

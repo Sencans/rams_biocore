@@ -52,6 +52,9 @@ async function escenario(t, { argv = ['--hidden'], html = HTML_VISOR, env: envEx
       AMADEUS_EXCLUIR_CAPTURA: '1',
       AMADEUS_AUTOARRANQUE: '',
       VTUBER_AI_TEMA: 'amadeus',
+      AMADEUS_PUTER: '1',
+      AMADEUS_PUTER_MODELO: '',
+      AMADEUS_PUTER_ESFUERZO: '',
       ...SIN_ATAJOS_PROPIOS,
       ...envExtra,
     },
@@ -332,6 +335,95 @@ test('main: IPC del chat validado (envío, confirmación, enlaces ofrecidos, ocu
   assert.equal(ch.visible, false);
 });
 
+// ---- tarjetas aprobables (v0.2.2, docs/V022_CORREO_DRIVE_SCRIPTS.md §13.3) ----
+
+const HUELLA = 'ab'.repeat(32);
+const CODIGO = 'Get-ChildItem $env:USERPROFILE\n# fin\n';
+const tarjetaScript = (id = '5c1a7e00') => ({
+  id, clase: 'script', version: 1, sha256: HUELLA, titulo: 'Script', resumen: '', aviso: '',
+  botones: ['aprobar', 'guardar', 'copiar', 'descartar'], caduca_ts: null, canal_origen: 'escritorio', estado: 'pendiente',
+  correo: null, drive: null, salida: null,
+  script: { lenguaje: 'powershell', plataforma: 'windows', codigo: CODIGO, explicacion: '', efectos: [], requisitos: [],
+    nivel: 'bajo', ejecutable: true, motivo_no_ejecutable: '', metodo: 'ast', hallazgos: [], hallazgos_omitidos: 0,
+    habilidad: null, habilidad_cambiada: false, ejecuciones: 0 },
+});
+const tarjetaCorreo = (id = '0a1b2c3d') => ({
+  ...tarjetaScript(id), clase: 'correo', botones: ['aprobar', 'editar', 'descartar'], script: null,
+  correo: { para: ['ana@example.com'], cc: [], cco: [], asunto: 'Hola', cuerpo: 'Cuerpo', adjuntos: [], problemas: [],
+    avisos: [], listo: true },
+});
+
+test('main/tarjetas: chat:tarjeta solo desde el chat; la decisión sale con su tope de 60 KiB', async (t) => {
+  const { ch, ov, ws, todoListo, sim } = await escenario(t);
+  await todoListo();
+  ws().recibir({ tipo: 'tarjeta', datos: tarjetaCorreo() });
+  assert.equal(ch.webContents.canal('chat:tarjeta').at(-1).id, '0a1b2c3d');
+  // pendiente nueva → el chat se abre SIN foco
+  assert.deepEqual(ch.nombres().filter((n) => ['show', 'showInactive', 'focus'].includes(n)), ['showInactive']);
+  const n = ws().enviados.length;
+  const v1 = { version: 1 };
+  assert.equal(await sim.invocar('chat:tarjeta', ov.webContents.evento(), '0a1b2c3d', HUELLA, 'aprobar', v1), false);
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento({ parent: null, url: 'https://evil.example/' }),
+    '0a1b2c3d', HUELLA, 'aprobar', v1), false);
+  assert.equal(ws().enviados.length, n);
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento(), '0a1b2c3d', HUELLA, 'aprobar', v1), true);
+  assert.deepEqual(ws().enviados.at(-1), { tipo: 'tarjeta_decision', id: '0a1b2c3d', sha256: HUELLA, decision: 'aprobar',
+    version: 1 });
+  // Un «editar» de ~57 KB (> 8 KiB) sale entero: el cableado respeta maxBytes hasta 61 440.
+  const campos = { cuerpo: '€'.repeat(10000), para: '€'.repeat(2600), cc: '€'.repeat(2600), cco: '€'.repeat(2600),
+    asunto: '€'.repeat(200), adjuntos: '€'.repeat(1000) };
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento(), '0a1b2c3d', HUELLA, 'editar', { campos, version: 1 }),
+    true);
+  const enviado = ws().enviados.at(-1);
+  assert.deepEqual(enviado.campos, campos);
+  const bytes = Buffer.byteLength(JSON.stringify(enviado), 'utf8');
+  assert.ok(bytes > 8192 && bytes <= 61440, `${bytes}`);
+  // Inválidas (campo por encima del tope, decisión desconocida, sin la versión que se ve): false y nada sale.
+  const m = ws().enviados.length;
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento(), '0a1b2c3d', HUELLA, 'editar',
+    { campos: { cuerpo: 'x'.repeat(10001) }, version: 1 }), false);
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento(), '0a1b2c3d', HUELLA, 'copiar', v1), false);
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento(), '0a1b2c3d', HUELLA, 'aprobar', {}), false);
+  assert.equal(ws().enviados.length, m);
+  // El resto de mensajes sigue con 8 KiB (p. ej. el chat, que ya va acotado a 2000 caracteres).
+  assert.equal(await sim.invocar('chat:send', ch.webContents.evento(), 'hola'), true);
+  // Sin WebSocket: false (el chat reactiva los botones).
+  ws().cerrar();
+  await asentar();
+  assert.equal(await sim.invocar('chat:tarjeta', ch.webContents.evento(), '0a1b2c3d', HUELLA, 'descartar', {}), false);
+});
+
+test('main/tarjetas: chat:copiar solo desde el chat y solo el código de una tarjeta de script vigente', async (t) => {
+  const { ch, ov, ws, todoListo, sim } = await escenario(t);
+  await todoListo();
+  ws().recibir({ tipo: 'tarjeta', datos: tarjetaCorreo() });
+  ws().recibir({ tipo: 'tarjeta', datos: tarjetaScript() });
+  sim.ipc('chat:copiar', ov.webContents.evento(), '5c1a7e00');             // otro emisor
+  sim.ipc('chat:copiar', ch.webContents.evento(), '0a1b2c3d');             // un correo no se copia
+  sim.ipc('chat:copiar', ch.webContents.evento(), 'deadbeef');             // desconocida
+  sim.ipc('chat:copiar', ch.webContents.evento(), 'Texto arbitrario');     // nunca texto del renderer
+  assert.deepEqual(sim.r.portapapeles, []);
+  sim.ipc('chat:copiar', ch.webContents.evento(), '5c1a7e00');
+  assert.deepEqual(sim.r.portapapeles, [CODIGO]);
+  // Cerrada → ya no se copia.
+  ws().recibir({ tipo: 'tarjeta', datos: { id: '5c1a7e00', clase: 'script', estado: 'cerrada', resultado: 'descartado', motivo: '' } });
+  sim.ipc('chat:copiar', ch.webContents.evento(), '5c1a7e00');
+  assert.equal(sim.r.portapapeles.length, 1);
+});
+
+test('main/tarjetas: las vigentes se reenvían al recargar el chat; una tarjeta de más de 64 KiB no entra', async (t) => {
+  const { ch, ws, todoListo } = await escenario(t);
+  await todoListo();
+  ws().recibir({ tipo: 'tarjeta', datos: tarjetaScript() });
+  const antes = ch.webContents.canal('chat:tarjeta').length;
+  ch.webContents.simularCarga(URL_CHAT);
+  assert.equal(ch.webContents.canal('chat:tarjeta').length, antes + 1);
+  const grande = tarjetaScript('00000002');
+  grande.titulo = 'x'.repeat(70000); // > MAX_WS_ENTRANTE (R.A.M.S. nunca lo manda: ≤ 60 KiB)
+  ws().recibir({ tipo: 'tarjeta', datos: grande });
+  assert.equal(ch.webContents.canal('chat:tarjeta').length, antes + 1);
+});
+
 test('main: los mensajes al chat se guardan hasta que carga', async (t) => {
   const { ch, ws } = await escenario(t);
   ws().abrir();
@@ -461,4 +553,359 @@ test('main: con la cámara de R.A.M.S. abierta la bandeja lo muestra (icono, men
   assert.ok(bandeja.img.ruta.endsWith('tray.png'));
   assert.ok(!bandeja.menu.some((i) => i.label === '● Cámara activa'));
   assert.ok(!bandeja.tooltip.includes('Cámara'));
+});
+
+// ---------------------------------------------------------------------------------------------
+// Respaldo Puter (§C2.15): ventana oculta, relevo WS ↔ IPC, bandeja y ventanita de conexión
+// ---------------------------------------------------------------------------------------------
+
+const MODELO_PUTER = 'google/gemini-3.5-flash-lite';
+const URL_TRABAJO = 'http://amadeus-puter.localhost/trabajo.html';
+const URL_CONECTAR = 'http://amadeus-puter.localhost/conectar.html';
+const ID_A = '0123456789abcdef01234567';
+const ID_B = 'fedcba9876543210fedcba98';
+const pedirLlm = (id, extra = {}) => ({
+  tipo: 'llm.pedir',
+  datos: { id, modelo: '', system: 'Eres Amadeus.', mensajes: [{ rol: 'usuario', texto: 'Hola' }], max_tokens: 256, temperatura: 0.9, ...extra },
+});
+const deTipo = (ws, tipo) => ws.enviados.filter((m) => m.tipo === tipo).map((m) => m.datos);
+const navegarA = (wc, url) => {
+  let bloqueada = false;
+  wc.emit('will-navigate', { url, preventDefault: () => { bloqueada = true; } }, url);
+  return bloqueada;
+};
+
+/** Ventana oculta cargada y con sesión de Puter (como la informaría trabajo.js). */
+function puterListo(sim) {
+  const pw = sim.puter();
+  pw.webContents.simularCarga(URL_TRABAJO);
+  sim.ipc('puter:estado', pw.webContents.evento(), { cargado: true, sesion: true, error: null });
+  return pw;
+}
+
+test('main/puter: ventana OCULTA en persist:puter con sandbox, protocolo propio con CSP y 404', async (t) => {
+  const { sim } = await escenario(t);
+  const pw = sim.puter();
+  assert.ok(pw, 'no se creó la ventana oculta de Puter');
+  assert.equal(pw.opciones.show, false);
+  assert.equal(pw.opciones.skipTaskbar, true);
+  assert.equal(pw.opciones.focusable, false);
+  const wp = pw.opciones.webPreferences;
+  assert.equal(wp.partition, 'persist:puter');
+  assert.equal(wp.contextIsolation, true);
+  assert.equal(wp.sandbox, true);
+  assert.equal(wp.nodeIntegration, false);
+  assert.equal(wp.webviewTag, false);
+  assert.equal(wp.backgroundThrottling, false);
+  assert.ok(wp.preload.endsWith('preload-puter.js'));
+  assert.deepEqual(ultimo(pw.llamadas, 'loadURL'), ['loadURL', URL_TRABAJO]);
+  assert.ok(!pw.nombres().includes('show') && !pw.nombres().includes('showInactive'));
+  // sesión endurecida (sin permisos) y `http:` interceptado SOLO en la partición de Puter
+  const ses = sim.r.sesiones.get('persist:puter');
+  let concedido = null;
+  ses.handlers.request(null, 'media', (v) => { concedido = v; });
+  assert.equal(concedido, false);
+  assert.equal(ses.handlers.check(), false);
+  for (const otra of ['(defecto)', 'amadeus-overlay', 'amadeus-chat']) assert.equal(sim.r.sesiones.get(otra).protocolos.size, 0);
+  const servir = ses.protocolos.get('http');
+  const pagina = await servir({ url: URL_TRABAJO, method: 'GET' });
+  assert.equal(pagina.status, 200);
+  assert.equal(pagina.headers.get('content-type'), 'text/html; charset=utf-8');
+  assert.match(pagina.headers.get('content-security-policy'), /default-src 'none'; script-src 'self' https:\/\/js\.puter\.com;/);
+  assert.equal(await pagina.text(), fs.readFileSync(path.join(__dirname, '..', 'puter', 'trabajo.html'), 'utf8'));
+  const cabeza = await servir({ url: 'http://amadeus-puter.localhost/conectar.js', method: 'HEAD' });
+  assert.equal(cabeza.status, 200);
+  assert.equal(await cabeza.text(), '');
+  for (const [url, metodo] of [['http://amadeus-puter.localhost/main.js', 'GET'], [URL_TRABAJO, 'POST'],
+    ['http://otro.localhost/trabajo.html', 'GET'], ['http://amadeus-puter.localhost/../preload-puter.js', 'GET']]) {
+    assert.equal((await servir({ url, method: metodo })).status, 404, `${metodo} ${url}`);
+  }
+  // nunca navega fuera de trabajo.html ni abre ventanas
+  assert.equal(navegarA(pw.webContents, 'https://puter.com/'), true);
+  assert.deepEqual(pw.webContents.openHandler({ url: 'https://puter.com/action/sign-in' }), { action: 'deny' });
+});
+
+test('main/puter: relevo — puter.estado tras el hola, llm.pedir → IPC → llm.respuesta, emisor validado', async (t) => {
+  const { sim, ov, ch, ws, todoListo, avanzar, carga } = await escenario(t);
+  await todoListo();
+  const pw = sim.puter();
+  // tras el hola: estado sin sesión (la ventana aún no informó)
+  assert.deepEqual(deTipo(ws(), 'puter.estado'), [{ listo: false, sesion: false, modelo: MODELO_PUTER, error: null }]);
+  assert.ok(ws().enviados.findIndex((m) => m.tipo === 'puter.estado') > ws().enviados.findIndex((m) => m.tipo === 'hola_app'));
+  pw.webContents.simularCarga(URL_TRABAJO);
+  assert.deepEqual(pw.webContents.canal('puter:info'), [{ modelo: MODELO_PUTER }]);
+  // estado: solo de la ventana oculta, de su frame principal y con trabajo.html
+  const listoDatos = { cargado: true, sesion: true, error: null };
+  sim.ipc('puter:estado', ov.webContents.evento(), listoDatos);
+  sim.ipc('puter:estado', ch.webContents.evento(), listoDatos);
+  sim.ipc('puter:estado', pw.webContents.evento({ parent: {}, url: URL_TRABAJO }), listoDatos);
+  sim.ipc('puter:estado', pw.webContents.evento({ parent: null, url: 'https://puter.com/' }), listoDatos);
+  assert.equal(deTipo(ws(), 'puter.estado').length, 1);
+  sim.ipc('puter:estado', pw.webContents.evento(), listoDatos);
+  assert.deepEqual(deTipo(ws(), 'puter.estado').at(-1), { listo: true, sesion: true, modelo: MODELO_PUTER, error: null });
+  assert.ok(sim.r.bandejas[0].menu.some((i) => i.label === `Puter: conectado (${MODELO_PUTER})`));
+  // pedido → ventana
+  const chatAntes = ch.webContents.enviados.length;
+  ws().recibir(pedirLlm(ID_A));
+  assert.deepEqual(pw.webContents.canal('puter:pedir'), [{
+    id: ID_A, modelo: MODELO_PUTER,
+    mensajes: [{ role: 'system', content: 'Eres Amadeus.' }, { role: 'user', content: 'Hola' }],
+    maxTokens: 256, temperatura: 0.9, esfuerzo: null, timeoutMs: 38000,
+  }]);
+  assert.equal(ch.webContents.enviados.length, chatAntes); // no pasa por el chat
+  await avanzar(1500);
+  // respuesta: solo de la ventana oculta
+  sim.ipc('puter:respuesta', ov.webContents.evento(), { id: ID_A, ok: true, texto: 'intruso' });
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta'), []);
+  sim.ipc('puter:respuesta', pw.webContents.evento(), { id: ID_A, ok: true, texto: 'Hmph. Hola.', modelo: MODELO_PUTER });
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta'), [{ id: ID_A, ok: true, texto: 'Hmph. Hola.', error: null, modelo: MODELO_PUTER, ms: 1500 }]);
+  // sin respuesta de la ventana → «timeout» a los 42 s (antes de los 45 s del contrato) y cancelación
+  ws().recibir(pedirLlm(ID_B));
+  await avanzar(41999);
+  assert.equal(deTipo(ws(), 'llm.respuesta').length, 1);
+  await avanzar(1);
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta').at(-1), { id: ID_B, ok: false, texto: null, error: 'timeout', modelo: MODELO_PUTER, ms: 42000 });
+  assert.deepEqual(pw.webContents.canal('puter:cancelar'), [ID_B]);
+  // ni el token de R.A.M.S. ni nada del prompt acaba en los logs o en la ventana de Puter
+  assert.ok(!JSON.stringify(pw.webContents.enviados).includes(TOKEN));
+  assert.ok(!carga.logs.join('\n').includes('Eres Amadeus') && !carga.logs.join('\n').includes('Hmph'));
+});
+
+test('main/puter: llm.pedir grande (> 64 KiB) se acepta; respuesta grande sale ≤ 64 KiB; otros grandes no', async (t) => {
+  const { sim, ch, ws, todoListo } = await escenario(t);
+  await todoListo();
+  const pw = puterListo(sim);
+  const mensajes = Array.from({ length: 6 }, (_v, i) => ({ rol: i % 2 ? 'modelo' : 'usuario', texto: 'ñ'.repeat(19000) }));
+  ws().recibir(pedirLlm(ID_A, { system: 's'.repeat(59000), mensajes }));
+  const p = pw.webContents.canal('puter:pedir').at(-1);
+  assert.equal(p.id, ID_A);
+  assert.equal(p.mensajes.length, 7);
+  sim.ipc('puter:respuesta', pw.webContents.evento(), { id: ID_A, ok: true, texto: 'ñ'.repeat(100000) });
+  const r = ws().enviados.at(-1);
+  assert.equal(r.tipo, 'llm.respuesta');
+  assert.equal(r.datos.ok, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(r), 'utf8') <= 64 * 1024);
+  const n = ch.webContents.canal('chat:msg').length;
+  ws().recibir({ tipo: 'subtitulo', datos: { texto: 'a'.repeat(70000) } }); // > 64 KiB y no es llm.pedir
+  assert.equal(ch.webContents.canal('chat:msg').length, n);
+});
+
+test('main/puter: sin sesión, llm.pedir → «sin_sesion» al instante sin abrir ni mostrar nada', async (t) => {
+  const { sim, ws, todoListo } = await escenario(t);
+  await todoListo();
+  const pw = sim.puter();
+  pw.webContents.simularCarga(URL_TRABAJO);
+  sim.ipc('puter:estado', pw.webContents.evento(), { cargado: false, sesion: false, error: null });
+  const ventanas = sim.r.ventanas.length;
+  ws().recibir(pedirLlm(ID_A));
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta'), [{ id: ID_A, ok: false, texto: null, error: 'sin_sesion', modelo: MODELO_PUTER, ms: 0 }]);
+  assert.deepEqual(pw.webContents.canal('puter:pedir'), []);
+  assert.equal(sim.r.ventanas.length, ventanas);
+  assert.ok(sim.r.ventanas.every((v) => !v.visible));
+  assert.equal(sim.conectar(), undefined);
+});
+
+test('main/puter: bandeja «Conectar Puter…» → ventanita; window.open solo a puter.com; conexión recarga la oculta', async (t) => {
+  const { sim, ws, todoListo } = await escenario(t);
+  await todoListo();
+  const menu = () => sim.r.bandejas[0].menu;
+  const item = (l) => menu().find((i) => i.label === l);
+  assert.ok(item('Conectar Puter (IA de respaldo)…'));
+  assert.equal(item('Desconectar Puter'), undefined);
+  assert.equal(sim.conectar(), undefined); // nada se abre solo
+  item('Conectar Puter (IA de respaldo)…').click();
+  const cw = sim.conectar();
+  assert.equal(cw.opciones.show, false);
+  const wp = cw.opciones.webPreferences;
+  assert.equal(wp.partition, 'persist:puter');
+  assert.equal(wp.sandbox, true);
+  assert.equal(wp.contextIsolation, true);
+  assert.equal(wp.nodeIntegration, false);
+  assert.ok(wp.preload.endsWith('preload-puter.js'));
+  assert.deepEqual(ultimo(cw.llamadas, 'loadURL'), ['loadURL', URL_CONECTAR]);
+  cw.webContents.simularCarga(URL_CONECTAR); // ready-to-show → se muestra con foco (la pidió el usuario)
+  assert.equal(cw.visible, true);
+  assert.ok(cw.nombres().includes('focus'));
+  assert.deepEqual(cw.webContents.canal('puter:info'), [{ modelo: MODELO_PUTER }]);
+  item('Conectar Puter (IA de respaldo)…').click(); // reutiliza la misma
+  assert.equal(sim.r.ventanas.filter((v) => v.opciones.title === 'Conectar Puter').length, 1);
+  // window.open: solo https://puter.com y subdominios, en ventana sandbox
+  const abrir = cw.webContents.openHandler;
+  const permitido = abrir({ url: 'https://puter.com/action/sign-in?embedded_in_popup=true&msg_id=1' });
+  assert.equal(permitido.action, 'allow');
+  const wpp = permitido.overrideBrowserWindowOptions.webPreferences;
+  assert.equal(wpp.sandbox, true);
+  assert.equal(wpp.contextIsolation, true);
+  assert.equal(wpp.nodeIntegration, false);
+  for (const url of ['https://evil.example/', 'http://puter.com/', 'https://puter.com.evil.example/', 'about:blank']) {
+    assert.deepEqual(abrir({ url }), { action: 'deny' }, url);
+  }
+  // la emergente: sin más ventanas y sin salir de puter.com
+  const popup = new sim.electron.BrowserWindow({ title: 'Puter', width: 520, height: 720 });
+  cw.webContents.emit('did-create-window', popup, { url: 'https://puter.com/action/sign-in' });
+  assert.deepEqual(popup.webContents.openHandler({ url: 'https://puter.com/otra' }), { action: 'deny' });
+  assert.equal(navegarA(popup.webContents, 'https://evil.example/'), true);
+  assert.equal(navegarA(popup.webContents, 'https://puter.com/dashboard'), false);
+  assert.equal(navegarA(cw.webContents, 'https://puter.com/'), true); // la ventanita no navega
+  // puter:conexion: solo de la ventanita; un fallo no recarga nada; la sesión nueva sí
+  const pw = sim.puter();
+  pw.webContents.simularCarga(URL_TRABAJO);
+  const cargas = () => pw.llamadas.filter((l) => l[0] === 'loadURL').length;
+  const antes = cargas();
+  sim.ipc('puter:conexion', pw.webContents.evento(), { ok: true, nueva: true });
+  sim.ipc('puter:conexion', cw.webContents.evento(), { ok: false, error: 'popup_blocked' });
+  assert.equal(cargas(), antes);
+  sim.ipc('puter:conexion', cw.webContents.evento(), { ok: true, nueva: true });
+  assert.equal(cargas(), antes + 1);
+  assert.deepEqual(ultimo(pw.llamadas, 'loadURL'), ['loadURL', URL_TRABAJO]);
+  // la página recargada informa la sesión → bandeja con «Desconectar Puter»
+  pw.webContents.simularCarga(URL_TRABAJO);
+  sim.ipc('puter:estado', pw.webContents.evento(), { cargado: true, sesion: true, error: null });
+  assert.deepEqual(deTipo(ws(), 'puter.estado').at(-1), { listo: true, sesion: true, modelo: MODELO_PUTER, error: null });
+  assert.ok(item('Desconectar Puter'));
+  assert.equal(item('Conectar Puter (IA de respaldo)…'), undefined);
+  // «Cerrar» de la ventanita (solo desde ella)
+  sim.ipc('puter:cerrar', pw.webContents.evento());
+  assert.equal(cw.destruida, false);
+  sim.ipc('puter:cerrar', cw.webContents.evento());
+  assert.equal(cw.destruida, true);
+});
+
+test('main/puter: «Desconectar Puter» borra la sesión de la partición, recarga y avisa a R.A.M.S.', async (t) => {
+  const { sim, ws, todoListo } = await escenario(t);
+  await todoListo();
+  const pw = puterListo(sim);
+  const item = (l) => sim.r.bandejas[0].menu.find((i) => i.label === l);
+  const cargas = pw.llamadas.filter((l) => l[0] === 'loadURL').length;
+  item('Desconectar Puter').click();
+  await asentar();
+  assert.equal(sim.r.sesiones.get('persist:puter').borrados, 1);
+  assert.equal(pw.llamadas.filter((l) => l[0] === 'loadURL').length, cargas + 1);
+  assert.deepEqual(deTipo(ws(), 'puter.estado').at(-1), { listo: false, sesion: false, modelo: MODELO_PUTER, error: null });
+  assert.ok(item('Conectar Puter (IA de respaldo)…'));
+  ws().recibir(pedirLlm(ID_A));
+  assert.equal(deTipo(ws(), 'llm.respuesta').at(-1).error, 'sin_sesion');
+});
+
+test('main/puter: la ventana oculta se cae → pedidos «otro», estado «ventana_caida» y recarga en 2 s', async (t) => {
+  const { sim, ws, todoListo, avanzar } = await escenario(t);
+  await todoListo();
+  const pw = puterListo(sim);
+  ws().recibir(pedirLlm(ID_A));
+  const cargas = () => pw.llamadas.filter((l) => l[0] === 'loadURL').length;
+  const antes = cargas();
+  pw.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta'), [{ id: ID_A, ok: false, texto: null, error: 'otro', modelo: MODELO_PUTER, ms: 0 }]);
+  assert.deepEqual(deTipo(ws(), 'puter.estado').at(-1), { listo: false, sesion: false, modelo: MODELO_PUTER, error: 'ventana_caida' });
+  ws().recibir(pedirLlm(ID_B)); // mientras tanto: sin sesión utilizable
+  assert.equal(deTipo(ws(), 'llm.respuesta').at(-1).error, 'sin_sesion');
+  await avanzar(1999);
+  assert.equal(cargas(), antes);
+  await avanzar(1);
+  assert.equal(cargas(), antes + 1);
+  pw.webContents.simularCarga(URL_TRABAJO);
+  assert.equal(pw.webContents.canal('puter:info').length, 2);
+  await avanzar(45000); // el temporizador del pedido caído quedó cancelado
+  assert.equal(deTipo(ws(), 'llm.respuesta').length, 2);
+});
+
+test('main/puter: caídas seguidas → 2 s, 4 s… 60 s aunque la página informe entre medias; 60 s estable → 2 s', async (t) => {
+  const { sim, todoListo, avanzar } = await escenario(t);
+  await todoListo();
+  const pw = puterListo(sim);
+  const cargas = () => pw.llamadas.filter((l) => l[0] === 'loadURL').length;
+  const esperaHastaRecarga = async () => {
+    const antes = cargas();
+    let ms = 0;
+    while (cargas() === antes && ms < 120000) {
+      await avanzar(500);
+      ms += 500;
+    }
+    return ms;
+  };
+  const esperas = [];
+  for (let i = 0; i < 7; i++) {
+    pw.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+    esperas.push(await esperaHastaRecarga());
+    // la página recargada arranca y manda su primer estado (trabajo.js lo hace antes de cargar
+    // puter.js), y vuelve a caerse a los pocos segundos
+    pw.webContents.simularCarga(URL_TRABAJO);
+    sim.ipc('puter:estado', pw.webContents.evento(), { cargado: false, sesion: false, error: null });
+    sim.ipc('puter:estado', pw.webContents.evento(), { cargado: true, sesion: true, error: null });
+    await avanzar(5000);
+  }
+  assert.deepEqual(esperas, [2000, 4000, 8000, 16000, 32000, 60000, 60000]);
+  // un fallo de carga también cuenta como caída (sigue en 60 s)
+  pw.webContents.emit('did-fail-load', {}, -105, 'ERR_NAME_NOT_RESOLVED', URL_TRABAJO, true);
+  assert.equal(await esperaHastaRecarga(), 60000);
+  // la página aguanta 60 s cargada → la siguiente caída vuelve a esperar 2 s
+  pw.webContents.simularCarga(URL_TRABAJO);
+  await avanzar(59500);
+  pw.webContents.emit('render-process-gone', {}, { reason: 'oom' });
+  assert.equal(await esperaHastaRecarga(), 60000); // a los 59,5 s aún no era estable
+  pw.webContents.simularCarga(URL_TRABAJO);
+  await avanzar(60000);
+  pw.webContents.emit('render-process-gone', {}, { reason: 'oom' });
+  assert.equal(await esperaHastaRecarga(), 2000);
+  pw.webContents.simularCarga(URL_TRABAJO);
+  pw.webContents.emit('render-process-gone', {}, { reason: 'crashed' });
+  assert.equal(await esperaHastaRecarga(), 4000);
+});
+
+test('main/puter: 401 con la página aún con sesión → «sin_sesion», sigue lista y se pide puter:refrescar', async (t) => {
+  const { sim, ws, todoListo } = await escenario(t);
+  await todoListo();
+  const pw = puterListo(sim);
+  const item = (l) => sim.r.bandejas[0].menu.find((i) => i.label === l);
+  ws().recibir(pedirLlm(ID_A));
+  sim.ipc('puter:respuesta', pw.webContents.evento(), {
+    id: ID_A, ok: false, texto: null, modelo: null,
+    fallo: { code: 'token_auth_failed', status: 401, message: 'Unauthorized', name: null, abortado: false, sinSesion: false },
+  });
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta').at(-1), { id: ID_A, ok: false, texto: null, error: 'sin_sesion', modelo: MODELO_PUTER, ms: 0 });
+  // R.A.M.S. recibe el estado real justo detrás (la página sigue con sesión) y la bandeja no cambia
+  assert.equal(ws().enviados.at(-1).tipo, 'puter.estado');
+  assert.deepEqual(ws().enviados.at(-1).datos, { listo: true, sesion: true, modelo: MODELO_PUTER, error: null });
+  assert.ok(item('Desconectar Puter'));
+  assert.deepEqual(pw.webContents.canal('puter:refrescar'), [null]);
+  // la página relee y ya no hay sesión → ahora sí baja, en R.A.M.S. y en la bandeja
+  sim.ipc('puter:estado', pw.webContents.evento(), { cargado: true, sesion: false, error: null });
+  assert.deepEqual(deTipo(ws(), 'puter.estado').at(-1), { listo: false, sesion: false, modelo: MODELO_PUTER, error: null });
+  assert.ok(item('Conectar Puter (IA de respaldo)…'));
+  // con la página sin sesión, otro 401 no vuelve a pedir que relea
+  sim.ipc('puter:estado', pw.webContents.evento(), { cargado: true, sesion: true, error: null });
+  ws().recibir(pedirLlm(ID_B));
+  sim.ipc('puter:respuesta', pw.webContents.evento(), { id: ID_B, ok: false, fallo: { status: 401, sinSesion: true } });
+  assert.equal(deTipo(ws(), 'llm.respuesta').at(-1).error, 'sin_sesion');
+  assert.equal(pw.webContents.canal('puter:refrescar').length, 1);
+});
+
+test('main/puter: AMADEUS_PUTER=0 — sin ventana ni sesión de Puter, estado «deshabilitado» y pedidos rechazados', async (t) => {
+  const { sim, ws, todoListo } = await escenario(t, { env: { AMADEUS_PUTER: '0' } });
+  assert.equal(sim.puter(), undefined);
+  assert.equal(sim.r.sesiones.has('persist:puter'), false);
+  await todoListo();
+  assert.deepEqual(deTipo(ws(), 'puter.estado'), [{ listo: false, sesion: false, modelo: null, error: 'deshabilitado' }]);
+  assert.ok(!sim.r.bandejas[0].menu.some((i) => i.label && i.label.includes('Puter')));
+  ws().recibir(pedirLlm(ID_A));
+  assert.deepEqual(deTipo(ws(), 'llm.respuesta'), [{ id: ID_A, ok: false, texto: null, error: 'rechazado', modelo: null, ms: 0 }]);
+  sim.electron.app.emit('second-instance', {}, [], '/', { v: 1, amadeus: 'puter', oculto: false, invalido: false });
+  assert.equal(sim.conectar(), undefined);
+});
+
+test('main/puter: --amadeus=puter abre la ventanita; AMADEUS_PUTER_MODELO cambia el modelo por defecto', async (t) => {
+  const { sim, ws, todoListo, carga } = await escenario(t, { env: { AMADEUS_PUTER_MODELO: 'anthropic/claude-haiku-5-5' } });
+  sim.electron.app.emit('second-instance', {}, [], '/', { v: 1, amadeus: 'puter', oculto: false, invalido: false });
+  assert.ok(sim.conectar());
+  await todoListo();
+  assert.equal(deTipo(ws(), 'puter.estado')[0].modelo, 'anthropic/claude-haiku-5-5');
+  assert.ok(!carga.logs.some((l) => l.includes('AMADEUS_PUTER_MODELO')));
+});
+
+test('main/puter: AMADEUS_PUTER_MODELO inválido → aviso sin repetir el valor y modelo por defecto', async (t) => {
+  const { ws, todoListo, carga } = await escenario(t, { env: { AMADEUS_PUTER_MODELO: 'modelo con espacios y secreto' } });
+  await todoListo();
+  assert.equal(deTipo(ws(), 'puter.estado')[0].modelo, MODELO_PUTER);
+  assert.ok(carga.logs.some((l) => l.includes('AMADEUS_PUTER_MODELO no es un nombre de modelo válido')));
+  assert.ok(!carga.logs.join('\n').includes('secreto'));
 });

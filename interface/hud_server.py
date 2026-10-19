@@ -26,6 +26,11 @@ habilitado y ``/escritorio`` solo con ``tiene_escritorio`` (si no, 404). Justo *
 ``pc.accion`` → ``accion`` y ``vision.camara`` con ``fuente``; nunca reenvía ``escritorio.chat``,
 ``escritorio.sistema`` ni la ``vista_previa`` de los permisos.
 
+v0.2.2 (``docs/V022_CORREO_DRIVE_SCRIPTS.md`` §12.5): ``google.estado`` → ``google`` (también al
+**final** de la instantánea: el orden ``hola`` → ``escritorio`` → instantánea no cambia). Las
+tarjetas (``tarjeta.mostrar``, ``tarjeta.cerrada``) y ``escritorio.tarjeta`` llevan contenido privado:
+``/ws`` **nunca** las reenvía (solo viajan por ``/escritorio``).
+
 Dependencias opcionales: ``websockets`` (≥ 14, API ``websockets.asyncio``). Sin ella el módulo
 se importa igual y ``iniciar()`` devuelve ``OFF ("websockets no instalado")``.
 
@@ -43,6 +48,7 @@ import hmac
 import json
 import logging
 import math
+import re
 import secrets
 import shutil
 import subprocess
@@ -131,10 +137,13 @@ EVENTOS_SUSCRITOS: Final = (
     "vision.estado",
     "pantalla.estado",
     "pc.accion",
+    # v0.2.2 (§12.5). Nunca "tarjeta.mostrar", "tarjeta.cerrada" ni "escritorio.tarjeta" (privados).
+    "google.estado",
 )
 
 # Instantánea para clientes nuevos: (evento del bus, tipo de mensaje del HUD).
 # ``vision.camara`` se envía una vez por cada ``fuente`` vista (el LED es el OR de las fuentes).
+# ``google.estado`` va AL FINAL (v0.2.2): el HUD y movil/ esperan ``hola`` → ``escritorio`` primero.
 INSTANTANEA: Final = (
     ("homeostasis.estado", "estado"),
     ("pc.telemetria", "telemetria"),
@@ -142,6 +151,7 @@ INSTANTANEA: Final = (
     ("vision.camara", "camara"),
     ("vision.estado", "vision"),
     ("pantalla.estado", "pantalla"),
+    ("google.estado", "google"),
 )
 _NOMBRES_INSTANTANEA: Final = frozenset(nombre for nombre, _tipo in INSTANTANEA)
 
@@ -167,6 +177,9 @@ ESPERA_CIERRE_S: Final = 3.0
 # y a que un navegador lanzado con ``Popen`` falle de inmediato (si sigue vivo, se deja así).
 ESPERA_SETSID_S: Final = 5.0
 ESPERA_NAVEGADOR_S: Final = 2.0
+
+# google.estado.motivo (∈ MOTIVOS_GOOGLE de lobes/google_cuenta.py): un código corto o "".
+_MOTIVO_GOOGLE_RE: Final = re.compile(r"[a-z_]{1,24}")
 
 # telegram.enviado.tipo → llamada.tipo (§10.23)
 _TIPO_LLAMADA: Final[dict[str, str]] = {
@@ -354,6 +367,18 @@ def traducir_evento(nombre: str, datos: Mapping[str, Any]) -> tuple[str, dict[st
             "tipo": _texto(datos.get("tipo"), 40),
             "resultado": _texto(datos.get("resultado"), 200),
             "destino": _texto(datos.get("destino"), 40) or None,
+        }
+    if nombre == "google.estado":  # v0.2.2 (§11, §12.5): la cuenta ya llega enmascarada
+        cuenta = datos.get("cuenta")
+        motivo = datos.get("motivo")
+        return "google", {
+            "conectado": datos.get("conectado") is True,
+            "correo": datos.get("correo") is True,
+            "drive_leer": datos.get("drive_leer") is True,
+            "drive_escribir": datos.get("drive_escribir") is True,
+            "drive_completo": datos.get("drive_completo") is True,
+            "cuenta": _texto(cuenta, 80) if isinstance(cuenta, str) and cuenta else None,
+            "motivo": motivo if isinstance(motivo, str) and _MOTIVO_GOOGLE_RE.fullmatch(motivo) else "",
         }
     if nombre == "usuario.presencia":
         return "presencia", dict(datos)

@@ -110,9 +110,14 @@ def sin_red(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # Programas que abren apps/URLs, teclean o mandan órdenes al compositor: un subproceso con
 # cualquiera de estos nombres base en sus argumentos hace fallar el test.
+# v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §3.5): tampoco shells reales (pwsh, bash, sh, zsh, dash)
+# ni unidades o límites reales (systemd-run, systemctl, prlimit): el taller se prueba con dobles.
+# sys.executable sigue permitido (scripts Python inocuos en tmp_path).
 PROGRAMAS_PROHIBIDOS: frozenset[str] = frozenset({
     "xdg-open", "gtk-launch", "wtype", "ydotool", "hyprctl", "explorer", "explorer.exe",
     "cmd", "cmd.exe", "powershell", "powershell.exe", "start",
+    "pwsh", "pwsh.exe", "bash", "bash.exe", "sh", "zsh", "dash",
+    "systemd-run", "systemctl", "prlimit",
 })
 # Funciones de Win32 que mueven el cursor, teclean, roban el foco o abren documentos/URLs.
 _FUNCIONES_WIN32: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -213,7 +218,9 @@ def sin_efectos_pc(monkeypatch: pytest.MonkeyPatch) -> None:
     (y ``shell32.ShellExecuteW``/``ShellExecuteExW``). Envuelve ``subprocess.Popen`` y
     ``asyncio.create_subprocess_exec`` para fallar **solo** si algún argumento tiene como nombre
     base ``xdg-open``, ``gtk-launch``, ``wtype``, ``ydotool``, ``hyprctl``, ``explorer[.exe]``,
-    ``cmd[.exe]``, ``powershell[.exe]`` o ``start`` (lo demás, como ``sys.executable``, pasa).
+    ``cmd[.exe]``, ``powershell[.exe]`` o ``start`` y, desde la v0.2.2, ``pwsh[.exe]``,
+    ``bash[.exe]``, ``sh``, ``zsh``, ``dash``, ``systemd-run``, ``systemctl`` o ``prlimit`` (lo
+    demás, como ``sys.executable``, pasa).
     Un ``monkeypatch`` del propio test se aplica encima y tiene prioridad. Los sustitutos llevan
     el atributo ``_rams_sin_efectos = True``.
 
@@ -328,6 +335,9 @@ def _entorno_prueba(tmp_path: Path) -> dict[str, str]:
         "RAMS_TRAVESURAS": "0",
         "RAMS_VISION_CONTINUA": "0",
         "RAMS_PANTALLA_MODO": "off",
+        # v0.2.2: Google y el taller de scripts apagados (aunque cambien los defectos).
+        "RAMS_GOOGLE": "0",
+        "RAMS_TALLER": "0",
     }
 
 

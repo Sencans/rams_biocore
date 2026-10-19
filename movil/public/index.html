@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#070b14">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <title>Amadeus Móvil · Videollamada</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="stylesheet" href="/movil/style.css">
+  <script src="/movil/app.js" defer></script>
+</head>
+<body>
+  <!-- Pantalla inicial de Videollamada: Botón Llamar a Amadeus -->
+  <div class="pantalla-llamada" id="pantalla-llamada" role="dialog" aria-label="Iniciar videollamada con Amadeus">
+    <div class="llamada-tarjeta">
+      <div class="llamada-avatar-aro">
+        <span class="llamada-avatar-letra">A</span>
+      </div>
+      <h1 class="llamada-titulo">AMADEUS</h1>
+      <p class="llamada-sub" id="llamada-estado-red">Videollamada 3D · PC en red o Modo Local</p>
+
+      <button type="button" class="btn-llamar-principal" id="btn-llamar-amadeus">
+        Llamar a Amadeus
+      </button>
+
+      <div class="llamada-acciones-sec">
+        <button type="button" class="btn-hud" id="btn-config-desde-llamada">Configurar IP / PC</button>
+        <button type="button" class="btn-hud" id="btn-vrm-desde-llamada">Elegir modelo .VRM</button>
+      </div>
+      <p class="llamada-nota" id="llamada-nota-modo">
+        Si estás en la misma red o por USB conecta con tu PC; si no, usa el modo local del teléfono sin internet.
+      </p>
+    </div>
+  </div>
+
+  <div class="app-movil">
+    <!-- Barra superior: estado real de la llamada, batería y ajuste de red -->
+    <header class="barra-sup">
+      <div class="marca-bloque">
+        <span class="marca-logo" aria-hidden="true">A</span>
+        <div>
+          <div class="marca-titulo" id="nombre-ia">AMADEUS</div>
+          <div class="marca-sub">
+            <i class="punto-estado" id="punto-conexion" aria-hidden="true"></i>
+            <span id="texto-conexion">En espera</span>
+            <span>·</span>
+            <span id="reloj-llamada">00:00</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="barra-der">
+        <div class="ind-estado" title=" Señal / Modo de conexión">
+          <div class="senal" id="senal-barras" aria-hidden="true">
+            <b class="on"></b><b class="on"></b><b class="on"></b><b class="on"></b>
+          </div>
+          <span id="senal-ms">Local</span>
+        </div>
+        <div class="ind-estado" title="Batería">
+          <div class="bateria" id="bateria-celdas" aria-hidden="true">
+            <i class="on"></i><i class="on"></i><i class="on"></i><i class="on"></i>
+          </div>
+          <span id="bateria-top-txt">--%</span>
+        </div>
+        <button type="button" class="btn-icono" id="btn-abrir-config" title="Configurar IP del PC">Red PC</button>
+      </div>
+    </header>
+
+    <!-- Contenedor principal con Visor 3D persistente a pantalla completa + Vistas -->
+    <main class="vistas" id="contenedor-vistas">
+      <!-- Escenario 3D VRM global: ocupa 100% en Videollamada y se acopla arriba en Estudio VRM -->
+      <div class="escena-vrm-global modo-vivo" id="escena-vrm-global">
+        <iframe id="marco-vrm" title="Visor 3D VRM Amadeus" allow="autoplay; microphone; camera"></iframe>
+
+        <!-- Vista previa PiP de cámara del celular + canvas oculto para análisis visual local -->
+        <div class="camara-pip" id="camara-pip" hidden>
+          <video id="video-camara-local" autoplay playsinline muted></video>
+          <canvas id="canvas-vision-local" width="64" height="48" hidden></canvas>
+          <div class="camara-pip-bar">
+            <span id="pip-estado-vision">Analizando…</span>
+            <div>
+              <button type="button" class="btn-pip-mini" id="btn-rotar-camara" title="Cambiar cámara frontal/trasera">↻</button>
+              <button type="button" class="btn-pip-mini" id="btn-cerrar-camara" title="Apagar cámara">✕</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VISTA 1: VIDEOLLAMADA EN VIVO -->
+      <section class="vista activa" id="vista-vivo" aria-label="Videollamada 3D en vivo">
+        <div class="hud-vivo-capa" id="hud-vivo-capa">
+          <!-- Fila superior: Estado real de cámara/visión y voz -->
+          <div class="hud-top-bar">
+            <div class="pildora-hud" id="pildora-camara">
+              <span class="led-camara" id="led-camara"></span>
+              <span id="camara-texto">Cámara apagada</span>
+              <span id="ojo-vision" hidden>· 👁 <span id="ojo-vision-texto"></span></span>
+            </div>
+
+            <div class="pildora-hud pildora-ondas" id="pildora-voz">
+              <div class="ondas" id="ondas-voz" aria-hidden="true">
+                <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+              </div>
+              <span id="voz-estado-texto">En escucha</span>
+            </div>
+          </div>
+
+          <!-- Tarjeta flotante de confirmación de CompuertaPermisos (cuando está conectado al PC) -->
+          <section class="tarjeta-permiso-vivo" id="tarjeta-permiso-vivo" hidden aria-live="assertive">
+            <p class="permiso-titulo" id="permiso-vivo-titulo">⚠ Confirmación requerida en PC</p>
+            <p id="permiso-vivo-desc"></p>
+            <pre class="permiso-borrador" id="permiso-vivo-borrador" hidden></pre>
+            <div class="permiso-botones" id="permiso-vivo-botones">
+              <button type="button" class="btn-aprobar" id="btn-vivo-aprobar">Aprobar</button>
+              <button type="button" class="btn-rechazar" id="btn-vivo-rechazar">Rechazar</button>
+            </div>
+            <p id="permiso-vivo-nota" hidden></p>
+          </section>
+
+          <!-- Subtítulo en vivo de Amadeus -->
+          <div class="subtitulo-flotante" id="subtitulo-caja" hidden>
+            <span id="subtitulo-texto"></span>
+          </div>
+
+          <!-- Controles de la videollamada -->
+          <div class="controles-vivo-inf" id="controles-vivo-inf">
+            <div class="fila-botones-hud">
+              <button type="button" class="btn-hud" id="btn-hud-camara" aria-pressed="false">Prender cámara</button>
+              <button type="button" class="btn-hud" id="btn-hud-silenciar" aria-pressed="false">Silenciar voz</button>
+              <button type="button" class="btn-hud" id="btn-encuadre-vrm">Encuadre: Busto</button>
+              <button type="button" class="btn-hud" id="btn-ocultar-hud" aria-pressed="false">Vista limpia</button>
+              <button type="button" class="btn-hud" id="btn-esc-nomolestar" aria-pressed="false">No molestar</button>
+              <button type="button" class="btn-hud peligro" id="btn-hud-colgar">Colgar llamada</button>
+            </div>
+
+            <form class="form-rapido" id="form-vivo" autocomplete="off">
+              <button type="button" class="btn-voz" id="btn-voz-dictado" title="Hablar por micrófono">Hablar</button>
+              <input type="text" class="input-rapido" id="input-vivo-texto" maxlength="2000" placeholder="Habla o escríbele a Amadeus…">
+              <button type="submit" class="btn-enviar" id="btn-vivo-enviar">Enviar</button>
+            </form>
+          </div>
+        </div>
+
+        <!-- Botón flotante para restaurar controles cuando está en Vista Limpia -->
+        <button type="button" class="btn-restaurar-hud" id="btn-restaurar-hud" hidden>Mostrar controles</button>
+      </section>
+
+      <!-- VISTA 2: HISTORIAL DE CHAT -->
+      <section class="vista" id="vista-rine" aria-label="Chat con Amadeus">
+        <div class="cabecera-rine">
+          <div>
+            <strong id="rine-cab-nombre">CHAT · AMADEUS</strong>
+            <div style="font-size:11px" id="rine-cab-estado">listo para conversar</div>
+          </div>
+          <div style="display:flex;gap:6px;align-items:center">
+            <span id="rine-hablando-ind" style="font-size:11px"></span>
+            <button type="button" class="chip-btn" id="btn-rine-limpiar" title="Limpiar historial">Limpiar</button>
+          </div>
+        </div>
+
+        <ol class="lista-rine" id="rine-lista" aria-live="polite">
+          <li class="msg-rine sistema" id="rine-vacio">
+            <div class="burbuja-rine">Inicia la llamada o escribe aquí para conversar con Amadeus.</div>
+          </li>
+        </ol>
+
+        <form class="form-rapido" id="form-rine" autocomplete="off">
+          <button type="button" class="btn-voz" id="btn-rine-voz">Hablar</button>
+          <input type="text" class="input-rapido" id="input-rine-texto" maxlength="2000" placeholder="Escribe un mensaje…">
+          <button type="submit" class="btn-enviar" id="btn-rine-enviar">Enviar</button>
+        </form>
+      </section>
+
+      <!-- VISTA 3: ESTUDIO VRM 3D (CONTROLES DEL MODELO 3D) -->
+      <section class="vista" id="vista-vtuber" aria-label="Control del modelo VRM 3D">
+        <div class="panel-tarjeta">
+          <h2>Modelo .VRM, Cámara y Escena</h2>
+          <div class="fila-control">
+            <label>Celular</label>
+            <input type="file" id="input-vrm-local" accept=".vrm" hidden>
+            <button type="button" class="btn-enviar" id="btn-vrm-archivo-local">Subir archivo .VRM del celular…</button>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-modelo-sel">Modelo</label>
+            <select id="vrm-modelo-sel"></select>
+            <button type="button" class="chip-btn" id="btn-vrm-cargar-modelo">Cargar</button>
+            <button type="button" class="chip-btn" id="btn-recargar-vrm">Recargar 3D</button>
+          </div>
+          <div class="fila-control">
+            <label>Cámara</label>
+            <div class="chips-grid" id="chips-camara-vrm"></div>
+          </div>
+          <div class="fila-control">
+            <label>Fondo</label>
+            <div class="chips-grid" id="chips-fondo-vrm"></div>
+          </div>
+          <div class="fila-control">
+            <label>Tema</label>
+            <div class="chips-grid" id="chips-tema-vrm"></div>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Hablar en el visor 3D (speak)</h2>
+          <div class="fila-control">
+            <input type="text" id="vrm-speak-texto" maxlength="400" value="Hola, te escucho perfectamente.">
+            <button type="button" class="btn-enviar" id="btn-vrm-speak">Hablar</button>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-speak-emo">Emoción</label>
+            <select id="vrm-speak-emo"></select>
+            <label for="vrm-speak-ges">Gesto</label>
+            <select id="vrm-speak-ges"></select>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Voz (TTS) y Tono</h2>
+          <div class="fila-control">
+            <label class="chk-linea">
+              <input type="checkbox" id="vrm-tts-on" checked>
+              <span>Voz (TTS) activa al hablar</span>
+            </label>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-voice-select">Voz</label>
+            <select id="vrm-voice-select"></select>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-pitch">Tono (pitch)</label>
+            <input type="range" id="vrm-pitch" min="50" max="200" value="108">
+            <span id="vrm-pitch-val">108%</span>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Expresiones faciales · <span id="vrm-exp-pct">100%</span></h2>
+          <div class="chips-grid" id="chips-expresiones"></div>
+          <div class="fila-control">
+            <label for="vrm-exp-slider">Intensidad</label>
+            <input type="range" id="vrm-exp-slider" min="0" max="100" value="100">
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Poses estáticas</h2>
+          <div class="chips-grid" id="chips-poses"></div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Gestos animados</h2>
+          <div class="chips-grid" id="chips-gestos"></div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Dirección de mirada (look)</h2>
+          <div class="chips-grid" id="chips-mirada"></div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Manos y Desplazamiento 3D</h2>
+          <div class="fila-control">
+            <label for="vrm-mano-lado">Mano</label>
+            <select id="vrm-mano-lado">
+              <option value="both">Ambas</option>
+              <option value="left">Izquierda</option>
+              <option value="right">Derecha</option>
+            </select>
+          </div>
+          <div class="chips-grid" id="chips-manos" style="margin-top:6px"></div>
+
+          <div class="cruceta-grid">
+            <span></span>
+            <button type="button" class="chip-btn" data-move="0,-0.35">↑</button>
+            <span></span>
+            <button type="button" class="chip-btn" data-move="-0.35,0">←</button>
+            <button type="button" class="chip-btn" data-move="center">●</button>
+            <button type="button" class="chip-btn" data-move="0.35,0">→</button>
+            <span></span>
+            <button type="button" class="chip-btn" data-move="0,0.35">↓</button>
+            <span></span>
+          </div>
+          <div class="chips-grid" style="justify-content:center">
+            <button type="button" class="chip-btn" data-turn="-30">⟲ -30°</button>
+            <button type="button" class="chip-btn" data-turn="0">De frente</button>
+            <button type="button" class="chip-btn" data-turn="30">⟳ +30°</button>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Rotación de Huesos VRM (grados)</h2>
+          <div class="fila-control">
+            <label for="vrm-hueso-sel">Hueso</label>
+            <select id="vrm-hueso-sel"></select>
+            <button type="button" class="chip-btn" id="btn-vrm-hueso-cero">Poner a 0</button>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-hx">Eje X</label>
+            <input type="range" id="vrm-hx" min="-180" max="180" value="0">
+            <span id="vrm-hx-val">0°</span>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-hy">Eje Y</label>
+            <input type="range" id="vrm-hy" min="-180" max="180" value="0">
+            <span id="vrm-hy-val">0°</span>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-hz">Eje Z</label>
+            <input type="range" id="vrm-hz" min="-180" max="180" value="0">
+            <span id="vrm-hz-val">0°</span>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Reposo, Respiración y Parpadeo</h2>
+          <div class="fila-control">
+            <label class="chk-linea">
+              <input type="checkbox" id="vrm-idle-on" checked>
+              <span>Respiración y balanceo natural</span>
+            </label>
+          </div>
+          <div class="fila-control">
+            <label for="vrm-idle-int">Intensidad</label>
+            <input type="range" id="vrm-idle-int" min="0" max="200" value="100">
+            <span id="vrm-idle-int-val">100%</span>
+          </div>
+          <div class="fila-control">
+            <label class="chk-linea">
+              <input type="checkbox" id="vrm-blink-on" checked>
+              <span>Parpadeo automático</span>
+            </label>
+          </div>
+          <div class="fila-control" style="justify-content:flex-end">
+            <button type="button" class="chip-btn" id="btn-vrm-reset">Restablecer avatar</button>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Consola de Comandos JSON y Actividad</h2>
+          <div class="fila-control">
+            <label for="vrm-console-preset">Ejemplo</label>
+            <select id="vrm-console-preset">
+              <option value="saludo">Saludo feliz</option>
+              <option value="pensar">Pensar y mirar arriba</option>
+              <option value="secuencia">Secuencia de actuación</option>
+              <option value="huesos">Rotación de huesos</option>
+              <option value="mirada">Mirar a cámara</option>
+              <option value="reset">Resetear avatar</option>
+            </select>
+          </div>
+          <textarea class="consola-json" id="vrm-console-input" rows="5" spellcheck="false"></textarea>
+          <div class="chips-grid" style="margin-top:6px">
+            <button type="button" class="btn-enviar" id="btn-vrm-console-run">Ejecutar</button>
+            <button type="button" class="chip-btn" id="btn-vrm-console-fmt">Formatear</button>
+          </div>
+          <div class="fila-control" style="justify-content:space-between;margin-top:10px">
+            <strong style="font-size:11px;color:var(--bata)">ACTIVIDAD DE COMANDOS</strong>
+            <button type="button" class="chip-btn" id="btn-vrm-clear-log">Limpiar</button>
+          </div>
+          <ul class="lista-simple" id="vrm-log"></ul>
+        </div>
+      </section>
+
+      <!-- VISTA 4: DATOS REALES DEL SISTEMA Y CÁMARA (SIN DATOS FALSOS) -->
+      <section class="vista" id="vista-sistema" aria-label="Estado real del sistema y sensores">
+        <div class="panel-tarjeta">
+          <h2>Sensor de Cámara y Visión en Vivo</h2>
+          <div class="rejilla-telemetria">
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">ESTADO CÁMARA</div>
+              <div class="caja-dato-valor" id="vis-estado">Apagada</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">DETECCIÓN</div>
+              <div class="caja-dato-valor" id="vis-rostro">Sin lectura</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">ILUMINACIÓN REAL</div>
+              <div class="caja-dato-valor" id="vis-brillo">Sin lectura</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">MOVIMIENTO EN CUADRO</div>
+              <div class="caja-dato-valor" id="vis-movimiento">Sin lectura</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Telemetría Real (PC / Dispositivo)</h2>
+          <div class="rejilla-telemetria">
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">MODO DE ENLACE</div>
+              <div class="caja-dato-valor" style="font-size:12px" id="tele-enlace">Modo Local</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">BATERÍA</div>
+              <div class="caja-dato-valor" id="tele-bat">Sin lectura</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">CPU DEL PC</div>
+              <div class="caja-dato-valor" id="tele-cpu">Sin lectura (PC desconectado)</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">MEMORIA RAM DEL PC</div>
+              <div class="caja-dato-valor" id="tele-ram">Sin lectura (PC desconectado)</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">TEMPERATURA PC</div>
+              <div class="caja-dato-valor" id="tele-temp">Sin lectura (PC desconectado)</div>
+            </div>
+            <div class="caja-dato">
+              <div class="caja-dato-titulo">VENTANA / PROCESO PC</div>
+              <div class="caja-dato-valor" style="font-size:12px" id="tele-proceso">Sin lectura (PC desconectado)</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Conectoma R.A.M.S. (Solo lectura real del PC)</h2>
+          <p id="nota-conectoma-pc" style="font-size:11px;color:var(--txt-d);margin:0 0 8px">
+            Sin lectura: conecta con tu PC para ver las variables reales del conectoma. No se inventan datos locales.
+          </p>
+          <div id="contenedor-barras-conectoma"></div>
+        </div>
+
+        <div class="panel-tarjeta">
+          <h2>Módulos del PC y Bitácora</h2>
+          <ul class="lista-simple" id="lista-modulos">
+            <li>Sin conexión al PC actualmente.</li>
+          </ul>
+          <ul class="lista-simple" id="lista-eventos" style="margin-top:8px"></ul>
+        </div>
+      </section>
+    </main>
+
+    <!-- Navegación inferior táctil -->
+    <nav class="nav-inf" role="tablist" aria-label="Secciones de Amadeus">
+      <button type="button" class="tab-nav activa" data-vista="vista-vivo">
+        <span>Videollamada</span>
+      </button>
+      <button type="button" class="tab-nav" data-vista="vista-rine">
+        <span>Chat <span class="insignia-tab" id="insignia-rine" hidden>0</span></span>
+      </button>
+      <button type="button" class="tab-nav" data-vista="vista-vtuber">
+        <span>Estudio 3D</span>
+      </button>
+      <button type="button" class="tab-nav" data-vista="vista-sistema">
+        <span>Sistema</span>
+      </button>
+    </nav>
+  </div>
+
+  <!-- Modal para configurar servidor del PC (Misma red Wi-Fi / USB / Tailscale) -->
+  <div class="modal-fondo" id="modal-config" hidden>
+    <div class="modal-caja">
+      <h2 style="margin:0 0 8px;font-size:14px;color:var(--bata)">Conexión con Amadeus en PC</h2>
+      <p style="font-size:11px;color:var(--txt-d);margin:0 0 8px">
+        • <strong>Por cable USB:</strong> deja <code>http://127.0.0.1:8767</code>.<br>
+        • <strong>Misma red Wi-Fi o Tailscale:</strong> pon la IP de tu PC (ej. <code>http://192.168.1.x:8767</code>).<br>
+        • Si el PC no responde al llamar, la app usará automáticamente a <strong>Amadeus Local</strong> en tu teléfono.
+      </p>
+      <div class="fila-control" style="margin-bottom:8px">
+        <label for="input-url-servidor">Dirección PC</label>
+        <input type="text" id="input-url-servidor" placeholder="http://127.0.0.1:8767">
+      </div>
+      <div class="fila-control" style="margin-bottom:10px">
+        <label for="input-token-hud">Token HUD</label>
+        <input type="text" id="input-token-hud" placeholder="Opcional (se obtiene solo del PC)">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button type="button" class="btn-hud" id="btn-cerrar-config">Cerrar</button>
+        <button type="button" class="btn-enviar" id="btn-guardar-config">Guardar y Probar</button>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

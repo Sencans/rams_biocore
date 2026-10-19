@@ -15,6 +15,11 @@ Qué hace:
   voz/terminal = pausa + máximo de interrupciones por hora y ≥ 10 min entre interrupciones
   (``descanso`` siempre se permite).
 - Entrada de Telegram por *long polling* con filtro estricto de remitente (§9.3).
+- Multimedia de Telegram (v0.2.1): ``enviar_foto_telegram`` (``sendPhoto`` de un JPEG en memoria,
+  ≤ 10 MB), ``enviar_voz_telegram`` (respuesta como nota de voz MP3, ElevenLabs o edge-tts) y
+  notas de voz/audios entrantes (≤ 2 MB y ≤ 3 min): ``getFile`` → descarga en memoria →
+  transcriptor inyectado con ``set_transcriptor`` → ``manejador(texto, voz=True)``. Nada de eso
+  toca el disco ni el log (del audio y de la foto solo se registran tamaños).
 
 Dependencias opcionales: ``httpx`` (ElevenLabs y Telegram), ``edge_tts`` (voz de respaldo),
 ``numpy`` (RMS del lip-sync; si falta, ``array('h')`` + ``math``; **nunca** ``audioop``),
@@ -53,6 +58,7 @@ import contextlib
 import functools
 import html
 import importlib.util
+import inspect
 import io
 import itertools
 import json
@@ -149,12 +155,30 @@ REINICIO_REFRACTARIO_S: Final = 6 * 3600.0
 
 # Telegram
 URL_TELEGRAM: Final = "https://api.telegram.org"
-# Mínimo entre envíos (sendMessage/sendVoice). Variable de módulo para que los tests la anulen.
+# Mínimo entre envíos (sendMessage/sendVoice/sendPhoto). Variable de módulo para que los tests la anulen.
 INTERVALO_MIN_ENVIO_S: float = 1.0
-METODOS_ENVIO: Final = frozenset({"sendMessage", "sendVoice"})
+METODOS_ENVIO: Final = frozenset({"sendMessage", "sendVoice", "sendPhoto"})
 ACTUALIZACIONES_PERMITIDAS: Final = ("message", "callback_query")
 LIMITE_MENSAJE: Final = 4000           # margen bajo el límite de 4096 caracteres
-LIMITE_LEYENDA: Final = 1000           # caption de sendVoice (≤ 1024)
+LIMITE_LEYENDA: Final = 1000           # caption de sendVoice/sendPhoto (≤ 1024)
+# Multimedia (Bot API): sendPhoto ≤ 10 MB; sendVoice ≤ 50 MB (OGG/Opus, MP3 o M4A); getFile
+# descarga ≤ 20 MB, pero aquí solo se aceptan notas de voz/audios de ≤ 2 MB y ≤ 3 min.
+LIMITE_FOTO_BYTES: Final = 10 * 1024 * 1024
+LIMITE_VOZ_BYTES: Final = 50 * 1024 * 1024
+LIMITE_AUDIO_ENTRANTE_BYTES: Final = 2 * 1024 * 1024
+LIMITE_AUDIO_ENTRANTE_S: Final = 180
+LIMITE_TEXTO_VOZ: Final = 1500         # caracteres que se sintetizan en una respuesta por voz
+TIMEOUT_DESCARGA_S: Final = 30.0       # descarga de una nota de voz (getFile + /file/bot…)
+# Transcripción de una nota de voz (Gemini). Variable de módulo para que los tests la reduzcan.
+TIMEOUT_TRANSCRIPCION_S: float = 60.0
+MIME_AUDIO_DEFECTO: Final = {"voice": "audio/ogg", "audio": "audio/mpeg"}
+_RE_MIME_AUDIO: Final = re.compile(r"^audio/[a-z0-9][a-z0-9.+\-]{0,40}$")
+_RE_RUTA_ARCHIVO: Final = re.compile(r"^[A-Za-z0-9_\-][A-Za-z0-9_\-./]{0,255}$")
+MENSAJE_AUDIO_SIN_TRANSCRIPTOR: Final = ("Ahora mismo no puedo escuchar notas de voz. "
+                                         "¿Me lo escribes, por favor?")
+MENSAJE_AUDIO_FALLIDO: Final = "No pude escuchar tu nota de voz. ¿Me la repites o me lo escribes?"
+MENSAJE_AUDIO_LARGO: Final = ("Tu audio es demasiado largo para mí (máximo 3 minutos). "
+                              "¿Me lo resumes en uno más corto o me lo escribes?")
 MAX_REINTENTOS_429: Final = 2
 ESPERA_ERROR_TELEGRAM_S: Final = 5.0
 LONG_POLL_S: Final = 50
@@ -261,6 +285,14 @@ class _ErrorTelegram(Exception):
 
 class _ErrorReproductor(Exception):
     """El reproductor de audio no se pudo abrir o dejó de aceptar datos."""
+
+
+class _ArchivoGrande(Exception):
+    """El archivo de Telegram supera el límite que se acepta (se corta la descarga)."""
+
+
+# Transcriptor de notas de voz: ``(audio, mime) -> texto | None`` (main inyecta el de Broca/Gemini).
+Transcriptor = Callable[[bytes, str], Awaitable["str | None"]]
 
 
 _PARADO: Final = object()   # centinela: se activó ``parar`` mientras se esperaba
@@ -381,6 +413,42 @@ def _teclado_llamada(llamada_id: int) -> dict[str, Any]:
         {"text": "Devolver llamada", "callback_data": f"dev:{llamada_id}"},
         {"text": "Ahora no", "callback_data": f"no:{llamada_id}"},
     ]]}
+
+
+def _entero_no_negativo(valor: Any) -> int | None:
+    """Entero ≥ 0 de un campo de la Bot API (``duration``, ``file_size``), o ``None``."""
+    if isinstance(valor, bool) or not isinstance(valor, int):
+        return None
+    return valor if valor >= 0 else None
+
+
+def _mime_audio(valor: Any, tipo: str) -> str:
+    """MIME de la nota de voz/audio declarado por Telegram (saneado) o el habitual del tipo."""
+    texto = str(valor or "").split(";", 1)[0].strip().lower()
+    if _RE_MIME_AUDIO.match(texto):
+        return texto
+    return MIME_AUDIO_DEFECTO.get(tipo, "audio/ogg")
+
+
+def _texto_para_voz(texto: str, maximo: int = LIMITE_TEXTO_VOZ) -> str:
+    """Acota el texto de una respuesta por voz cortando en el último fin de oración que quepa."""
+    if len(texto) <= maximo:
+        return texto
+    corte = texto[:maximo]
+    fin = max(corte.rfind(". "), corte.rfind("? "), corte.rfind("! "), corte.rfind("… "))
+    if fin >= maximo // 3:
+        return corte[:fin + 1].strip()
+    return corte.rstrip() + "…"
+
+
+def _acepta_voz(manejador: Callable[..., Any]) -> bool | None:
+    """¿El manejador acepta ``voz=``? ``None`` si su firma no se puede leer."""
+    try:
+        parametros = inspect.signature(manejador).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    return any((p.name == "voz" and p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD))
+               or p.kind is p.VAR_KEYWORD for p in parametros)
 
 
 # ---------------------------------------------------------------------------
@@ -760,6 +828,7 @@ class RikoMeguminIO:
         self._entrada_telegram_desactivada = False
         self._proximo_envio = 0.0
         self._megumin: dict[str, list[dict[str, str]]] | None = None
+        self._transcriptor: Transcriptor | None = None
 
     # ------------------------------------------------------------------
     # Propiedades públicas
@@ -2295,6 +2364,120 @@ class RikoMeguminIO:
         self._publicar("telegram.enviado", {"tipo": "respuesta", "nivel": 0, "texto": limpio[:200]})
         return True
 
+    # --- Multimedia: fotos y notas de voz -------------------------------
+
+    async def enviar_foto_telegram(self, jpeg: bytes, *, leyenda: str = "") -> bool:
+        """``sendPhoto`` (multipart) de un JPEG en memoria al ``CHAT_ID``. ``True`` si se envió.
+
+        Mismos límites que el resto de envíos: ritmo mínimo entre envíos, reintento ante 429 y
+        desactivación si Telegram rechaza el token. La foto debe pesar ≤ 10 MB (límite de la Bot
+        API); la leyenda se limpia y se escapa como un ``sendMessage`` (≤ 1000 caracteres). Los
+        bytes nunca se escriben en disco ni en el log.
+        """
+        if not self._telegram_disponible():
+            return False
+        if not isinstance(jpeg, (bytes, bytearray)) or not jpeg:
+            log.info("No hay foto que enviar por Telegram.")
+            return False
+        if len(jpeg) > LIMITE_FOTO_BYTES:
+            log.warning("La foto pesa %d KB (> 10 MB); no se envía por Telegram.", len(jpeg) // 1024)
+            return False
+        limpio = limpiar_para_telegram(str(leyenda or ""))
+        await self._accion_chat("upload_photo")
+        datos = {"chat_id": str(self._settings.telegram_chat_id)}
+        if limpio:
+            datos["caption"] = html.escape(_acotar_caracteres(limpio, LIMITE_LEYENDA))
+            datos["parse_mode"] = "HTML"
+        try:
+            await self._tg("sendPhoto", data=datos,
+                           files={"photo": ("amadeus.jpg", bytes(jpeg), "image/jpeg")},
+                           timeout=httpx.Timeout(15.0, read=60.0, write=60.0))
+        except _ErrorTelegram as exc:
+            self._registrar_error_telegram("sendPhoto", exc)
+            return False
+        self._publicar("telegram.enviado", {"tipo": "foto", "nivel": 0, "texto": limpio[:200]})
+        log.info("Telegram: foto enviada (%d KB).", len(jpeg) // 1024)
+        return True
+
+    async def enviar_voz_telegram(self, texto: str, *, tone: str = "calido",
+                                  transcripcion: bool = True) -> bool:
+        """Nota de voz con ``texto`` (ElevenLabs o edge-tts, MP3) por ``sendVoice``. ``True`` si se envió.
+
+        Se sintetiza como las notas de voz de las llamadas (``mp3_44100_64`` de ElevenLabs o el MP3
+        de edge-tts), con el texto limpio para voz y acotado a ``LIMITE_TEXTO_VOZ`` caracteres
+        (cortando en un fin de oración). Con ``transcripcion`` (por defecto) la nota lleva el texto
+        como leyenda, igual que las llamadas; pásalo en ``False`` si el texto ya va en otro mensaje.
+        Si la respuesta es larga (la voz se recortó o el texto no cabe en la leyenda), la nota va
+        sin leyenda y el texto **completo** sigue en mensajes aparte: nada se pierde en silencio.
+        Sin motor de voz o si la síntesis falla devuelve ``False`` (quien llama envía el texto);
+        también si la nota salió pero el texto completo no (quien llama lo reintenta).
+        """
+        if not self._telegram_disponible():
+            return False
+        limpio = limpiar_para_telegram(str(texto or ""))
+        voz_completa = limpiar_para_voz(str(texto or ""))
+        texto_voz = _texto_para_voz(voz_completa)
+        if not texto_voz:
+            return False
+        texto_aparte = bool(transcripcion and limpio) and (
+            len(voz_completa) > LIMITE_TEXTO_VOZ or len(limpio) > LIMITE_LEYENDA)
+        audio = await self._sintetizar_mp3(texto_voz, str(tone or "calido"), "es")
+        if not audio:
+            log.info("No se pudo sintetizar la nota de voz para Telegram; va solo el texto.")
+            return False
+        if len(audio) > LIMITE_VOZ_BYTES:
+            log.warning("La nota de voz pesa demasiado (%d KB); no se envía.", len(audio) // 1024)
+            return False
+        leyenda = ""
+        if transcripcion and limpio and not texto_aparte:
+            leyenda = html.escape(_acotar_caracteres(limpio, LIMITE_LEYENDA))
+        if not await self._enviar_voz(audio, leyenda_html=leyenda):
+            return False
+        self._publicar("telegram.enviado", {"tipo": "audio", "nivel": 0, "texto": limpio[:200]})
+        log.info("Telegram: nota de voz enviada (%d KB, %d caracteres).", len(audio) // 1024, len(texto_voz))
+        if texto_aparte and not await self.enviar_telegram_texto(limpio):
+            log.warning("La nota de voz salió, pero el texto completo de la respuesta no.")
+            return False
+        return True
+
+    async def _sintetizar_mp3(self, texto_voz: str, tone: str, lang: str) -> bytes | None:
+        """MP3 de ``texto_voz``: ElevenLabs (``mp3_44100_64``) o, si no, edge-tts. ``None`` si no hay voz."""
+        if self._eleven_activo():
+            async def accion(extras: bool) -> bytes:
+                return await self._eleven_mp3(self._texto_eleven([(tone, texto_voz)], extras), tone, lang,
+                                              extras)
+            try:
+                audio = await self._intentar_eleven(accion)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # la voz es opcional: el texto va igual
+                log.info("ElevenLabs no pudo generar la nota de voz (%s).", type(exc).__name__)
+                audio = None
+            if audio:
+                return bytes(audio)
+        if self._edge_disponible():
+            try:
+                audio = await asyncio.wait_for(self._edge_mp3(texto_voz, tone, lang), TIMEOUT_EDGE_MP3_S)
+                if audio:
+                    return audio
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.info("edge-tts no pudo generar la nota de voz (%s).", type(exc).__name__)
+        return None
+
+    def set_transcriptor(self, fn: Transcriptor | None) -> None:
+        """Función que transcribe las notas de voz entrantes: ``await fn(audio, mime) -> texto | None``.
+
+        ``None`` la quita: entonces a una nota de voz se le responde por texto que no se puede
+        escuchar. main inyecta ``broca.transcribir_audio`` si hay Gemini y ``telegram_transcribir``.
+        """
+        if fn is not None and not callable(fn):
+            log.warning("set_transcriptor recibió un %s que no es invocable; se ignora.", type(fn).__name__)
+            return
+        self._transcriptor = fn
+        log.info("Transcripción de notas de voz de Telegram %s.", "activa" if fn is not None else "desactivada")
+
     # --- Ruta proactiva por niveles ------------------------------------
 
     async def _entregar_telegram_proactivo(self, u: Utterance, segs: list[Segmento]) -> bool:
@@ -2623,14 +2806,20 @@ class RikoMeguminIO:
     # ------------------------------------------------------------------
 
     async def bucle_telegram_entrada(self, parar: asyncio.Event,
-                                     manejador: Callable[[str], Awaitable[None]]) -> None:
+                                     manejador: Callable[..., Awaitable[None]]) -> None:
         """*Long polling* de ``getUpdates`` con filtro estricto de remitente (§9.3).
 
         1. ``getUpdates(offset=-1)`` para saltar el *backlog*; ``offset = último + 1``.
         2. ``getUpdates(timeout=50)`` con ``allowed_updates=["message","callback_query"]``.
         3. Solo chats privados cuyo ``chat.id`` y ``from.id`` sean ``CHAT_ID``.
-        4. Texto → ``manejador(texto)``; botones ``dev:``/``no:`` → marcar la llamada.
+        4. Texto → ``manejador(texto)``; nota de voz o audio (≤ 2 MB y ≤ 3 min) → ``getFile``,
+           descarga en memoria, transcriptor y ``manejador(texto, voz=True)`` (sin transcriptor o
+           si falla, se responde por texto que no se pudo escuchar); botones ``dev:``/``no:`` →
+           marcar la llamada.
         5. 409 → ``log.error`` y termina; otros errores → espera 5 s y reintenta.
+
+        CONTRATO: ``manejador(texto: str, *, voz: bool = False)``. Un manejador antiguo sin ``voz``
+        sigue funcionando (recibe solo el texto).
         """
         if not self._telegram_disponible():
             log.info("Entrada de Telegram desactivada (sin configuración, offline o sin httpx).")
@@ -2681,7 +2870,7 @@ class RikoMeguminIO:
             offset = self._siguiente_offset(resultado, offset or 0)
             for actualizacion in resultado:
                 if isinstance(actualizacion, dict):
-                    await self._procesar_actualizacion(actualizacion, manejador, chat_id)
+                    await self._procesar_actualizacion(actualizacion, manejador, chat_id, parar=parar)
 
     @staticmethod
     def _siguiente_offset(actualizaciones: Any, actual: int) -> int:
@@ -2695,8 +2884,9 @@ class RikoMeguminIO:
         return siguiente
 
     async def _procesar_actualizacion(self, actualizacion: Mapping[str, Any],
-                                      manejador: Callable[[str], Awaitable[None]], chat_id: str) -> None:
-        """Aplica el filtro de remitente y despacha mensajes de texto y botones."""
+                                      manejador: Callable[..., Awaitable[None]], chat_id: str, *,
+                                      parar: asyncio.Event | None = None) -> None:
+        """Aplica el filtro de remitente y despacha mensajes de texto, notas de voz y botones."""
         mensaje = actualizacion.get("message")
         if isinstance(mensaje, dict):
             chat = mensaje.get("chat") if isinstance(mensaje.get("chat"), dict) else {}
@@ -2707,6 +2897,8 @@ class RikoMeguminIO:
                 if isinstance(texto, str) and texto.strip():
                     log.info("Mensaje de Telegram recibido (%d caracteres).", len(texto))
                     await self._llamar_manejador(manejador, texto)
+                elif isinstance(mensaje.get("voice"), dict) or isinstance(mensaje.get("audio"), dict):
+                    await self._procesar_audio_entrante(mensaje, manejador, parar)
                 else:
                     log.info("Mensaje de Telegram sin texto ignorado.")
             else:
@@ -2721,8 +2913,136 @@ class RikoMeguminIO:
             else:
                 log.info("Botón de Telegram ignorado: remitente no autorizado.")
 
+    async def _procesar_audio_entrante(self, mensaje: Mapping[str, Any],
+                                       manejador: Callable[..., Awaitable[None]],
+                                       parar: asyncio.Event | None) -> None:
+        """Nota de voz (``voice``) o audio (``audio``) del usuario → texto → ``manejador(texto, voz=True)``.
+
+        Límites: ≤ 2 MB y ≤ 180 s (lo declarado por Telegram y lo que llega de verdad). El audio
+        se descarga en memoria, se pasa al transcriptor y se suelta; nunca toca el disco ni el log
+        (del texto transcrito solo se registra la longitud). Si no hay transcriptor, el audio es
+        demasiado largo o algo falla, se responde por texto en el mismo chat.
+        """
+        tipo = "voice" if isinstance(mensaje.get("voice"), dict) else "audio"
+        datos: Mapping[str, Any] = mensaje[tipo]
+        duracion = _entero_no_negativo(datos.get("duration"))
+        tam = _entero_no_negativo(datos.get("file_size"))
+        log.info("%s de Telegram recibida (%s s, %s KB).",
+                 "Nota de voz" if tipo == "voice" else "Nota de audio",
+                 "?" if duracion is None else duracion, "?" if tam is None else tam // 1024)
+        if self._transcriptor is None:
+            await self.enviar_telegram_texto(MENSAJE_AUDIO_SIN_TRANSCRIPTOR)
+            return
+        if ((duracion is not None and duracion > LIMITE_AUDIO_ENTRANTE_S)
+                or (tam is not None and tam > LIMITE_AUDIO_ENTRANTE_BYTES)):
+            log.info("Nota de voz demasiado larga; no se descarga.")
+            await self.enviar_telegram_texto(MENSAJE_AUDIO_LARGO)
+            return
+        file_id = datos.get("file_id")
+        if not isinstance(file_id, str) or not file_id.strip() or len(file_id) > 256:
+            await self.enviar_telegram_texto(MENSAJE_AUDIO_FALLIDO)
+            return
+        await self._accion_chat("typing")
+        trabajo = self._escuchar_audio(file_id, _mime_audio(datos.get("mime_type"), tipo))
+        if parar is not None:
+            resultado = await self._esperar_o_parar(trabajo, parar)
+            if resultado is _PARADO:
+                return
+        else:
+            resultado = await trabajo
+        estado, texto = resultado
+        if estado == "ok" and texto:
+            log.info("Nota de voz transcrita (%d caracteres).", len(texto))
+            await self._llamar_manejador(manejador, texto, voz=True)
+        elif estado == "largo":
+            await self.enviar_telegram_texto(MENSAJE_AUDIO_LARGO)
+        elif estado == "sin_transcriptor":
+            await self.enviar_telegram_texto(MENSAJE_AUDIO_SIN_TRANSCRIPTOR)
+        else:
+            await self.enviar_telegram_texto(MENSAJE_AUDIO_FALLIDO)
+
+    async def _escuchar_audio(self, file_id: str, mime: str) -> tuple[str, str | None]:
+        """``getFile`` → descarga en memoria → transcriptor. ``(estado, texto)``.
+
+        ``estado`` ∈ {``"ok"``, ``"largo"``, ``"fallo"``, ``"sin_transcriptor"``}. Nunca lanza
+        (salvo la cancelación).
+        """
+        try:
+            info = await self._tg("getFile", json_={"file_id": file_id}, timeout=15.0)
+        except _ErrorTelegram as exc:
+            self._registrar_error_telegram("getFile", exc)
+            if exc.codigo == 400 and "too big" in exc.descripcion.lower():
+                return "largo", None
+            return "fallo", None
+        if not isinstance(info, dict):
+            return "fallo", None
+        tam = _entero_no_negativo(info.get("file_size"))
+        if tam is not None and tam > LIMITE_AUDIO_ENTRANTE_BYTES:
+            return "largo", None
+        ruta = info.get("file_path")
+        if not isinstance(ruta, str) or not _RE_RUTA_ARCHIVO.match(ruta) or ".." in ruta:
+            log.warning("getFile devolvió una ruta de archivo no válida; se descarta la nota de voz.")
+            return "fallo", None
+        try:
+            audio = await asyncio.wait_for(self._descargar_archivo(ruta, LIMITE_AUDIO_ENTRANTE_BYTES),
+                                           TIMEOUT_DESCARGA_S + 5.0)
+        except _ArchivoGrande:
+            return "largo", None
+        except asyncio.TimeoutError:
+            log.warning("La descarga de la nota de voz tardó demasiado.")
+            return "fallo", None
+        except _ErrorTelegram as exc:
+            log.warning("No se pudo descargar la nota de voz (%s).", exc)
+            return "fallo", None
+        if not audio:
+            return "fallo", None
+        transcriptor = self._transcriptor
+        if transcriptor is None:
+            return "sin_transcriptor", None
+        try:
+            texto = await asyncio.wait_for(transcriptor(audio, mime), TIMEOUT_TRANSCRIPCION_S)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            log.warning("La transcripción de la nota de voz tardó más de %g s.", TIMEOUT_TRANSCRIPCION_S)
+            texto = None
+        except Exception as exc:  # el transcriptor es de otro módulo: nunca tumba la escucha
+            log.warning("El transcriptor de notas de voz falló (%s).", type(exc).__name__)
+            texto = None
+        finally:
+            del audio
+        if not isinstance(texto, str) or not texto.strip():
+            log.info("La nota de voz no se pudo transcribir.")
+            return "fallo", None
+        return "ok", texto.strip()
+
+    async def _descargar_archivo(self, ruta: str, limite: int) -> bytes:
+        """``GET https://api.telegram.org/file/bot{token}/{ruta}`` en memoria, cortando al pasar ``limite``.
+
+        Lanza ``_ArchivoGrande`` o ``_ErrorTelegram`` (sin la URL: lleva el token).
+        """
+        cliente = self._obtener_cliente()
+        if cliente is None:
+            raise _ErrorTelegram(None, "httpx no disponible")
+        url = f"{URL_TELEGRAM}/file/bot{self._settings.telegram_bot_token}/{ruta}"
+        datos = bytearray()
+        try:
+            async with cliente.stream("GET", url, timeout=httpx.Timeout(10.0, read=TIMEOUT_DESCARGA_S)) as respuesta:
+                if respuesta.status_code != 200:
+                    raise _ErrorTelegram(respuesta.status_code, "descarga del archivo")
+                declarado = str(respuesta.headers.get("content-length") or "")
+                if declarado.isdigit() and int(declarado) > limite:
+                    raise _ArchivoGrande()
+                async for parte in respuesta.aiter_bytes():
+                    datos += parte
+                    if len(datos) > limite:
+                        raise _ArchivoGrande()
+        except _ERRORES_RED as exc:
+            raise _ErrorTelegram(None, type(exc).__name__) from None
+        return bytes(datos)
+
     async def _procesar_boton(self, consulta: Mapping[str, Any],
-                              manejador: Callable[[str], Awaitable[None]]) -> None:
+                              manejador: Callable[..., Awaitable[None]]) -> None:
         """``dev:<id>`` devuelve la llamada; ``no:<id>`` la anota como rechazada."""
         id_consulta = consulta.get("id")
         coincidencia = _RE_CALLBACK.match(str(consulta.get("data") or ""))
@@ -2750,9 +3070,27 @@ class RikoMeguminIO:
         except _ErrorTelegram as exc:
             log.debug("answerCallbackQuery falló: %s", exc)
 
-    async def _llamar_manejador(self, manejador: Callable[[str], Awaitable[None]], texto: str) -> None:
+    async def _llamar_manejador(self, manejador: Callable[..., Awaitable[None]], texto: str, *,
+                                voz: bool = False) -> None:
+        """``manejador(texto)`` o, para una nota de voz, ``manejador(texto, voz=True)``.
+
+        Un manejador que no admite ``voz`` (firma antigua) recibe solo el texto.
+        """
         try:
-            await manejador(texto)
+            if voz:
+                acepta = _acepta_voz(manejador)
+                if acepta is None:
+                    try:
+                        corrutina = manejador(texto, voz=True)
+                    except TypeError:
+                        corrutina = manejador(texto)
+                    await corrutina
+                elif acepta:
+                    await manejador(texto, voz=True)
+                else:
+                    await manejador(texto)
+            else:
+                await manejador(texto)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # un turno fallido nunca detiene la escucha

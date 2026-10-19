@@ -3614,7 +3614,7 @@ addopts = -q
 
 **Protocolo del visor** (fuente de verdad: `lib/protocol.js` de VTuber AI Studio). `POST /api/command` recibe un comando, una lista (se ejecuta en orden sin esperar a que termine cada uno: en la práctica, en paralelo) o una `sequence` (en orden; `await: false` en un paso para no esperarlo). Cada `speak` nuevo interrumpe al anterior y **cada `sequence` nueva cancela la anterior**. `GET /api/state` devuelve `viewers`, `ready`, `model`, `expressionsAvailable`, `bonesAvailable` y `current` (`pose`, `look`, `position {x, z}`, `rotation`, `camera`, `speaking`…); el visor lo actualiza 250 ms después de ejecutar cada comando. Ejes vistos desde el avatar: x+ inclinar adelante, y+ girar hacia SU izquierda, z+ ladear hacia SU derecha; en el escenario, x+ = derecha del espectador y z+ = hacia la cámara.
 
-**Configuración** (§4.1): `VTUBER_AI_ENABLED` (1), `VTUBER_AI_URL`, `VTUBER_AI_TTS` (1 = si no hay voz propia, habla la voz del navegador), `VTUBER_AI_LANG` (`es-MX`) y `VTUBER_AI_VOICE` (`female` por defecto, es decir, voz femenina del navegador; también admite nombres separados por comas, p. ej. `"Sabina,Helena"`).
+**Configuración** (§4.1): `VTUBER_AI_ENABLED` (1), `VTUBER_AI_URL`, `VTUBER_AI_TTS` (1 = si no hay voz propia, habla la voz del navegador), `VTUBER_AI_LANG` (`es-MX`), `VTUBER_AI_BURBUJA` (0 = sin globo de texto; 1 = globo sobre el avatar en cada `speak`, que lleva `"bubble"`) y `VTUBER_AI_VOICE` (`female` por defecto, es decir, voz femenina del navegador; también admite nombres separados por comas, p. ej. `"Sabina,Helena"`).
 
 **Eventos que consume** (§5):
 

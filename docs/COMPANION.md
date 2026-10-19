@@ -1,6 +1,6 @@
 # R.A.M.S. BIO-CORE v0.2 "Amadeus Companion": especificación de arquitectura
 
-> **Estado:** especificación normativa para la implementación en paralelo (tanda v0.2), **revisión 2** (incorpora la revisión crítica; lo aceptado, lo modificado y lo rechazado está en §C6). Complementa a `docs/ARQUITECTURA.md` (v0.1), que sigue siendo la base. Si algo de aquí contradice a la v0.1, **manda este documento** para los archivos que toca la v0.2; todo lo demás de la v0.1 sigue vigente.
+> **Estado:** especificación normativa para la implementación en paralelo (tanda v0.2), **revisión 2** (incorpora la revisión crítica; lo aceptado, lo modificado y lo rechazado está en §C6). Complementa a `docs/ARQUITECTURA.md` (v0.1), que sigue siendo la base. Si algo de aquí contradice a la v0.1, **manda este documento** para los archivos que toca la v0.2; todo lo demás de la v0.1 sigue vigente. **Ampliaciones posteriores:** §C2.15 (respaldo Puter del Área de Broca dentro de Amadeus Desktop) y §C2.16 (v0.2.1: Telegram multimedia, apps del menú Inicio y capacidades reales).
 > **Fecha:** 2026-10-17. **Idioma:** español (comentarios, docstrings, UI, identificadores). **Reglas de código:** UTF-8 + LF; Python ≥ 3.11 (vermin `-t=3.11-`); nada bloqueante en el event loop; sin `shell=True`; dependencias opcionales en `try/except`; Electron con `contextIsolation`, `sandbox` y preload mínimo; sin secretos en el código.
 > **Investigación de apoyo** (solo lectura): `scratchpad/research2/` → `amadeus_desktop_overlay.md`, `control_pc_apps_raton.md`, `vision_continua_local.md`, `kurisu_look_vrm.md`. Este documento manda sobre los informes.
 
@@ -99,7 +99,7 @@ Dos clientes del mismo endpoint `/escritorio`:
 - **Ventana de chat de Electron** (`preload-chat`): escribes → `{tipo:"chat", texto}` → `escritorio.chat` → main → `_turno_serializado(texto, "escritorio")`, que publica **una** `usuario.entrada{canal:"escritorio"}` ya redactada.
 - **Panel de chat estilo RINE en el HUD** (`amadeus_hud.html`): igual, con el token de escritorio que el HUD recibe en un mensaje aparte de `/ws` (§C2.4.6), si `RAMS_HUD_CHAT=1`.
 
-Las respuestas salen en **modo terminal** (texto en el chat y en el globo, labios mudos; con `RAMS_ESCRITORIO_VOZ=1`, regla de voz de la v0.1). La salida de los comandos (`/estado`, `/ayuda`…) vuelve al chat como mensaje de sistema. El canal `escritorio` es **local** (presencia y capacidades de la terminal), pero **no** resuelve confirmaciones con texto: se confirman con **botones** ligados al `id` de la solicitud; `cerrar_ventana` solo por terminal.
+Las respuestas salen en **modo terminal** (texto en el chat, labios mudos; globo sobre el avatar solo con `VTUBER_AI_BURBUJA=1`; con `RAMS_ESCRITORIO_VOZ=1`, regla de voz de la v0.1). La salida de los comandos (`/estado`, `/ayuda`…) vuelve al chat como mensaje de sistema. El canal `escritorio` es **local** (presencia y capacidades de la terminal), pero **no** resuelve confirmaciones con texto: se confirman con **botones** ligados al `id` de la solicitud; `cerrar_ventana` solo por terminal.
 
 ### C1.6 "Búscame en 10 minutos"
 
@@ -263,6 +263,8 @@ percepcion: Mapping[str, Any] | None = field(default=None, hash=False)
 
 ### C2.3 Eventos del bus nuevos (ampliación de la tabla de §5)
 
+v0.2.2: eventos y mensajes nuevos en `docs/V022_CORREO_DRIVE_SCRIPTS.md` §11–§12.
+
 Payloads JSON-serializables; claves exactas; sin secretos, imágenes, rutas completas ni comandos completos. **Reglas del bus v0.2:** (a) ningún módulo se suscribe a `"*"` ni a `"escritorio.*"`; (b) `escritorio.chat` es el **único** evento con texto del usuario sin redactar: solo lo consume main, nadie lo registra (ni en INFO ni en DEBUG) y ni el HUD ni `/escritorio` lo reenvían; (c) `usuario.entrada` sigue siendo **exclusivo de main** (§5 de la v0.1).
 
 | Evento | Emisor | Payload (`datos`) | Frecuencia | Consumidores |
@@ -308,6 +310,8 @@ Payloads JSON-serializables; claves exactas; sin secretos, imágenes, rutas comp
 
 ### C2.4 Protocolo WS `/escritorio` (grupo `escritorio-ws`, en `interface/hud_server.py`)
 
+v0.2.2: eventos y mensajes nuevos en `docs/V022_CORREO_DRIVE_SCRIPTS.md` §11–§12.
+
 1. **Ubicación:** nuevo path `/escritorio` en el servidor WebSocket del HUD (mismo `ServidorHUD`, `settings.hud_puerto`, `127.0.0.1`, nunca `0.0.0.0`). El grupo PUEDE crear `interface/escritorio_link.py` y componerlo desde `ServidorHUD`.
 2. **Arranque:** `ServidorHUD` arranca si `hud_habilitado or tiene_escritorio`; sirve `/` y `/ws` **solo** con `hud_habilitado` (si no, 404); sirve `/escritorio` solo con `tiene_escritorio`. Nuevo `diagnostico_escritorio() -> DiagnosticoModulo` (clave `"escritorio"`; `OK` con `ws://127.0.0.1:<p>/escritorio` **sin** token; `OFF` si `not tiene_escritorio`).
 3. **Token:** `secrets.token_urlsafe(16)`, distinto del token del HUD, nuevo en cada arranque. Se escribe en `settings.escritorio_token_file` como `{"url":"ws://127.0.0.1:<puerto>/escritorio","token":"…","pid":<os.getpid()>}` de forma **atómica** (temporal en el mismo directorio + `os.replace`) con 0o600. `cerrar()` lo borra **solo** si su contenido sigue teniendo el token y el pid propios. El token nunca aparece en logs, en `repr`, en el `hola` de `/ws` ni en diagnósticos.
@@ -335,6 +339,8 @@ Mensajes (JSON en ambos sentidos):
 | R.A.M.S. → App | `{"tipo":"travesuras","datos":{"activas","hasta_ts"}}` | ambos | de `motor.travesuras` |
 | R.A.M.S. → App | `{"tipo":"no_molestar","datos":{"activo": bool,"motivo": str,"usuario": bool}}` | ambos | de `pc.no_molestar` (`motivo` fuera de la lista → `""`; `usuario = activo and motivo == "usuario"`: el "no molestar" puesto a mano). **Siempre** en la instantánea al conectar (sin `pc.no_molestar` previo: todo `false`, que es el estado inicial de main) |
 | R.A.M.S. → App | `{"tipo":"vision","datos":{"camara": bool}}` | solo sin Origin | OR de `vision.camara.activa` por `fuente` (§C2.13: ojo del overlay e icono de la bandeja); solo cuando cambia (la continua se repite cada 5 s) y **siempre** en la instantánea |
+
+| App ↔ R.A.M.S. | `puter.estado`, `llm.pedir`, `llm.respuesta` | solo sin Origin | respaldo Puter del Área de Broca: contrato, límites y ritmo en §C2.15 |
 
 **Instantánea al conectar** (en este orden, antes de cualquier difusión): `hola`, el `permiso` pendiente (si hay), `travesuras` (si se conoce), `no_molestar` y, solo para Electron, `vision` y el último `estado`.
 
@@ -637,7 +643,7 @@ Síncrono y thread-safe: `True` solo si hay pendiente, `hmac.compare_digest(id, 
 **Orígenes y canales.**
 - Se mantiene la denegación de `origen ∈ {llm, telegram}`. El contenido que redacta el LLM es **dato**: nunca se convierte en `AccionPC` por sí mismo; la acción nace de un mensaje del usuario (`publicar_borrador` referencia el último borrador, §C2.14.8).
 - `escritorio` es canal local: acciones con `origen="usuario"`; confirma **solo con botón** (y la terminal sigue pudiendo responder). El texto del chat **nunca** resuelve una confirmación (paso 0 de `procesar_entrada` limitado a `canal == "terminal"`).
-- Telegram **no** gana capacidades.
+- Telegram **no** gana capacidades (v0.2.1: salvo lo que enumera §C2.16, cada cosa con su interruptor).
 
 **Prerrellenar antes que teclear; nunca enviar.** No existe `enviar`/`pulsar_enter`. El objetivo de `escribir_texto` (`hwnd+pid+exe` / `address+pid+clase`) sale de `ControlPC.ventana_previa()` al crear la acción; no se fuerza el foco; se revalida antes de cada trozo.
 
@@ -684,6 +690,122 @@ Síncrono y thread-safe: `True` solo si hay pendiente, `hmac.compare_digest(id, 
 10. **Visión:** tabla de traducción y presencia de §C2.3. `percepcion` de `ContextoBroca` en turnos locales e iniciativas con la última muestra (`pantalla.estado` ≤ 10 s, `vision.estado`). `hud.control{camara}` y `/camara off` → además `vision.set_camara(False)`. Consola `● CÁMARA ACTIVA` = OR de fuentes. `mirar_pantalla` en Windows (sin captura) → `ResultadoAccion(False, "Mirar la pantalla no está disponible en este sistema.")` **sin** `error_propio`.
 11. **Comandos nuevos:** `/vision on|off|pausa [min]|estado`, `/pantalla off|metadatos|pixeles`, `/travesuras on|off`. Intenciones `escritorio_venir` → `escritorio.orden{aparecer, borde, modo:"entrar"}`; `escritorio_vete` → `escritorio.orden{esconderse}`; `basta_travesuras` → `_set_travesuras("basta")` + esconderse; `vision_pausa` → `vision.pausar(min*60 o None)`.
 
+### C2.15 Respaldo Puter del Área de Broca (tanda posterior a la rev. 2)
+
+**Qué es.** [Puter.js](https://developer.puter.com/tutorials/free-unlimited-ai-api/) es una biblioteca de **navegador** (`<script src="https://js.puter.com/v2/">`) que da acceso a cientos de modelos con `puter.ai.chat(mensajes, {model, max_tokens, temperature…})` **sin clave de API**, con el modelo *user-pays*: el usuario inicia sesión con **su** cuenta de Puter y el uso se descuenta de **su** saldo. Como necesita un navegador, se ejecuta **dentro de Amadeus Desktop** (Chromium) y R.A.M.S. se lo pide por `/escritorio`. Es el **proveedor de respaldo** del Área de Broca: cadena `Gemini → Puter → banco local` (con `RAMS_PUTER_PRIMERO=1`, `Puter → Gemini → banco local`). El principio No-LLM (§C0.3) no cambia: Puter, como Gemini, **solo verbaliza**.
+
+**1. Settings (grupo `base`, §C2.1).**
+
+| Variable | Campo | Defecto | Notas |
+|---|---|---|---|
+| `RAMS_PUTER` | `puter_habilitado: bool` | `True` | `0` = nunca usar Puter |
+| `PUTER_MODEL` | `puter_modelo: str` | `""` | nombre exacto de Puter (`proveedor/modelo`); empieza por letra o cifra, ≤ 100 caracteres; `""` = el modelo por defecto de Amadeus Desktop |
+| `RAMS_PUTER_PRIMERO` | `puter_primero: bool` | `False` | `True` = Puter antes que Gemini |
+| `PUTER_MAX_CALLS_DAY` | `puter_max_llamadas_dia: int` | `300` | tope diario propio de pedidos a Puter (los paga el usuario); `0` = nunca usar Puter |
+
+`Settings.tiene_puter = puter_habilitado and puter_max_llamadas_dia > 0 and escritorio_habilitado and not offline` (a diferencia del resto de la v0.2, **sí** depende de `offline`: Puter es un servicio en línea). Que la app esté conectada y con sesión lo dice el proveedor en tiempo de ejecución.
+
+**2. Mensajes nuevos de `/escritorio`** (sobre `{tipo, datos}`, mismas reglas de §C2.4; **solo** el cliente sin Origin, y solo el activo: lo que llegue del chat del HUD o de una conexión reemplazada se ignora):
+
+| Dirección | Mensaje | Cuándo |
+|---|---|---|
+| App → R.A.M.S. | `{"tipo":"puter.estado","datos":{"listo": bool,"sesion": bool,"modelo": str\|null,"error": str\|null}}` | justo después de recibir el `hola` y en cada cambio. `listo` = puter.js cargado **y** sesión iniciada (R.A.M.S. aplica `listo and sesion`). `error`: código corto `[a-z_]{1,24}` (`deshabilitado`, `carga_fallida`, `modelo_desconocido`, `ventana_caida`) o `null` |
+| R.A.M.S. → App | `{"tipo":"llm.pedir","datos":{"id": str,"modelo": str,"system": str,"mensajes":[{"rol":"usuario"\|"modelo","texto": str}],"max_tokens": int,"temperatura": float}}` | un turno de Broca. `id` hex en minúsculas de 16-32 (R.A.M.S. usa 24); `modelo: ""` = el defecto del escritorio. **Nunca** sale hacia el HUD (lleva el system prompt) |
+| App → R.A.M.S. | `{"tipo":"llm.respuesta","datos":{"id": str,"ok": bool,"texto": str\|null,"error": str\|null,"modelo": str\|null,"ms": int}}` | **siempre** una por pedido con `id` válido, en ≤ 45 s. `ok` exige texto no vacío; `error ∈ {"sin_sesion","timeout","cuota","red","rechazado","otro"}` (otro valor → `"otro"`) |
+
+Límites (los dos lados los validan): `system` ≤ 60 000 caracteres, ≤ 40 mensajes, `texto` ≤ 20 000 cada uno, contados como `String.length` de JavaScript (unidades UTF-16: un emoji cuenta 2; R.A.M.S. recorta así para que el escritorio nunca rechace un pedido por longitud); `max_tokens` 1..8192; `temperatura` 0..2. R.A.M.S. deja el JSON de `llm.pedir` en ≤ 768 KiB quitando los mensajes más antiguos (el último siempre queda y la conversación sigue empezando por el usuario) y el escritorio acepta `llm.pedir` de hasta 1 MiB (el resto de entrantes, ≤ 64 KiB). `llm.respuesta` puede llegar hasta 64 KiB (`max_size` del servidor; el escritorio la deja en ≤ 60 KiB y el texto en ≤ 32 000 caracteres); el resto de mensajes de la app sigue en ≤ 8 KiB. Como mucho **2** pedidos en curso en el escritorio (el escritorio rechaza el 3.º con `rechazado`). El semáforo de R.A.M.S. cuenta lo que el escritorio tiene **en curso**, no lo que R.A.M.S. sigue esperando: un pedido enviado conserva su turno hasta que llega **su** `llm.respuesta` (aunque llegue cuando R.A.M.S. ya dejó de esperarla), hasta que la app se desconecta o la reemplaza otra, o como tope 46 s después del envío (45 s garantizados + 1). R.A.M.S. espera **≤ 40 s** contando la espera de turno, y si tras esperar turno le quedan menos de 5 s (o de la mitad de su plazo, si es corto) no envía el pedido (`completar` → `None`): Puter no llegaría a tiempo y se cobraría igual. El escritorio responde **siempre en ≤ 45 s** (aborta `puter.ai.chat` a los 38 s y el relevo contesta `timeout` a los 42 s). El contrato no tiene cancelación: un pedido que R.A.M.S. abandona por su plazo se sigue procesando (y cobrando) en el escritorio hasta esos 38-42 s.
+
+Ritmo (§C2.4.5): `puter.estado` va en la clase "estado" (≤ 20/s) y, si no cabe, **no se pierde**: se aplica el último al vencer la ventana de 1 s (la app solo lo reenvía cuando cambia). `llm.respuesta` tiene su clase (≤ 10/s), pero la que responde a un pedido **en curso** nunca se descarta por ritmo (perderla dejaría a Broca esperando 40 s o un turno ocupado hasta 46 s), tampoco si llega tarde; las ajenas, repetidas o inventadas sí gastan cupo y se ignoran.
+
+Semántica: una respuesta tardía (tras el plazo de R.A.M.S.) a un pedido propio libera su turno y aplica el efecto de su error (`cuota`, `sin_sesion`), sin texto para nadie ni cambio en los contadores; una con un `id` desconocido o ya respondido se ignora. `sin_sesion` → R.A.M.S. marca "sin sesión" **al recibirla** y el escritorio reenvía justo detrás su `puter.estado` real (resincronización: gana ese estado). `cuota` (saldo de Puter agotado o límite) → R.A.M.S. no le pide nada durante 10 min (diagnóstico `DEGRADADO`, «saldo de Puter agotado · pausa de 10 min»: un detalle que no caduca, porque el HUD y la tabla de `/estado` muestran el último publicado; la cuenta atrás va en la línea de `/estado`) y vuelve solo. `timeout`, `red`, `rechazado`, `otro` → ese turno sin texto (Broca sigue con la cadena). Si la app se desconecta o la reemplaza otra instancia, los pedidos en vuelo devuelven `None` **al momento**, sus turnos quedan libres y el estado vuelve a "sin app"/"sin sesión" hasta el siguiente `puter.estado`. Sin sesión, el escritorio responde `{ok:false, error:"sin_sesion"}` al instante **sin abrir nada**.
+
+**3. Python.** `lobes/broca_llm.py` (grupo `orquestacion`) define el protocolo y la cadena; `interface/escritorio_link.py` (grupo `escritorio-ws`) lo implementa sobre `/escritorio`:
+```python
+@runtime_checkable
+class ProveedorRespaldo(Protocol):          # lobes/broca_llm.py
+    nombre: str                              # "puter": es la `fuente` de sus BrocaReply
+    @property
+    def disponible(self) -> bool: ...        # barato, sin red, nunca lanza
+    async def completar(self, system: str, mensajes: list[dict[str, str]], *, modelo: str,
+                        max_tokens: int, temperatura: float, timeout_s: float) -> str | None: ...
+BrocaLLM.set_respaldo(proveedor: ProveedorRespaldo | None) -> None   # nunca lanza
+BrocaLLM.respaldo_disponible -> bool         # tiene_puter + bajo el tope diario + sin pausa + proveedor.disponible
+BrocaLLM.llamadas_hoy() -> {"gemini": int, "respaldo": int, "respaldo_ok": int}
+
+class RespaldoPuter:                         # interface/escritorio_link.py
+    nombre = "puter"
+    def __init__(self, enlace: EnlaceEscritorio, *, modelo: str = "", reloj=time.monotonic): ...  # se vincula al enlace
+    disponible: bool          # /escritorio activo, app conectada, último puter.estado con listo y sin enfriamiento por "cuota"
+    modelo: str               # PUTER_MODEL válido o ""
+    modelo_efectivo: str | None   # el configurado o el que anuncia la app
+    ultimo_modelo: str | None     # el de la última respuesta (BrocaReply.modelo)
+    async def completar(...) -> str | None   # min(timeout_s, 40) s con la espera de turno; None ante cualquier fallo; nunca lanza por la red
+    def estado(self) -> dict      # {conectado, listo, sesion, modelo, error, enfriamiento_s, pendientes, en_curso}
+    def estadisticas(self) -> dict  # {pedidos, respuestas, fallos, ultimo_error} de la sesión
+    def diagnostico(self) -> DiagnosticoModulo   # clave "puter"
+    def desvincular(self) -> None
+EnlaceEscritorio.puter -> RespaldoPuter | None;  EnlaceEscritorio.vincular_puter(respaldo | None)
+```
+Broca le pasa **lo mismo que a Gemini** (system prompt de Amadeus, historial ya filtrado por modo público y el turno con `<contexto>`); la imagen del turno **no** viaja (si la había, se le avisa de que no puede verla) y su texto pasa por el mismo `postprocesar`. Un 429 de Gemini con Puter listo no se reintenta: Gemini queda en pausa y los turnos van a Puter. Las llamadas a Puter se cuentan **aparte** (no gastan `GEMINI_MAX_CALLS_DAY`) y tienen su tope (`PUTER_MAX_CALLS_DAY`); dos fallos seguidos lo enfrían. `resumir` y `escribir_bitacora` siguen siendo solo Gemini. El detalle normativo de la cadena está en el docstring de `lobes/broca_llm.py`.
+
+**4. main (`orquestacion`).** Paso 3b del arranque, justo después de construir Broca (el HUD ya existe): si `puter_habilitado`, tope > 0, sin `--offline` y con `hud.escritorio`, crea `RespaldoPuter(hud.escritorio, modelo=puter_modelo)` y llama a `broca.set_respaldo(respaldo)`; si Broca no tiene `set_respaldo` → `OFF` «Broca sin respaldo»; si lanza → `DEGRADADO` y el respaldo se desvincula. Diagnóstico clave `"puter"`, nombre «Respaldo Puter (Amadeus Desktop)», con su línea en el arranque (después de `escritorio`) y en `/estado`:
+
+| Estado | Detalle |
+|---|---|
+| `OFF` | `deshabilitado (RAMS_PUTER=0)` · `tope diario 0 (PUTER_MAX_CALLS_DAY=0)` · `modo offline` · `sin /escritorio (RAMS_ESCRITORIO=0)` · `Broca sin respaldo` |
+| `EN ESPERA` | `sin app de escritorio` · `Puter desactivado en Amadeus Desktop (AMADEUS_PUTER=0)` (`error: deshabilitado`) · `sin conexión con puter.com` (`carga_fallida`) · `ventana de Puter caída (se recarga sola)` (`ventana_caida`) · `sin sesión de Puter` · `Puter sin cargar (<error>)` (sesión sin `listo`: no lo produce el escritorio actual) |
+| `DEGRADADO` | `saldo de Puter agotado · pausa de 10 min` · `Broca rechazó el respaldo` |
+| `OK` | el modelo (`modelo_efectivo`; sin él, «modelo por defecto de Amadeus Desktop»); con `error: modelo_desconocido` y sin `PUTER_MODEL`, «… · no aparece en el listado de Puter» (aviso: puede ser un alias que `listModels` no enumera) |
+
+Con `listo: false`, el código de `error` manda sobre `sesion` (con el escritorio real, sin puter.js cargado `sesion` siempre es `false`, y «sin sesión» mandaría al usuario a iniciar una sesión que no arregla nada).
+
+`RespaldoPuter` publica `sistema.modulo` (clave `"puter"`, origen `escritorio`) **solo cuando cambia** su diagnóstico; main lo recoge como el resto. `/estado` añade una línea: `IA de respaldo (Puter): lista|en espera|tope diario alcanzado|en pausa|en pausa (saldo de Puter agotado, reintento en N min) · si Gemini no puede|antes que Gemini · hoy N de TOPE pedidos, M con respuesta` (la última forma de «en pausa» es la del saldo agotado, con la cuenta atrás del momento), y su fila de la tabla de módulos sale de `diagnostico()` en ese momento, no del último `sistema.modulo`.
+
+**5. Amadeus Desktop (grupo `desktop`).** Archivos nuevos: `desktop/lib/puter.js` (relevo WS ↔ IPC, puro: validación de `llm.pedir`, clasificación de fallos, plazos, `puter.estado`), `desktop/lib/puter-sitio.js` (páginas, CSP y dominios permitidos, puro), `desktop/preload-puter.js` (`window.amadeusPuter`, versión 1, solo en el origen propio) y `desktop/puter/` (`trabajo.html/js`: la ventana oculta que llama a `puter.ai.chat`; `conectar.html/js` + `puter.css`: la ventanita de inicio de sesión).
+- **Ventana oculta** dedicada (nunca se muestra), partición **`persist:puter`** (la sesión de Puter se conserva entre arranques), `sandbox`, `contextIsolation`, preload mínimo, sin `nodeIntegration`. Sus páginas se sirven en el origen `http://amadeus-puter.localhost` con `protocol.handle` **solo** en esa partición y **sin abrir puertos** (`puter.auth.signIn()` rechaza `file://`); cualquier otra ruta → 404.
+- **CSP** por cabecera: `script-src 'self' https://js.puter.com`; `connect-src 'self' https://api.puter.com wss://api.puter.com https://puter.com https://js.puter.com`; sin marcos, workers, objetos ni formularios.
+- **Relevo en el proceso principal:** `llm.pedir` → IPC `puter:pedir` → `puter:respuesta` → `llm.respuesta`, y `puter.estado` tras el `hola`. El **token de R.A.M.S. nunca llega** a la ventana de Puter (solo el main abre el WebSocket). Nunca registra prompts ni respuestas; de un fallo solo su clasificación.
+- **Bandeja:** «Conectar Puter (IA de respaldo)…» abre una ventanita con un **botón** (el inicio de sesión de Puter abre una ventana emergente que necesita el gesto del usuario); `window.open` solo a `https://puter.com` y subdominios, en una ventana sandbox que no puede salir de puter.com. Con sesión: «Desconectar Puter» (borra los datos de la partición y recarga). También `--amadeus=puter` (CLI, para `hl.bind`).
+- **Entorno:** `AMADEUS_PUTER=0` lo apaga (responde `rechazado` y anuncia `error:"deshabilitado"`); `AMADEUS_PUTER_MODELO` cambia el modelo por defecto; `AMADEUS_PUTER_ESFUERZO` (`none|minimal|low|medium|high`, opcional) fija el `reasoning_effort`.
+- **Modelo por defecto:** `MODELO_DEFECTO` de `desktop/lib/puter.js`, verificado en el listado oficial de Puter (developer.puter.com/ai/models y docs.puter.com): hoy `google/gemini-3.5-flash-lite`, el más rápido de los candidatos, bueno en español y de la familia Gemini para la que está afinado el prompt de Amadeus. `PUTER_MODEL` en R.A.M.S. (por pedido) gana a `AMADEUS_PUTER_MODELO` (por defecto del escritorio).
+
+**6. Privacidad.** A Puter (y, a través de Puter, al proveedor del modelo) le llega lo mismo que a Gemini: system prompt de Amadeus, turnos recientes, recuerdos y contexto del turno y, solo con `RAMS_PERFIL_EN_PROMPT=1`, el resumen del perfil de WhatsApp; **nunca** imágenes ni fotogramas. `--offline`, `RAMS_PUTER=0` o `PUTER_MAX_CALLS_DAY=0` lo cortan del todo. R.A.M.S. no guarda ninguna credencial de Puter: la sesión vive en la partición `persist:puter` de Amadeus Desktop.
+
+**7. Pruebas** (sin red, sin Puter real ni inicio de sesión, sin ventanas visibles): `tests/test_escritorio_link.py` con un **Amadeus Desktop falso** (cliente `websockets` sin Origin que contesta los `llm.pedir`): estado y diagnóstico, ida y vuelta solo a la app (el HUD nunca ve `llm.pedir`; ni el prompt ni la respuesta en `caplog`), cada código de error, `sin_sesion` + resincronización, `cuota` y fin del enfriamiento, plazo y respuesta tardía, desconexión y reemplazo con pedidos en vuelo, máximo 2 a la vez, ráfagas sobre el cupo (`puter.estado` y `llm.respuesta`), 64 KiB solo para `llm.respuesta` de la app, límites en unidades UTF-16 y recorte por tamaño, coherencia del patrón de modelo con `core/config.py` y `desktop/lib/puter.js`, y que `RespaldoPuter` cumple `ProveedorRespaldo`. `tests/test_main.py`: cableado con el HUD real y un escritorio falso (EN ESPERA → OK → EN ESPERA), `OFF` por configuración, Broca sin soporte o que lo rechaza, y la línea de `/estado`. `tests/test_broca_llm.py`: la cadena con un proveedor falso. `desktop/test/`: relevo y sitio puros con `node --test`; el smoke oculto carga la ventana de Puter con una sesión en memoria y comprueba que un pedido sin sesión falla al instante sin abrir ventanas.
+
+**8. Archivos por frente** (un archivo, un frente): **broca** — `lobes/broca_llm.py`, `core/config.py`, `.env.example`, `tests/test_broca_llm.py`, `tests/test_config_bus.py`; **desktop** — `desktop/main.js`, `desktop/lib/cli.js`, **`desktop/lib/puter.js`**, **`desktop/lib/puter-sitio.js`**, **`desktop/preload-puter.js`**, **`desktop/puter/**`**, `desktop/test/**`, `desktop/README.md`; **enlace** — `interface/escritorio_link.py`, `main.py`, `tests/test_escritorio_link.py`, `tests/test_main.py`, `docs/COMPANION.md`, `README.md`.
+
+### C2.16 Telegram multimedia, apps del menú Inicio y capacidades reales (v0.2.1)
+
+Pedido del usuario: quitar el globo de texto del avatar, que Amadeus deje de decir que «no puede abrir nada ni tiene control sobre el PC», y que por Telegram mande fotos de la cámara o de la pantalla y audios, y que entienda los suyos. **Manda sobre §C2.12 («Telegram no gana capacidades») solo en lo que se lista aquí.**
+
+**1. Settings** (`core/config.py`; documentados en `.env.example`).
+
+| Variable | Campo | Defecto | Notas |
+|---|---|---|---|
+| `VTUBER_AI_BURBUJA` | `vtuber_ai_burbuja: bool` | `False` | globo de texto del visor en cada `speak` |
+| `RAMS_TELEGRAM_FOTOS` | `telegram_fotos: bool` | `False` | fotos de la cámara o capturas pedidas **desde** Telegram (desde el PC no hace falta) |
+| `RAMS_TELEGRAM_AUDIO` | `telegram_audio: str` | `"auto"` | `off` · `auto` (nota de voz si llegó una o la pidió) · `siempre` |
+| `RAMS_TELEGRAM_TRANSCRIBIR` | `telegram_transcribir: bool` | `True` | notas de voz entrantes → Gemini (solo con Gemini disponible) |
+| `RAMS_TELEGRAM_ACCIONES` | `telegram_acciones: bool` | `True` | acciones de bajo riesgo pedidas por Telegram |
+| `RAMS_APPS_MENU_INICIO` | `apps_menu_inicio: bool` | `True` | apps del menú Inicio por nombre (solo Windows) |
+
+**2. Globo del visor.** `speak` acepta `"bubble": bool` (defecto `true`, por compatibilidad: el panel y MCP sin el campo siguen con globo); con `false` no muestra el globo ni oculta el de otro `speak`. `lobes/vtuber_ai_bridge.py` envía `bubble = settings.vtuber_ai_burbuja` en cada `speak`.
+
+**3. Enrutador** (`core/intenciones.py`). Quita vocativos («asistente», «amadeus», «kurisu», «christina», «oye») y cortesías («por favor», «porfa», «pls», «plis», «xfa», también estiradas o con erratas) y entiende peticiones («¿puedes abrir X?», «ábreme X», «me abres X», «abre X en el pc»). En Windows, «abre X» que no es del catálogo → `lanzar_app{nombre, local: True, explicito}` (R18 del diseño v0.3; `tentativa` para verbos ambiguos como «lanza una moneda»). Intenciones nuevas: `enviar_foto{fuente: camara|pantalla}` («mándame una foto», «mándame captura», «pantallazo») y `pedir_audio` («mándame un audio», «dímelo con tu voz»; `destino: "telegram"` si lo pide desde el PC). Por Telegram, con `telegram_acciones`, pasan `abrir_destino`, `buscar_en`, `lanzar_app` y `media` con `args["canal"] = "telegram"`; lo demás sigue en `bloqueada_canal`.
+
+**4. Apps del menú Inicio** (`lobes/control_pc.py`). Índice en un hilo (se refresca cada 5 min) de los `.lnk`/`.url` de `Start Menu\Programs` en `%APPDATA%` y `%ProgramData%`, más unas pocas apps de la Store. **Excluidas** (nunca se abren): desinstaladores, instaladores, ayudas y accesos a páginas web. **Sensibles** (confirmación cada vez, nunca se recuerdan): consolas y herramientas del sistema. API: `resolver_app_local(nombre) -> ResolucionApp{estado: unica|varias|ninguna|excluida|desactivada, app, opciones, nivel, motivo}`, `lanzar_app_local(clave)` (`os.startfile` del acceso, que debe seguir dentro del menú Inicio; comparte el cupo de 6/min con `abrir_destino`) y `aprobar_app_local(clave)` (`data/apps_aprobadas.json`, 0o600). La compuerta (`nivel_app`) pide confirmación la primera vez para una app `descubierta`; si el usuario acepta, main la recuerda. Por Telegram nada se confirma: solo se abren las ya aprobadas.
+
+**5. Capturas** (`lobes/capturas.py`, nuevo). `capturar_jpeg(fuente, *, settings, vision=None, ventana_titulo=None, calidad=85, max_lado=1600, bus=None) -> ResultadoCaptura(ok, jpeg, ancho, alto, fuente, motivo)`, con `motivo ∈ {deshabilitada, sin_camara, camara_ocupada, ventana_sensible, sin_backend, error}`. Cámara: `VisionContinua.instantanea_jpeg()` si la tiene abierta; si no, la abre un instante en el executor (descarta los cuadros de exposición y hace `release()` siempre) y publica `vision.camara{activa, fuente: "vistazo"}` en `bus` mientras está abierta (main pasa siempre su bus). Pantalla: el monitor de la ventana activa (Windows: mss; Hyprland: `grim` a stdout); se cancela si **cualquier** ventana visible en ese monitor es sensible o no se puede comprobar, y se vuelve a revisar tras capturar; en X11, otros Wayland y macOS → `sin_backend`. Nunca disco ni log.
+
+**6. Telegram** (`lobes/riko_megumin_io.py`). `enviar_foto_telegram(jpeg, *, leyenda="")` (`sendPhoto` ≤ 10 MB), `enviar_voz_telegram(texto, *, tone="calido")` (`sendVoice` MP3 de ElevenLabs o edge-tts; si el texto no cabe en la leyenda, va completo aparte) y `set_transcriptor(fn)`. Notas de voz o audios entrantes (≤ 2 MB y ≤ 180 s): `getFile` → descarga en memoria → transcriptor → `manejar(texto, voz=True)`; sin transcriptor o si falla, responde por texto que no pudo escucharla. `telegram.enviado.tipo` suma `foto` y `audio`.
+
+**7. Broca** (`lobes/broca_llm.py`). `transcribir_audio(audio, mime) -> str | None` (modelo ligero de la cadena, `inline_data`, cuenta en el tope diario). El system prompt lleva el bloque `CAPACIDADES REALES` (`<capacidades canal="local|telegram|nexus">`), generado por código a partir de Settings y del canal, con la frase exacta de cada acción y la regla de no negar lo listado; si el usuario pidió una acción que no se ejecutó, Broca explica la frase exacta en vez de decir que no puede.
+
+**8. main.py.** `_manejar_telegram(texto, *, voz=False)`; `riko.set_transcriptor(broca.transcribir_audio)` si `telegram_transcribir` y hay Gemini. `enviar_foto` pasa por la compuerta (solo `origen="usuario"`, ≤ 10 por hora; por Telegram exige `telegram_fotos`), respeta la pausa de la cámara pedida por el usuario y avisa en el PC («📸 …»). Toda acción pedida por Telegram se anuncia en el PC («📱 Desde Telegram: …», en el chat y como notificación de Amadeus Desktop). Respuesta en nota de voz si `telegram_audio == "siempre"` o (`"auto"` y (llegó una nota de voz o pidió audio)); si la nota falla, va el texto.
+
+**9. Pruebas.** `tests/test_capturas.py` (dobles de mss, Win32, cámara y grim), `test_intenciones.py`, `test_control_pc.py`, `test_permisos.py`, `test_riko_megumin_io.py`, `test_broca_llm.py`, `test_main.py` y `vtuber-ai/test/speak_bubble.test.js`. E2E de integración: un R.A.M.S. aislado (datos y puertos propios) con Telegram, Gemini y VTuber AI Studio simulados por `httpx.MockTransport`, el chat por el WebSocket real `/escritorio` y cámara, mss y `os.startfile` falsos.
+
 ---
 
 ## §C3. Grupos de implementación
@@ -719,6 +841,10 @@ El grupo **base** va primero. El resto en paralelo contra sus contratos. Un arch
 | `pc.accion` | orquestacion | escritorio-ws |
 | `permiso.solicitado{vista_previa}` / `permiso.resuelto` | orquestacion (`permisos.py`) | escritorio-ws; orquestacion |
 | WS `/escritorio` (§C2.4) | escritorio-ws | desktop (`main.js`, `lib/mapeo.js`); escritorio-ws (`amadeus_hud.html`) |
+| WS `/escritorio`: `puter.estado`, `llm.respuesta` (§C2.15) | desktop (`lib/puter.js`) | escritorio-ws (`RespaldoPuter`) |
+| WS `/escritorio`: `llm.pedir` (§C2.15) | escritorio-ws (`RespaldoPuter`) | desktop (`lib/puter.js` → ventana oculta `desktop/puter/trabajo.js`) |
+| `ProveedorRespaldo` / `set_respaldo` (§C2.15) | orquestacion (`broca_llm.py`) | escritorio-ws (`RespaldoPuter`); orquestacion (`main.py`) |
+| `sistema.modulo{clave:"puter"}` (§C2.15) | escritorio-ws (`RespaldoPuter`) | orquestacion (arranque y `/estado`); HUD |
 | IPC `amadeusDesktop` / `amadeusChat` (§C2.7.2) | desktop | visor-escritorio (`app.js`); desktop (`chat.html`) |
 | HTTP `:3939` (`desktop`, `theme`, `/api/state` con `desktopViewers*`, `viewerSeq`, códigos 409) | visor-escritorio | motor-escritorio (puente) |
 | `aplicarTemaAmadeus` / `clasificarMaterial` (§C2.6) | kurisu | visor-escritorio (`loadModel`) |
@@ -785,6 +911,8 @@ Cómo probar cada pieza:
 - **desktop:** módulos puros con `node --test`; `--smoke` oculto (§C2.7.8). Descargar `electron@44.8.0` de npm está permitido.
 - **Privacidad:** test de código fuente en `vision_continua.py` (lista prohibida) y `control_pc.py` (`shell=True`).
 
+- **Respaldo Puter (§C2.15):** nunca se carga Puter.js contra la cuenta del usuario ni se inicia sesión en Puter, y no se gasta cuota de Gemini: en Python, un Amadeus Desktop falso (cliente `websockets` sin Origin) contesta los `llm.pedir` y Broca usa un `PuterFalso`; en `desktop/`, el relevo y el sitio son puros (`node --test`) y el smoke usa una partición en memoria.
+
 El smoke global (manual, opcional) usa un VTuber AI Studio y un R.A.M.S. arrancados aparte en puertos libres, nunca las instancias del usuario.
 
 ---
@@ -797,7 +925,8 @@ El smoke global (manual, opcional) usa un VTuber AI Studio y un R.A.M.S. arranca
 2. **Modelo de Kurisu:** pon un `.vrm` en `vtuber-ai/models/` (VRoid Hub ShiningFinger, o VRoid Studio exportando VRM 1.0 **sin reducir materiales** y con *Kurisu* en el *Avatar name* o en *References*). Sin modelo propio, el tema recolorea el de ejemplo. Crédito obligatorio; homenaje de fan. Si la licencia prohíbe modificarlo, `VTUBER_AI_TEMA=none` en el `.env` de R.A.M.S. **y** en el entorno con que se lanza Amadeus Desktop (Electron no lee el `.env`); ver `vtuber-ai/models/README.md`.
 3. **Visión continua (opcional, OFF):** `RAMS_CAMERA=1` **y** `RAMS_VISION_CONTINUA=1`; YuNet (`face_detection_yunet_2023mar.onnx`, 232 KB, MIT) en `data/models/`; en Windows `pip install mss==10.2.0`. Pantalla: `RAMS_PANTALLA_MODO=metadatos` (o `pixeles`). Dinos dónde está la webcam, si da imagen en espejo y su ángulo (`RAMS_VISION_HFOV`). En Windows 11, para videollamadas con la cámara continua encendida, activa "Permitir que varias apps usen la cámara".
 4. **Control del PC:** Windows no necesita nada; Arch: `sudo pacman -S wtype xdg-utils gtk3`. Sinónimos propios con `RAMS_DESTINOS` (p. ej. `wasap=whatsapp,twitter=x`).
-5. **Decisiones pendientes:** ¿activar las travesuras con el cursor real (`RAMS_TRAVESURAS=1`; por defecto OFF, solo mirada y persecución visual)? ¿Dar el chat al HUD (`RAMS_HUD_CHAT=1`, defecto) o solo a la app? Recuerda: "basta"/`Ctrl+Alt+Shift+Q` las apaga; "deja de mirarme"/`Ctrl+Alt+V` pausan la cámara.
+5. **Respaldo Puter (opcional, §C2.15):** con Amadeus Desktop abierto, bandeja → «Conectar Puter (IA de respaldo)…» → botón → inicia sesión con **tu** cuenta de Puter (o crea una). No hay clave que copiar: el uso se descuenta de **tu saldo de Puter** y R.A.M.S. lo limita con `PUTER_MAX_CALLS_DAY` (300 por defecto). Por defecto Puter entra solo cuando Gemini no puede (cuota, red, tope diario, sin clave); `RAMS_PUTER_PRIMERO=1` lo pone delante; `PUTER_MODEL` elige otro modelo; `RAMS_PUTER=0` lo apaga. «Desconectar Puter» cierra la sesión.
+6. **Decisiones pendientes:** ¿activar las travesuras con el cursor real (`RAMS_TRAVESURAS=1`; por defecto OFF, solo mirada y persecución visual)? ¿Dar el chat al HUD (`RAMS_HUD_CHAT=1`, defecto) o solo a la app? Recuerda: "basta"/`Ctrl+Alt+Shift+Q` las apaga; "deja de mirarme"/`Ctrl+Alt+V` pausan la cámara.
 
 ---
 
@@ -854,3 +983,5 @@ Revisión crítica de la rev. 1 (43 hallazgos). Todos los hallazgos se aceptan s
 Otros ajustes del arquitecto en esta revisión: (a) `CANALES_SALIDA` **no** cambia (el chat recibe la salida en modo `terminal`; evita tocar la validación de `Utterance`); (b) el estado homeostático para el overlay lo traduce escritorio-ws directamente desde `homeostasis.estado` (≤ 1 Hz) en lugar de pasar por `escritorio.orden{estado}`, que se elimina; (c) la categoría local de la curiosidad web es `iniciativa_curiosidad_web`, que es la que Broca busca para las iniciativas; (d) `escritorio.evento{toque|soltada}` se traduce a `recompensa`/`error` (inyectables existentes) con límites de ritmo.
 
 **Ajustes de la integración (ronda 1).** (1) «Quieta» pasa a `Ctrl+Alt+Shift+Q` (§C1.12: `Ctrl+Alt+Q` = AltGr+Q = «@» en el teclado latinoamericano). (2) `/escritorio` añade el mensaje `vision{camara}` para Electron (§C2.4) y el visor la orden `camara` (§C2.5.5): el ojo del overlay de §C2.13. (3) Presencia: un rostro de < 60 s gana a la inactividad (§C2.3). (4) La vista previa de las confirmaciones usa el saneado de ControlPC (§C2.3). (5) En el "no molestar" del usuario gana el estado de R.A.M.S. (§C2.4). (6) `abrir_destino` sigue **permitida sin confirmación** (§C1.8, §C2.11): "abre youtube" abre YouTube al momento; las acciones que confirman son `prerrellenar`, `escribir_texto` y `cerrar_ventana`. (7) Notas de implementación en §C2.8, §C2.9 y §C2.10; `amadeusChat.confirmar` devuelve `Promise<boolean>` y `chat:permiso` lleva `caducada?` (§C2.7.2).
+
+**Respaldo Puter (§C2.15).** (1) Puter es **respaldo** de Gemini y no sustituto: Gemini sigue primero salvo `RAMS_PUTER_PRIMERO=1`, porque el prompt de Amadeus está afinado para él y Puter lo paga el usuario de su saldo. (2) Puter.js se ejecuta **dentro de Amadeus Desktop** y no en un navegador aparte ni en Node: es una biblioteca de navegador cuyo inicio de sesión necesita una ventana emergente y un gesto del usuario; la ventana oculta usa su propia partición y el token de R.A.M.S. no sale del proceso principal. (3) Sin la app, sin sesión o con `--offline`, todo sigue como antes (Gemini y banco local): el respaldo nunca bloquea un turno más de 40 s y nunca lanza. (4) Ajustes de la integración: los límites de `llm.pedir` se miden en unidades UTF-16 (como los valida JavaScript); el efecto de `sin_sesion`/`cuota` se aplica al **recibir** la respuesta (para que el `puter.estado` de resincronización que llega detrás gane); un `puter.estado` sobre el cupo se aplica al vencer la ventana y una `llm.respuesta` a un pedido pendiente nunca se descarta por ritmo; el patrón de `PUTER_MODEL` es el mismo en `core/config.py`, en el enlace y en el escritorio (`RE_MODELO`), en los dos sentidos. (5) Revisión del enlace: el semáforo de R.A.M.S. cuenta los pedidos **en curso en el escritorio** (antes soltaba el turno al vencer su propio plazo y el escritorio, aún ocupado, rechazaba el siguiente, que Broca contaba como fallo y acababa enfriando Puter); el diagnóstico explica los códigos de `puter.estado.error` en vez de decir «sin sesión»; y el detalle de la pausa por saldo no lleva cuenta atrás (se quedaba congelado en el HUD y en `/estado`). Rechazado: medir el plazo desde el envío (rompería «`completar` no tarda más de `timeout_s`», que Broca corta a los 42 s) y añadir `plazo_ms` o un mensaje de cancelación al contrato (cambia el contrato del escritorio; el coste de un pedido abandonado queda acotado por el aborto de 38 s).

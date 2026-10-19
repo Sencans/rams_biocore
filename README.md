@@ -63,6 +63,9 @@ La especificación completa está en [`docs/ARQUITECTURA.md`](docs/ARQUITECTURA.
 - **Visión en tiempo real local** (sección 8.4, opt-in): cámara y pantalla procesadas en tu PC, sin
   tokens y sin guardar ni enviar imágenes.
 - **Look de Kurisu/Amadeus** para el avatar VRM (tema `amadeus` de VTuber AI Studio).
+- **IA de respaldo con Puter** (sección 4): si Gemini se queda sin cuota, sin red o sin clave,
+  Amadeus sigue conversando con [Puter](https://developer.puter.com) desde Amadeus Desktop, con
+  **tu** cuenta de Puter y sin ninguna clave de API.
 - Todo sigue siendo **No-LLM**: cuándo aparece, cuándo te busca, qué app abre o cuándo hace una
   travesura lo deciden el conectoma y reglas deterministas; Gemini (opcional) solo pone las palabras.
   **No hace falta ninguna clave de API nueva.**
@@ -124,8 +127,8 @@ acota otros. Todos los cambios tienen una razón técnica:
 ## 4. Claves, voz y servicios en línea
 
 Todas las claves son **opcionales**. Sin ninguna, Amadeus funciona igual: Broca en modo no verbal
-(banco local de frases), voz por edge-tts (servicio en línea, ver abajo), sin Telegram y con
-búsqueda por DuckDuckGo. Con `--offline` no sale nada a la red. Las claves van en `.env`, una por
+(banco local de frases; o con Puter, que no usa clave, si conectas tu cuenta en Amadeus Desktop),
+voz por edge-tts (servicio en línea, ver abajo), sin Telegram y con búsqueda por DuckDuckGo. Con `--offline` no sale nada a la red. Las claves van en `.env`, una por
 línea, sin comillas ni comentarios en la misma línea.
 
 ### Gemini (Área de Broca)
@@ -141,8 +144,51 @@ línea, sin comillas ni comentarios en la misma línea.
 | `GEMINI_MAX_CALLS_DAY` | `300` | **Tope diario propio** de llamadas (se reinicia a la medianoche local). Al alcanzarlo, Amadeus sigue con el banco local de frases hasta el día siguiente. Protege tu cuota y tu factura; Google aplica además sus propios límites por minuto y por día. |
 
 Si la clave es inválida o fue revocada (401/403), Gemini se desactiva durante la sesión (queda
-en el log) y Amadeus sigue en modo no verbal. Con `--offline` nunca se llama a Gemini. Qué datos recibe Gemini está en la
-sección 11 (Privacidad).
+en el log) y Amadeus sigue con Puter si lo conectaste (abajo) o, si no, en modo no verbal. Con
+`--offline` nunca se llama a Gemini. Qué datos recibe Gemini está en la sección 11 (Privacidad).
+
+### Puter (IA de respaldo, sin clave de API)
+
+[Puter](https://developer.puter.com/tutorials/free-unlimited-ai-api/) da acceso a cientos de modelos
+de IA (Gemini, Claude, GPT, Grok…) desde el navegador **sin clave de API**: inicias sesión con tu
+cuenta de Puter y el uso **se descuenta de tu saldo de Puter** (modelo *user-pays*: R.A.M.S. no
+guarda ninguna credencial de Puter ni paga nada por ti). Como es una biblioteca de navegador, corre
+**dentro de Amadeus Desktop** (sección 8.2), en una ventana oculta, y R.A.M.S. le pide el texto por
+el enlace `/escritorio`. Es el **respaldo del Área de Broca**: Gemini → Puter → banco local de frases.
+Puter tampoco decide nada: solo pone en palabras lo que ya decidió el conectoma.
+
+**Conectar tu cuenta** (una vez; la sesión se recuerda entre arranques):
+
+1. Arranca R.A.M.S. y Amadeus Desktop (sección 8.2).
+2. Bandeja de Amadeus Desktop → **«Conectar Puter (IA de respaldo)…»** → pulsa el botón de la
+   ventanita e inicia sesión en puter.com (o crea una cuenta) en la ventana que se abre. En Hyprland,
+   lo mismo con `amadeus-desktop --amadeus=puter`.
+3. Comprueba con `/estado`: el módulo `Respaldo Puter (Amadeus Desktop)` pasa a **OK** con el
+   modelo y aparece la línea `IA de respaldo (Puter): lista · si Gemini no puede · hoy N de 300
+   pedidos, …`. En el arranque de R.A.M.S. el módulo sale **EN ESPERA** hasta que la app se conecta;
+   es normal. Para cerrar la sesión: bandeja → **«Desconectar Puter»**.
+
+Sin la app abierta o sin sesión, el diagnóstico queda **EN ESPERA** y Broca sigue con Gemini y el
+banco local: nada se bloquea. El detalle dice qué falta: «sin app de escritorio», «sin sesión de
+Puter» (conéctala desde la bandeja), «sin conexión con puter.com» (la app no pudo cargar Puter:
+revisa la red; lo reintenta sola), «ventana de Puter caída (se recarga sola)» o «Puter desactivado
+en Amadeus Desktop (AMADEUS_PUTER=0)». Si tu saldo de Puter se agota, Amadeus deja de pedirle
+durante 10 minutos (diagnóstico **DEGRADADO**, «saldo de Puter agotado · pausa de 10 min»; en
+`/estado`, `IA de respaldo (Puter): en pausa (saldo de Puter agotado, reintento en N min)`) y luego
+vuelve a probar.
+
+| Variable (`.env` de R.A.M.S.) | Valor por defecto | Qué hace |
+|---|---|---|
+| `RAMS_PUTER` | `1` | `0` = no usar nunca Puter. |
+| `PUTER_MODEL` | *(vacío)* | Modelo de Puter con su nombre exacto de [docs.puter.com](https://docs.puter.com/AI/chat/) (p. ej. `google/gemini-3.8-flash` o `anthropic/claude-haiku-5-5`). Vacío = el modelo por defecto de Amadeus Desktop. |
+| `RAMS_PUTER_PRIMERO` | `0` | `1` = Puter **antes** que Gemini (Gemini pasa a ser el respaldo). Con `0`, Puter solo entra cuando Gemini no puede (cuota 429, red, `GEMINI_MAX_CALLS_DAY`, sin clave). |
+| `PUTER_MAX_CALLS_DAY` | `300` | Tope diario propio de pedidos a Puter (cuentan aparte de `GEMINI_MAX_CALLS_DAY`), porque los pagas tú. `0` = no usar Puter. |
+
+En el entorno con que lanzas Amadeus Desktop (no lee el `.env`): `AMADEUS_PUTER=0` lo apaga del
+lado de la app y `AMADEUS_PUTER_MODELO` cambia su modelo por defecto (ver `desktop/README.md`). El
+modelo por defecto de la app es `google/gemini-3.5-flash-lite` (verificado en el listado oficial de
+modelos de Puter): el más rápido de los candidatos, bueno en español y de la misma familia para la
+que está afinado el prompt de Amadeus. Con `--offline` Puter no se usa.
 
 ### ElevenLabs (voz principal)
 
@@ -429,8 +475,9 @@ Alternativa sin VTube Studio: un avatar VRM que se mueve por HTTP (`lobes/vtuber
 2. Arranca R.A.M.S. En el arranque verás `Avatar 3D VTuber AI Studio :3939 ... OK (1 visor(es))`.
 3. Cada respuesta de Amadeus llega al avatar como una secuencia: la expresión (`[EXP]`, p. ej.
    `smug` → sonrisa + ojos relajados), el gesto o la pose (`[MOTION]`: asentir, brazos cruzados,
-   mirar a otro lado…) y el habla con globo y labios. La prosodia sale de `[TONE]`. En reposo,
-   la cara sigue a la homeostasis del conectoma.
+   mirar a otro lado…) y el habla con labios (sin globo de texto; `VTUBER_AI_BURBUJA=1` lo
+   vuelve a mostrar). La prosodia sale de `[TONE]`. En reposo, la cara sigue a la homeostasis
+   del conectoma.
 4. Si R.A.M.S. no tiene voz propia, la pone el navegador (`VTUBER_AI_TTS=1`). Con ElevenLabs
    activo, el avatar solo mueve los labios y la voz sale de R.A.M.S.
 
@@ -467,6 +514,8 @@ salga a caminar por tu pantalla. Requiere **Node ≥ 22**.
    | Sinónimos propios para abrir apps | `RAMS_DESTINOS=wasap=whatsapp,pajarito=x` |
    | Que las respuestas del chat también se digan en voz alta | `RAMS_ESCRITORIO_VOZ=1` |
    | Quitar el look de Kurisu (licencia del modelo) | `VTUBER_AI_TEMA=none` (y lo mismo en el entorno de Amadeus Desktop) |
+   | IA de respaldo cuando Gemini no puede (tu cuenta de Puter, sin clave) | nada: viene activada (`RAMS_PUTER=1`); conecta tu cuenta desde la bandeja (sección 4) |
+   | Que nunca use Puter | `RAMS_PUTER=0` |
 
    La lista completa, comentada, está en `.env.example` (secciones «Amadeus Desktop / escritorio»,
    «Control del PC y travesuras» y «Visión continua»). Gemini sigue siendo opcional: sin
@@ -491,7 +540,8 @@ salga a caminar por tu pantalla. Requiere **Node ≥ 22**.
    aprueba nada (el mensaje queda en cola y se lee después); la terminal puede responder igual que
    en la v0.1. Cerrar ventanas solo se confirma en la terminal.
 7. **Bandeja:** Llamar a Amadeus · Abrir chat · No molestar · Quieta (sin travesuras) · Pausar
-   visión · Dejar pasar clics · Salir.
+   visión · Dejar pasar clics · Conectar Puter (IA de respaldo)… / Desconectar Puter (sección 4) ·
+   Salir.
 8. **Atajos y emergencias:**
 
    | Atajo | Qué hace |
@@ -505,8 +555,8 @@ salga a caminar por tu pantalla. Requiere **Node ≥ 22**.
    «Quieta» lleva Shift porque en Windows `Ctrl+Alt` es AltGr y, en el teclado latinoamericano,
    AltGr+Q escribe «@». Los atajos se cambian con `AMADEUS_ATAJO_*` (ver `desktop/README.md`).
 
-   En Hyprland, los mismos comandos por CLI: `amadeus-desktop --amadeus=toggle|show|hide|chat|basta|vision_pausa|clics|quit`
-   (sección 7).
+   En Hyprland, los mismos comandos por CLI: `amadeus-desktop --amadeus=toggle|show|hide|chat|basta|vision_pausa|clics|puter|quit`
+   (sección 7; `puter` abre la ventanita «Conectar Puter»).
 9. **Capturas de pantalla:** con `AMADEUS_EXCLUIR_CAPTURA=1` (defecto) el overlay **no** sale en
    capturas, OBS ni Discord. Pon `0` si quieres capturarla.
 10. **Look de Kurisu:** el tema `amadeus` de VTuber AI Studio recolorea el modelo VRM a la paleta de
@@ -526,6 +576,15 @@ Las reglas, en orden de seguridad:
    (DuckDuckGo). Sinónimos de serie: «twitter», «wasap», «insta», «yt», «mail»…; añade los tuyos con
    `RAMS_DESTINOS=wasap=whatsapp,pajarito=x` (cada sinónimo `^[a-z0-9_]{1,24}$` y siempre hacia una
    clave del catálogo). Si el alias no está en el catálogo, en Linux se usa `RAMS_APPS` (sección 3).
+   **En Windows (v0.2.1)** abre además las **apps instaladas** por el nombre que tienen en el menú
+   Inicio («abre Steam», «Amadeus, ¿me abres el bloc de notas?», «oye, abre Epic Games porfa»):
+   entiende que la llames por su nombre y las cortesías («porfa», «pls», «por favor»). La primera
+   vez te pide confirmación (botón del chat o `s` en la terminal) y, si aceptas, la recuerda en
+   `data/apps_aprobadas.json`: las siguientes la abre directo. Los desinstaladores, instaladores y
+   accesos a páginas web del menú nunca se abren; las consolas y herramientas del sistema
+   (PowerShell, CMD, WSL, Editor del Registro…) piden confirmación cada vez y nunca se recuerdan.
+   Los nombres del catálogo (YouTube, Discord, Spotify…) siguen abriendo su web.
+   `RAMS_APPS_MENU_INICIO=0` lo desactiva.
 2. **Borrador prerrellenado** (WhatsApp, Telegram, X, Gmail, correo): Amadeus abre la app con el
    texto ya escrito y **tú pulsas Enviar**. Siempre pide confirmación con la vista previa.
 3. **Teclear** donde no hay prerrelleno (Instagram, TikTok, Discord…): «escribe ahí: …». El
@@ -579,6 +638,69 @@ travesura, aborta y se apaga 2 h. Topes: ≤ 1 cada 15 min y ≤ 6 al día.
 del día las apaga 2 h; el segundo, hasta mañana. `/travesuras off` las apaga hasta `/travesuras on`.
 El estado se guarda en `data/travesuras.json`.
 
+### 8.6 Correo, Drive y scripts (v0.2.2, opt-in, OFF por defecto)
+
+Amadeus puede **enviar correos desde tu Gmail**, **usar tu Google Drive** y, cuando le pides algo que
+no sabe hacer, **escribirte un script** para hacerlo. Nada de eso pasa sin ti: todo lo que envía, sube,
+comparte o ejecuta se muestra antes en una **tarjeta** en el chat (Amadeus Desktop o el chat del HUD)
+con el contenido completo, y solo ocurre cuando **tú pulsas el botón** (Enviar, Subir, Compartir,
+Ejecutar…). Ni el texto del chat, ni un «sí» en la terminal, ni Telegram, ni Gemini pueden aprobar una
+tarjeta. Si no hay ningún chat abierto, Amadeus te pide que abras uno.
+
+**Cómo activarlo**
+
+1. **Google (correo y Drive):** crea tu propio cliente OAuth de «App de escritorio» en Google Cloud,
+   guarda el JSON como `data/google_cliente.json`, pon `RAMS_GOOGLE=1` en tu `.env` y reinicia. La guía
+   paso a paso está en `docs/V022_CORREO_DRIVE_SCRIPTS.md` §17. Después dile **«conecta mi cuenta de
+   Google»**: se abre tu navegador; como es tu propia app, Google avisa de que no está verificada
+   (Configuración avanzada → Ir a Amadeus) y marcas las casillas de correo y Drive. Permisos mínimos:
+   Gmail **solo enviar** (nunca lee tu bandeja) y Drive **leer todo + modificar solo lo que cree
+   Amadeus** (`RAMS_DRIVE_COMPLETO=1` para modificar cualquier archivo; hay que reconectar).
+   «desconecta google» revoca el permiso y borra el token local (con confirmación).
+2. **Contactos (opcional):** `RAMS_CORREO_CONTACTOS=mama=mama@gmail.com,jefe=jefe@empresa.com` para
+   escribir «mándale un correo a mamá …». Límites: 10 destinatarios por correo, 5 correos cada 10 min
+   y 30 al día (ajustables en el `.env`).
+3. **Taller de scripts:** `RAMS_TALLER=1` (Windows o Linux). Los scripts los escribe Gemini (hace
+   falta su clave); sin Gemini solo funcionan las habilidades que ya guardaste.
+
+**Frases de ejemplo**
+
+| Quieres | Dile |
+|---|---|
+| Enviar un correo | «mándale un correo a mamá diciendo que llegué bien», «envía un email a juan@empresa.com con asunto Reunión: mañana no puedo» |
+| Que Amadeus lo redacte | «redacta un correo a mi jefe pidiendo vacaciones la semana del 3 de noviembre» (a Gemini solo le llega el tema y el alias, nunca la dirección) |
+| Adjuntar | «… adjunta informe.pdf: aquí va el informe» (se busca por nombre en Descargas, Documentos y Escritorio) |
+| Buscar en Drive | «busca en mi drive el informe de ventas», «¿qué tengo en drive sobre impuestos?», «lista mi drive» |
+| Detalles, descargar, resumir | «detalles del 2», «descarga el 2 como pdf en documentos», «resume el documento 1 de drive» |
+| Carpetas y subir | «crea una carpeta Facturas 2026 en drive», «sube informe.pdf a drive» (con tarjeta) |
+| Papelera y compartir | «manda a la papelera el 3» (nunca borra para siempre), «comparte el 2 con ana@x.com como editora», «haz público el 2» (dos confirmaciones y siempre de solo lectura) |
+| Un script | «hazme un script que renombre las fotos de Descargas con la fecha», `/script …` |
+| Habilidades | «¿qué habilidades tienes?», «ejecuta la habilidad renombrar fotos», «olvida la habilidad …», `/habilidades` |
+| Estado de Google | «¿está conectado google?», `/google` |
+
+**Cómo se usa cada cosa**
+
+- **Correo:** la tarjeta muestra Para, CC, CCO, asunto, cuerpo y adjuntos; puedes **Editar** y
+  **Guardar cambios** antes de pulsar **Enviar**. Si el texto parece una contraseña o un código (o
+  una palabra de 24+ caracteres, como un enlace largo), no lo envía hasta que lo cambies. Si el envío
+  falla, la tarjeta se reabre para reintentar con otro clic; si la red falló a mitad, te avisa de que
+  revises Enviados antes de reintentar. Nunca reintenta solo.
+- **Desde Telegram** solo se **prepara** el correo (`RAMS_TELEGRAM_CORREO=1`, por defecto): queda la
+  tarjeta en el computador para que la apruebes allí. Buscar en Drive por Telegram exige
+  `RAMS_TELEGRAM_DRIVE=1` (apagado: los nombres de tus archivos pasarían por Telegram). Scripts por
+  Telegram, nunca.
+- **Scripts:** un analizador local (no Gemini) clasifica el riesgo (bajo, medio, alto, crítico) y la
+  tarjeta muestra el **código completo**. Solo corre al pulsar **Ejecutar**, sin permisos de
+  administrador, con tiempo límite y en su propia carpeta (`data/scripts/`). Los de riesgo crítico no
+  se pueden ejecutar desde la app (puedes copiarlos). La salida aparece en otra tarjeta y nunca va a
+  Gemini ni a Telegram. «Guardar como habilidad» lo deja listo para reutilizarlo (siempre con tarjeta;
+  si el código cambió, se revisa de nuevo).
+- **Cuando no sabe hacer algo** de tu PC («organiza mis descargas por tipo»), Amadeus te **ofrece**
+  escribir un script; contesta «sí» o «dale» y te deja la tarjeta.
+
+Seguridad y privacidad en detalle: `docs/V022_CORREO_DRIVE_SCRIPTS.md` §15 (y §16 para lo que pasa
+sin red, sin Gemini o con permisos parciales).
+
 ## 9. Nexus IDE
 
 **Servidor MCP** (Nexus → Ajustes → «Servidores MCP»):
@@ -618,9 +740,26 @@ ElevenLabs, o desactiva AIRI para no tener dos voces.
 **Qué puedes pedir desde el celular:** conversar, buscar en la red, recordar, programar
 recordatorios, consultar la memoria, el reporte del sistema y los comandos `/ayuda`, `/estado`,
 `/divergencia`, `/memoria`, `/recordar`, `/buscar`, `/agenda`, `/reporte`, `/bitacora` y `/colgar`.
-**Qué no:** nada que mire, escuche o actúe sobre el PC (cámara, pantalla, apps, ventanas,
-`/camara`, `/olvidar`, `/salir`, `/hud`). Amadeus responde «Eso solo se puede pedir desde el
-computador.».
+Desde la v0.2.1, además:
+
+- **Abrir cosas en el computador** (`RAMS_TELEGRAM_ACCIONES=1`, por defecto): webs del catálogo
+  («puedes abrir YouTube en el PC»), buscar dentro de ellas («busca lofi en YouTube»), pausar o
+  pasar la música y abrir apps del menú Inicio **ya aprobadas** desde el computador. Por Telegram
+  no hay botón de confirmar: una app nueva se aprueba abriéndola una vez en el PC. Todo lo que
+  pidas así se anuncia en el PC («📱 Desde Telegram: …», en el chat y como notificación).
+- **Fotos** (`RAMS_TELEGRAM_FOTOS=1`, apagado por defecto): «mándame una foto» (cámara; exige
+  `RAMS_CAMERA=1` y respeta el «deja de mirarme») y «mándame captura» (la pantalla donde está la
+  ventana activa; se cancela si en ella se ve una ventana de bancos, pagos o contraseñas, aunque
+  no tenga el foco). Como mucho 10 por hora; en el PC queda el aviso «📸 …» y la imagen solo vive
+  en memoria (nunca se guarda en disco ni va a Gemini).
+- **Notas de voz:** las que le mandas se transcriben con Gemini (`RAMS_TELEGRAM_TRANSCRIBIR=1`,
+  por defecto; ≤ 3 min) y te responde con una nota de voz cuando le mandas una o se la pides
+  («mándame un audio»): `RAMS_TELEGRAM_AUDIO=auto` (defecto), `siempre` u `off`. La voz sale de
+  ElevenLabs o edge-tts, así que necesita `RAMS_VOICE=1`.
+
+**Qué no:** teclear o dejar borradores en otras apps, cerrar ventanas, subir o bajar el volumen,
+mover el avatar, mirarte por la cámara para comentarlo, `/camara`, `/olvidar`, `/salir` y `/hud`.
+Amadeus responde «Eso solo se puede pedir desde el computador.».
 
 **Cuando no estás, Amadeus te "llama":**
 
@@ -683,11 +822,20 @@ los fragmentos que consolidó mientras no estabas.
   - **Gemini:** tu mensaje, los turnos recientes, los recuerdos relevantes, el estado del
     conectoma, la telemetría o los resultados web del turno y, con `RAMS_PERFIL_EN_PROMPT=1`, el
     resumen de tu perfil de WhatsApp (nunca el chat crudo). Si pides «mira mi pantalla», la
-    captura de pantalla de ese turno. Nunca fotogramas de la cámara.
+    captura de pantalla de ese turno. Nunca fotogramas de la cámara. Con
+    `RAMS_TELEGRAM_TRANSCRIBIR=1`, el audio de las notas de voz que le mandas por Telegram (solo
+    para transcribirlas; no se guarda en disco ni en los logs).
+  - **Puter** (solo si conectaste tu cuenta en Amadeus Desktop y Gemini no pudo, o con
+    `RAMS_PUTER_PRIMERO=1`): lo mismo que Gemini en ese turno (system prompt, turnos recientes,
+    recuerdos, contexto y, con `RAMS_PERFIL_EN_PROMPT=1`, el resumen del perfil), que Puter pasa al
+    proveedor del modelo elegido. **Nunca** imágenes: la captura de «mira mi pantalla» no viaja a
+    Puter. Los prompts y las respuestas no se registran en los logs, y el token de `/escritorio`
+    nunca llega a la ventana de Puter. `RAMS_PUTER=0` o `PUTER_MAX_CALLS_DAY=0` lo cortan.
   - **ElevenLabs** o, sin su clave, **edge-tts (servicio en línea de Microsoft)**: el texto que
     Amadeus va a decir en voz alta. Con `RAMS_VOICE=1` (defecto) y sin `ELEVENLABS_API_KEY`, la voz
     usa edge-tts; `RAMS_VOICE=0` o `--sin-voz` lo evitan (ver la sección 4).
-  - **Telegram:** los mensajes que intercambias con tu bot y las notas de voz.
+  - **Telegram:** los mensajes que intercambias con tu bot y las notas de voz; con
+    `RAMS_TELEGRAM_FOTOS=1`, las fotos de la cámara y las capturas que **tú** le pidas.
   - **DuckDuckGo o Brave:** solo la consulta de búsqueda.
 - **Datos no confiables:** resultados web, chat de Nexus, títulos de ventana y recuerdos llegan a
   Gemini como datos delimitados, nunca como instrucciones.

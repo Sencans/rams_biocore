@@ -1,0 +1,72 @@
+/* Conectar Puter — estilo del sistema Amadeus (negro, carmesí, violeta). Sin recursos remotos. */
+:root {
+  --fondo: #0b0d12;
+  --panel: #12151d;
+  --borde: #262b38;
+  --texto: #ece9f2;
+  --tenue: #9aa0b2;
+  --carmesi: #d0343c;
+  --violeta: #8f74d8;
+  --ok: #3fbf7f;
+  --error: #e0624a;
+  color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--fondo);
+  color: var(--texto);
+  font: 14px/1.5 system-ui, "Segoe UI", "Noto Sans", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  background:
+    radial-gradient(120% 60% at 100% 0%, rgb(208 52 60 / 12%), transparent 60%),
+    radial-gradient(100% 50% at 0% 100%, rgb(143 116 216 / 10%), transparent 60%),
+    var(--fondo);
+}
+
+.caja { padding: 20px 22px 18px; }
+
+h1 {
+  margin: 0 0 10px;
+  font-size: 18px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+}
+
+p { margin: 0 0 10px; }
+
+.tenue { color: var(--tenue); font-size: 13px; }
+
+.estado {
+  min-height: 2.6em;
+  margin: 14px 0;
+  padding: 8px 10px;
+  border: 1px solid var(--borde);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.estado.ok { border-color: rgb(63 191 127 / 55%); color: var(--ok); }
+.estado.error { border-color: rgb(224 98 74 / 55%); color: var(--error); }
+
+.botones { display: flex; gap: 10px; justify-content: flex-end; }
+
+button {
+  font: inherit;
+  padding: 8px 14px;
+  border-radius: 10px;
+  border: 1px solid var(--carmesi);
+  background: var(--carmesi);
+  color: #fff;
+  cursor: pointer;
+}
+
+button.secundario { background: transparent; border-color: var(--borde); color: var(--texto); }
+button:disabled { opacity: 0.5; cursor: default; }
+button:focus-visible { outline: 2px solid var(--violeta); outline-offset: 2px; }

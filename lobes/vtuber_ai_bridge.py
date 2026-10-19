@@ -4,11 +4,13 @@ Es una alternativa (o un complemento) a VTube Studio. A diferencia de ``VTubeBri
 puente **no** se inyecta en el despachador de salida: escucha el bus y traduce lo que ya
 publican los demás módulos (§5) a comandos ``POST /api/command`` de la interfaz:
 
-- ``salida.subtitulo``  → expresión mezclada + gesto/pose + ``speak`` (globo y labios). Si R.A.M.S.
-  ya está hablando con su propia voz (``canal == "voz"``) el visor anima los labios en silencio;
-  si la salida es solo texto (``canal == "terminal"``), el visor puede hablar con la voz del
-  navegador (``VTUBER_AI_TTS=1``). Los segmentos que llegan juntos se agrupan en una ``sequence``,
-  porque en el visor cada ``speak`` interrumpe al anterior.
+- ``salida.subtitulo``  → expresión mezclada + gesto/pose + ``speak`` (labios y, con
+  ``VTUBER_AI_BURBUJA=1``, globo de texto: cada ``speak`` lleva ``"bubble": settings.vtuber_ai_burbuja``,
+  por defecto ``False`` = sin globo). Si R.A.M.S. ya está hablando con su propia voz
+  (``canal == "voz"``) el visor anima los labios en silencio; si la salida es solo texto
+  (``canal == "terminal"``), el visor puede hablar con la voz del navegador (``VTUBER_AI_TTS=1``).
+  Los segmentos que llegan juntos se agrupan en una ``sequence``, porque en el visor cada ``speak``
+  interrumpe al anterior.
 - ``homeostasis.estado`` → expresión de reposo (``sugerir_etiquetas``) cuando no está hablando, salvo
   que otro módulo gobierne la cara (``reposo_externo = True``, lo pone ``lobes/corteza_motora.py``).
 - ``sistema.apagado``   → reverencia de despedida.
@@ -273,6 +275,8 @@ class VTuberAIBridge:
         self.tts_navegador = bool(getattr(settings, "vtuber_ai_tts", True))
         self.lang = str(getattr(settings, "vtuber_ai_lang", "es-MX"))
         self.voz = str(getattr(settings, "vtuber_ai_voz", "female"))
+        # Globo de texto del visor al hablar (campo "bubble" de speak). Sin el setting: sin globo.
+        self.burbuja = bool(getattr(settings, "vtuber_ai_burbuja", False))
         # Si otro módulo (lobes/corteza_motora.py) gobierna la cara en reposo, el puente no la toca.
         self.reposo_externo = False
         self.en_linea = False
@@ -596,7 +600,8 @@ class VTuberAIBridge:
             pasos.extend(durante)
             texto = str(seg.get("texto"))
             pasos.append({"type": "speak", "text": texto, "lang": self.lang, "voice": self.voz, "rate": rate,
-                          "pitch": pitch, "tts": bool(self.tts_navegador and not seg.get("voz_propia"))})
+                          "pitch": pitch, "tts": bool(self.tts_navegador and not seg.get("voz_propia")),
+                          "bubble": self.burbuja})
             duracion += duracion_estimada(texto, rate)
             for paso in deshacer:
                 if paso not in deshacer_total:

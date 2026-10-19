@@ -11,6 +11,14 @@ Qué hace:
 - v0.2 "Amadeus Companion" (``docs/COMPANION.md`` §C2.1): ajustes de Amadeus Desktop, del
   control del PC y travesuras, y de la visión continua; y las funciones puras
   :func:`parece_secreto` y :func:`titulo_sensible` (base de la regla anti-contraseñas, §C2.12).
+- Respaldo Puter del Área de Broca (``RAMS_PUTER``, ``PUTER_MODEL``, ``RAMS_PUTER_PRIMERO``,
+  ``PUTER_MAX_CALLS_DAY``): Puter.js corre dentro de Amadeus Desktop, sin clave de API (paga la
+  cuenta de Puter del usuario); :attr:`Settings.tiene_puter` dice si está permitido por
+  configuración.
+- v0.2.2 "Correo, Drive y taller de scripts" (``docs/V022_CORREO_DRIVE_SCRIPTS.md`` §2 y §3): ajustes
+  de Google (Gmail y Drive) y del taller de scripts, las carpetas conocidas del usuario
+  (:func:`carpetas_usuario`) y la redacción de los formatos de OAuth de Google en :func:`redactar`.
+  Ningún ajuste nuevo es secreto: el secreto del cliente y los tokens viven en archivos de ``data/``.
 
 Dependencias: solo la biblioteca estándar y ``core.contracts`` (que no importa este módulo: no
 hay ciclo). ``python-dotenv`` es opcional: si falta, se usa un parser mínimo propio que imita a
@@ -35,6 +43,7 @@ import sys
 import threading
 import types
 import unicodedata
+import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
@@ -42,7 +51,15 @@ from pathlib import Path
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from core.contracts import DESTINOS_BASE, MODOS_PANTALLA, PATRON_TITULO_SENSIBLE, SAFE_ALIAS_RE
+from core.contracts import (
+    CARPETAS_USUARIO,
+    CORREO_RE,
+    DESTINOS_BASE,
+    MODOS_PANTALLA,
+    PATRON_TITULO_SENSIBLE,
+    SAFE_ALIAS_RE,
+    SERVICIOS_GOOGLE,
+)
 
 try:  # opcional: si falta, se usa el parser mínimo propio
     from dotenv import dotenv_values
@@ -68,6 +85,7 @@ __all__ = [
     "parece_secreto",
     "titulo_sensible",
     "normalizar_titulo",
+    "carpetas_usuario",
     "nombre_nivel",
     "zona_local",
     "ahora_local",
@@ -123,6 +141,11 @@ _RE_CMD_APP: Final = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 # Otros formatos (valores no secretos).
 _RE_CONTROL: Final = re.compile(r"[\x00-\x1f\x7f]")
 _RE_MODELO: Final = re.compile(r"^[A-Za-z0-9_.\-]{1,80}$")
+# Modelos de Puter: además admiten «/» y «:» (p. ej. "proveedor/modelo" o "prefijo:proveedor/modelo").
+# Empieza por letra o dígito y tiene como mucho 100 caracteres: el MISMO patrón que
+# _MODELO_PUTER_RE de interface/escritorio_link.py (un valor aceptado aquí nunca lo descarta el enlace).
+_RE_MODELO_PUTER: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/\-]{0,99}$")
+MAX_LARGO_MODELO_PUTER: Final = 100
 _RE_VOZ_ID: Final = re.compile(r"^[A-Za-z0-9_\-]{6,64}$")
 _RE_VOZ_EDGE: Final = re.compile(r"^[A-Za-z0-9\-]{3,80}$")
 _RE_ZONA: Final = re.compile(r"^[A-Za-z0-9_+\-]+(/[A-Za-z0-9_+\-]+)*$")
@@ -152,6 +175,24 @@ _RE_NOMBRE_PROCESO: Final = re.compile(r"^[a-z0-9_.+\-]{1,64}$")
 _PANTALLA_EXCLUIR_MAX: Final = 32          # patrones extra como mucho
 _PANTALLA_EXCLUIR_LARGO: Final = 60        # caracteres por patrón extra
 
+# v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §2.1): alias de RAMS_CORREO_CONTACTOS, ya normalizado
+# (minúsculas, sin tildes y con los espacios colapsados, como el texto que enruta core/intenciones.py).
+_RE_ALIAS_CONTACTO: Final = re.compile(r"^[a-z0-9_ ]{1,30}$")
+# Carpetas conocidas del usuario (§3.2): clave de CARPETAS_USUARIO → (FOLDERID de Windows, nombre por
+# defecto bajo el perfil o el $HOME, variable de ~/.config/user-dirs.dirs en Linux).
+_CARPETAS_CONOCIDAS: Final[Mapping[str, tuple[str, str, str]]] = types.MappingProxyType({
+    "descargas": ("374DE290-123F-4565-9164-39C4925E467B", "Downloads", "XDG_DOWNLOAD_DIR"),
+    "documentos": ("FDD39AD0-238F-46AF-ADB4-6C85480369C7", "Documents", "XDG_DOCUMENTS_DIR"),
+    "escritorio": ("B4BFCC3A-DB2C-424C-B029-7FE99A87C641", "Desktop", "XDG_DESKTOP_DIR"),
+    "imagenes": ("33E28130-4E1E-4676-835A-98395C3BC3BB", "Pictures", "XDG_PICTURES_DIR"),
+    "musica": ("4BD8D571-6D19-48D3-BE97-422220080E43", "Music", "XDG_MUSIC_DIR"),
+    "videos": ("18989B1D-99B5-455B-841C-AB7C74E4DDFC", "Videos", "XDG_VIDEOS_DIR"),
+})
+_MAX_USER_DIRS: Final = 64 * 1024          # bytes como mucho de user-dirs.dirs (más ⇒ se ignora)
+_RE_LINEA_USER_DIRS: Final = re.compile(r'^\s*(XDG_[A-Z]+_DIR)\s*=\s*(?:"(.*)"|(\S*))\s*$')
+_RE_ESCAPE_USER_DIRS: Final = re.compile(r'\\([\\"$`])')
+_RE_HOME_USER_DIRS: Final = re.compile(r"^(?:\$HOME|\$\{HOME\})(?=/|$)")
+
 # Campos que nunca se muestran ni se registran.
 _CAMPOS_SECRETOS: Final = (
     "gemini_api_key",
@@ -161,6 +202,9 @@ _CAMPOS_SECRETOS: Final = (
     "brave_api_key",
     "nexus_colab_token",
 )
+# v0.2.2: campos NO secretos pero privados (direcciones de correo): fuera de repr y, en
+# resumen_seguro, solo su número. _CAMPOS_SECRETOS no cambia (§2).
+_CAMPOS_PRIVADOS: Final = ("correo_contactos_items",)
 
 
 def _ruta_token_ctl_defecto() -> Path:
@@ -259,6 +303,12 @@ class Settings:
     telegram_bot_token: str | None = field(default=None, repr=False)
     telegram_chat_id: str | None = field(default=None, repr=False)
     telegram_polling: bool = True
+    # Telegram multimedia (v0.2.1): fotos de la cámara/pantalla bajo pedido, notas de voz de ida y vuelta,
+    # y acciones de bajo riesgo en el PC pedidas desde el celular.
+    telegram_fotos: bool = False         # RAMS_TELEGRAM_FOTOS: enviar fotos de cámara/pantalla si las pides
+    telegram_audio: str = "auto"        # RAMS_TELEGRAM_AUDIO: off | auto (voz si mandas voz o la pides) | siempre
+    telegram_transcribir: bool = True    # RAMS_TELEGRAM_TRANSCRIBIR: entender tus notas de voz (Gemini)
+    telegram_acciones: bool = True       # RAMS_TELEGRAM_ACCIONES: abrir apps/webs y buscar en el PC desde Telegram
     brave_api_key: str | None = field(default=None, repr=False)
     web_region: str = "co-es"
     vts_habilitado: bool = True
@@ -271,12 +321,14 @@ class Settings:
     vtuber_ai_tts: bool = True          # sin voz propia, habla la voz del navegador
     vtuber_ai_lang: str = "es-MX"
     vtuber_ai_voz: str = "female"        # voz del navegador: nombre(s) "Sabina,Helena" o "female"
+    vtuber_ai_burbuja: bool = False      # VTUBER_AI_BURBUJA: globo de texto sobre el avatar al hablar
     # Autonomía corporal del avatar 3D (lobes/corteza_motora.py): el conectoma decide cuándo y cómo
     # se mueve, gesticula y cambia de cara, sin LLM.
     avatar_autonomo: bool = True
     avatar_actividad: float = 1.0        # multiplicador de la frecuencia de conductas (0 = quieta)
     avatar_caminar: bool = True          # puede desplazarse por el escenario
     avatar_camara: bool = False          # puede cambiar el encuadre de la cámara
+    apps_menu_inicio: bool = True        # RAMS_APPS_MENU_INICIO: en Windows, abrir apps del menú Inicio por nombre
     camara_habilitada: bool = False
     camara_indice: int = 0
     camara_intervalo_min_s: float = 90.0
@@ -333,6 +385,38 @@ class Settings:
     pantalla_fps: float = 1.0            # 0,2..2
     pantalla_excluir: tuple[str, ...] = ()   # patrones EXTRA; PATRON_TITULO_SENSIBLE se aplica siempre
     pantalla_excluir_avatar: bool = True     # enmascara la caja del avatar (escritorio.caja)
+    # Respaldo Puter: IA de respaldo del Área de Broca, ejecutada con Puter.js dentro de Amadeus
+    # Desktop (sin clave de API: el usuario inicia sesión con SU cuenta de Puter y paga él).
+    puter_habilitado: bool = True        # RAMS_PUTER
+    puter_modelo: str = ""               # PUTER_MODEL; "" = el modelo por defecto de Amadeus Desktop
+    puter_primero: bool = False          # RAMS_PUTER_PRIMERO; True = Puter antes que Gemini
+    # PUTER_MAX_CALLS_DAY: tope de pedidos diarios a Puter (paga el usuario); 0 = nunca usar Puter.
+    puter_max_llamadas_dia: int = 300
+    # --- v0.2.2 Correo, Drive y taller de scripts (docs/V022_CORREO_DRIVE_SCRIPTS.md §2.1) ---
+    # Ninguno es secreto: el secreto del cliente OAuth y los tokens viven en archivos de data/.
+    google_habilitado: bool = False      # RAMS_GOOGLE: interruptor maestro (opt-in)
+    google_servicios: tuple[str, ...] = SERVICIOS_GOOGLE   # RAMS_GOOGLE_SERVICIOS ⊆ SERVICIOS_GOOGLE
+    google_cliente_path: Path = BASE_DIR_DEFECTO / "data" / "google_cliente.json"   # RAMS_GOOGLE_CLIENTE
+    google_token_path: Path = BASE_DIR_DEFECTO / "data" / "google_token.json"       # RAMS_GOOGLE_TOKEN (avanzada)
+    drive_completo: bool = False         # RAMS_DRIVE_COMPLETO: scope "drive" en vez de drive.readonly + drive.file
+    drive_descargas_dir: Path | None = None   # RAMS_DRIVE_DESCARGAS; None = Descargas del usuario
+    drive_max_descarga_mb: int = 200     # 1..2048
+    drive_max_subida_mb: int = 100       # 1..2048
+    # RAMS_CORREO_CONTACTOS: (alias normalizado, correo). Datos privados: fuera del repr.
+    correo_contactos_items: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    correo_max_destinatarios: int = 10   # 1..50 (Para + CC + CCO)
+    correo_max_10min: int = 5            # 1..20
+    correo_max_dia: int = 30             # 1..200
+    correo_max_adjuntos_mb: int = 20     # 1..24
+    telegram_correo: bool = True         # RAMS_TELEGRAM_CORREO: preparar correos desde Telegram (nunca enviar)
+    telegram_drive: bool = False         # RAMS_TELEGRAM_DRIVE: buscar e info de Drive desde Telegram
+    taller_habilitado: bool = False      # RAMS_TALLER: interruptor maestro (opt-in)
+    taller_ofrecer: bool = True          # RAMS_TALLER_OFRECER: ofrecer el taller cuando no hay herramienta
+    taller_timeout_s: float = 30.0       # 5..300
+    taller_max_procesos: int = 16        # 1..64 (procesos vivos del árbol; sin efecto con el respaldo prlimit)
+    taller_max_memoria_mb: int = 512     # 64..8192 (memoria del árbol; con prlimit, por proceso)
+    taller_max_salida: int = 16384       # 1024..262144 bytes capturados por flujo
+    taller_dir: Path = BASE_DIR_DEFECTO / "data" / "scripts"   # RAMS_TALLER_DIR (avanzada); lo crea el taller
 
     # --- Capacidades (§4.1.2) ---
 
@@ -389,6 +473,19 @@ class Settings:
         return bool(self.vision_continua) and bool(self.camara_habilitada)
 
     @property
+    def tiene_puter(self) -> bool:
+        """Respaldo Puter permitido: habilitado, con tope diario > 0, con endpoint ``/escritorio``
+        y sin ``offline``.
+
+        Puter corre dentro de Amadeus Desktop (que habla con R.A.M.S. por ``/escritorio``) y
+        necesita red, así que, a diferencia del resto de la v0.2, sí depende de ``offline``. Que
+        la app esté conectada y con sesión iniciada lo dice el proveedor en tiempo de ejecución;
+        cuántos pedidos quedan hoy lo lleva el Área de Broca.
+        """
+        return (bool(self.puter_habilitado) and int(self.puter_max_llamadas_dia) > 0
+                and bool(self.escritorio_habilitado) and not self.offline)
+
+    @property
     def destinos_permitidos(self) -> Mapping[str, str]:
         """Alias de destino → clave de ``DESTINOS_BASE``, de solo lectura.
 
@@ -407,6 +504,33 @@ class Settings:
         """
         return _compilar_excluir(self.pantalla_excluir)
 
+    # --- Capacidades v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §2.2) ---
+
+    @property
+    def tiene_google(self) -> bool:
+        """Conexión con Google permitida por configuración: ``RAMS_GOOGLE=1`` y sin ``offline``.
+
+        Que haya cliente OAuth, token y scopes concedidos lo dice ``lobes/google_cuenta.py`` en
+        tiempo de ejecución.
+        """
+        return bool(self.google_habilitado) and not self.offline
+
+    @property
+    def correo_contactos(self) -> Mapping[str, str]:
+        """Alias de contacto → correo (``RAMS_CORREO_CONTACTOS``), de solo lectura y cacheado.
+
+        Como :attr:`destinos_permitidos`: tolera una copia con datos raros (``con()``) y descarta,
+        sin lanzar, los pares que no cumplen el alias o ``CORREO_RE``. Si un alias se repite, gana
+        el último.
+        """
+        return _contactos_correo(self.correo_contactos_items)
+
+    @property
+    def tiene_taller(self) -> bool:
+        """Taller de scripts permitido: ``RAMS_TALLER=1`` en Windows o Linux (no depende de ``offline``:
+        las habilidades guardadas no necesitan red)."""
+        return bool(self.taller_habilitado) and _taller_soportado(sys.platform)
+
     def secretos(self) -> tuple[str, ...]:
         """Valores no vacíos de las claves (Gemini, ElevenLabs, token y chat de Telegram, Brave)
         y del token de colaboración de Nexus. Se pasan a :class:`FiltroSecretos`."""
@@ -422,6 +546,8 @@ class Settings:
         v0.2 (§C2.1): crea también el directorio padre de ``escritorio_token_file`` con 0o700.
         Un padre que ya existía solo recibe ``chmod`` si es el directorio propio ``rams`` (nunca
         se cambian los permisos de un directorio ajeno como ``/tmp``).
+
+        v0.2.2: **no** crea ``taller_dir`` (lo crea el taller, bajo demanda, con 0o700).
         """
         for ruta in (self.data_dir, self.memoria_dir, self.log_dir, self.data_dir / "models"):
             try:
@@ -443,13 +569,16 @@ class Settings:
     def resumen_seguro(self) -> dict[str, object]:
         """Diccionario JSON-serializable de la configuración, sin secretos.
 
-        Las claves aparecen como ``"configurada"`` o ``"ausente"``.
+        Las claves aparecen como ``"configurada"`` o ``"ausente"``. v0.2.2: los contactos de correo
+        (datos privados, §15.11) aparecen solo como su número.
         """
         resumen: dict[str, object] = {}
         for campo in dataclasses.fields(self):
             valor = getattr(self, campo.name)
             if campo.name in _CAMPOS_SECRETOS:
                 resumen[campo.name] = "configurada" if valor else "ausente"
+            elif campo.name in _CAMPOS_PRIVADOS:
+                resumen[campo.name] = len(_como_tupla(valor))
             elif isinstance(valor, Path):
                 resumen[campo.name] = str(valor)
             elif isinstance(valor, tuple):
@@ -457,7 +586,8 @@ class Settings:
             else:
                 resumen[campo.name] = valor
         for nombre in ("tiene_gemini", "tiene_elevenlabs", "tiene_edge_tts", "tiene_telegram",
-                       "tiene_brave", "tiene_web", "tiene_escritorio", "tiene_vision_continua"):
+                       "tiene_brave", "tiene_web", "tiene_escritorio", "tiene_vision_continua",
+                       "tiene_puter", "tiene_google", "tiene_taller"):
             resumen[nombre] = getattr(self, nombre)
         return resumen
 
@@ -892,6 +1022,58 @@ class _Lector:
             log.warning("Se descartaron %d entradas inválidas de %s", descartados, var)
         return tuple(patrones)
 
+    def csv_servicios(self, var: str, defecto: tuple[str, ...]) -> tuple[str, ...]:
+        """CSV de servicios de Google (v0.2.2, §2.1): subconjunto de ``SERVICIOS_GOOGLE``.
+
+        En minúsculas, sin duplicados y en el orden del catálogo (``"Drive, correo"`` →
+        ``("correo", "drive")``). Sin ningún servicio o con alguno desconocido ⇒ ``defecto`` con
+        aviso (sin el valor recibido). Ausente ⇒ ``defecto``.
+        """
+        valor = self.crudo(var)
+        if valor is None:
+            return defecto
+        pedidos: set[str] = set()
+        for parte in valor.split(","):
+            nombre = parte.strip().lower()
+            if not nombre:
+                continue
+            if nombre not in SERVICIOS_GOOGLE:
+                return self.invalido(var, defecto)
+            pedidos.add(nombre)
+        if not pedidos:
+            return self.invalido(var, defecto)
+        return tuple(servicio for servicio in SERVICIOS_GOOGLE if servicio in pedidos)
+
+    def contactos(self, var: str) -> tuple[tuple[str, str], ...]:
+        """``alias=correo,alias=correo`` (v0.2.2, ``RAMS_CORREO_CONTACTOS``).
+
+        El alias se normaliza (minúsculas, sin tildes y con los espacios colapsados, como el texto
+        que enruta ``core/intenciones.py``) y debe cumplir ``^[a-z0-9_ ]{1,30}$``; el correo
+        (sin espacios alrededor) debe cumplir ``CORREO_RE``. Los pares que no cumplen se descartan
+        con **un** único ``log.warning`` sin valores (las direcciones son datos privados). Si un
+        alias se repite, gana el último. Ausente ⇒ ``()``.
+        """
+        valor = self.crudo(var)
+        if valor is None:
+            return ()
+        pares: dict[str, str] = {}
+        descartados = 0
+        for parte in valor.split(","):
+            parte = parte.strip()
+            if not parte:
+                continue
+            alias, igual, correo = parte.partition("=")
+            alias = normalizar_titulo(alias)
+            correo = correo.strip()
+            if not igual or not _RE_ALIAS_CONTACTO.fullmatch(alias) or not CORREO_RE.fullmatch(correo):
+                descartados += 1
+                continue
+            pares.pop(alias, None)  # el último gana, conservando el orden de aparición
+            pares[alias] = correo
+        if descartados:
+            log.warning("Se descartaron %d entradas inválidas de %s", descartados, var)
+        return tuple(pares.items())
+
     def secreto(self, var: str, patron: re.Pattern[str]) -> str | None:
         """Secreto validado por formato; inválido ⇒ ``None`` con aviso sin el valor."""
         valor = self.crudo(var)
@@ -970,6 +1152,8 @@ def _settings_por_defecto(base: Path, *, offline: bool) -> Settings:
         perfil_path=memoria / "perfil_conductual.json", persona_dir=base / "persona",
         log_dir=data / "logs", flywire_dir=data / "flywire", offline=offline,
         escritorio_token_file=_ruta_token_escritorio(os.environ.get, data),
+        google_cliente_path=data / "google_cliente.json", google_token_path=data / "google_token.json",
+        taller_dir=data / "scripts",
     )
 
 
@@ -1040,6 +1224,13 @@ def _cargar_settings(
                                         _ruta_token_escritorio(lector.crudo, data_dir))
     vision_modelo = lector.ruta_opcional("RAMS_VISION_MODELO", None)
 
+    # v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §2.1): rutas de Google y del taller, colgadas de
+    # data_dir; RAMS_DRIVE_DESCARGAS vacía ⇒ None (la carpeta Descargas del usuario).
+    google_cliente_path = lector.ruta("RAMS_GOOGLE_CLIENTE", data_dir / "google_cliente.json")
+    google_token_path = lector.ruta("RAMS_GOOGLE_TOKEN", data_dir / "google_token.json")
+    drive_descargas_dir = lector.ruta_opcional("RAMS_DRIVE_DESCARGAS", None)
+    taller_dir = lector.ruta("RAMS_TALLER_DIR", data_dir / "scripts")
+
     # --- Nivel de log ---
     nivel_crudo = lector.crudo("RAMS_LOG_LEVEL")
     log_nivel = "INFO"
@@ -1105,6 +1296,10 @@ def _cargar_settings(
         telegram_bot_token=lector.secreto("TELEGRAM_BOT_TOKEN", _RE_TOKEN_TELEGRAM),
         telegram_chat_id=lector.secreto(var_chat, _RE_CHAT_ID),
         telegram_polling=lector.booleano("RAMS_TELEGRAM_POLL", True),
+        telegram_fotos=lector.booleano("RAMS_TELEGRAM_FOTOS", False),
+        telegram_audio=lector.texto("RAMS_TELEGRAM_AUDIO", "auto", opciones=("off", "auto", "siempre"), minusculas=True),
+        telegram_transcribir=lector.booleano("RAMS_TELEGRAM_TRANSCRIBIR", True),
+        telegram_acciones=lector.booleano("RAMS_TELEGRAM_ACCIONES", True),
         brave_api_key=lector.secreto("BRAVE_API_KEY", _RE_CLAVE),
         web_region=lector.texto("RAMS_WEB_REGION", "co-es", patron=_RE_REGION_WEB,
                                 minusculas=True),
@@ -1117,10 +1312,12 @@ def _cargar_settings(
         vtuber_ai_tts=lector.booleano("VTUBER_AI_TTS", True),
         vtuber_ai_lang=lector.texto("VTUBER_AI_LANG", "es-MX", patron=_RE_LANG_BCP47),
         vtuber_ai_voz=lector.texto("VTUBER_AI_VOICE", "female", patron=_RE_VOZ_NAVEGADOR),
+        vtuber_ai_burbuja=lector.booleano("VTUBER_AI_BURBUJA", False),
         avatar_autonomo=lector.booleano("RAMS_AVATAR_AUTONOMO", True),
         avatar_actividad=lector.real("RAMS_AVATAR_ACTIVIDAD", 1.0, minimo=0.0, maximo=3.0),
         avatar_caminar=lector.booleano("RAMS_AVATAR_CAMINAR", True),
         avatar_camara=lector.booleano("RAMS_AVATAR_CAMARA", False),
+        apps_menu_inicio=lector.booleano("RAMS_APPS_MENU_INICIO", True),
         camara_habilitada=lector.booleano("RAMS_CAMERA", False),
         camara_indice=lector.entero("RAMS_CAMERA_INDEX", 0, minimo=0, maximo=63),
         camara_intervalo_min_s=lector.real("RAMS_CAMERA_MIN_INTERVAL_S", 90.0, minimo=0.0),
@@ -1179,6 +1376,35 @@ def _cargar_settings(
         pantalla_fps=lector.real("RAMS_PANTALLA_FPS", 1.0, minimo=0.2, maximo=2.0),
         pantalla_excluir=lector.csv_patrones("RAMS_PANTALLA_EXCLUIR"),
         pantalla_excluir_avatar=lector.booleano("RAMS_PANTALLA_EXCLUIR_AVATAR", True),
+        # --- Respaldo Puter (IA de respaldo del Área de Broca, en Amadeus Desktop) ---
+        puter_habilitado=lector.booleano("RAMS_PUTER", True),
+        puter_modelo=lector.texto("PUTER_MODEL", "", patron=_RE_MODELO_PUTER,
+                                  largo=(1, MAX_LARGO_MODELO_PUTER)),
+        puter_primero=lector.booleano("RAMS_PUTER_PRIMERO", False),
+        puter_max_llamadas_dia=lector.entero("PUTER_MAX_CALLS_DAY", 300, minimo=0),
+        # --- v0.2.2 Correo, Drive y taller de scripts (§2.1) ---
+        google_habilitado=lector.booleano("RAMS_GOOGLE", False),
+        google_servicios=lector.csv_servicios("RAMS_GOOGLE_SERVICIOS", SERVICIOS_GOOGLE),
+        google_cliente_path=google_cliente_path,
+        google_token_path=google_token_path,
+        drive_completo=lector.booleano("RAMS_DRIVE_COMPLETO", False),
+        drive_descargas_dir=drive_descargas_dir,
+        drive_max_descarga_mb=lector.entero("RAMS_DRIVE_MAX_DESCARGA_MB", 200, minimo=1, maximo=2048),
+        drive_max_subida_mb=lector.entero("RAMS_DRIVE_MAX_SUBIDA_MB", 100, minimo=1, maximo=2048),
+        correo_contactos_items=lector.contactos("RAMS_CORREO_CONTACTOS"),
+        correo_max_destinatarios=lector.entero("RAMS_CORREO_MAX_DESTINATARIOS", 10, minimo=1, maximo=50),
+        correo_max_10min=lector.entero("RAMS_CORREO_MAX_10MIN", 5, minimo=1, maximo=20),
+        correo_max_dia=lector.entero("RAMS_CORREO_MAX_DIA", 30, minimo=1, maximo=200),
+        correo_max_adjuntos_mb=lector.entero("RAMS_CORREO_MAX_ADJUNTOS_MB", 20, minimo=1, maximo=24),
+        telegram_correo=lector.booleano("RAMS_TELEGRAM_CORREO", True),
+        telegram_drive=lector.booleano("RAMS_TELEGRAM_DRIVE", False),
+        taller_habilitado=lector.booleano("RAMS_TALLER", False),
+        taller_ofrecer=lector.booleano("RAMS_TALLER_OFRECER", True),
+        taller_timeout_s=lector.real("RAMS_TALLER_TIMEOUT_S", 30.0, minimo=5.0, maximo=300.0),
+        taller_max_procesos=lector.entero("RAMS_TALLER_MAX_PROC", 16, minimo=1, maximo=64),
+        taller_max_memoria_mb=lector.entero("RAMS_TALLER_MAX_MEM_MB", 512, minimo=64, maximo=8192),
+        taller_max_salida=lector.entero("RAMS_TALLER_MAX_SALIDA", 16384, minimo=1024, maximo=262144),
+        taller_dir=taller_dir,
     )
 
 
@@ -1212,17 +1438,26 @@ def _hhmm(lector: _Lector, var: str, defecto: str) -> str:
 _RE_BOT_TOKEN: Final = re.compile(r"bot\d{6,}:[A-Za-z0-9_-]{20,}")
 _RE_CLAVE_GOOGLE: Final = re.compile(r"AIza[0-9A-Za-z_\-]{30,}")
 _RE_CLAVE_ELEVEN: Final = re.compile(r"sk_[0-9a-fA-F]{32,}")
+# v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §3.3, regla 3b): tokens OAuth de Google (access token
+# "ya29.…" y refresh token "1//…") y secreto del cliente OAuth ("GOCSPX-…").
+_RE_TOKEN_GOOGLE: Final = re.compile(r"ya29\.[0-9A-Za-z_\-]{20,}|1//[0-9A-Za-z_\-]{20,}")
+_RE_SECRETO_CLIENTE_GOOGLE: Final = re.compile(r"GOCSPX-[0-9A-Za-z_\-]{10,}")
 # CONTRATO: regla 5 de §4.1.3 ampliada (superconjunto estricto): si el valor empieza por un
 # esquema de autenticación ("Authorization: Bearer xyz"), se oculta también la credencial que
 # lo sigue. Con la regex literal, "\S+" consumía solo "Bearer" y la regla 6 ya no veía el token.
+# v0.2.2: también los nombres de OAuth (``\btoken`` no casa dentro de ``refresh_token``).
 _RE_ASIGNACION: Final = re.compile(
     r"(?i)\b(xi-api-key|x-goog-api-key|x-subscription-token|authorization|api[_-]?key|token"
-    r"|password|secret)(\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?\S+"
+    r"|password|secret|client_secret|refresh_token|access_token|id_token|code_verifier)"
+    r"(\s*[:=]\s*)(?:(?:bearer|basic|token)\s+)?\S+"
 )
 _RE_ARGUMENTO: Final = re.compile(
     r"(?i)(\bbearer|--api[_-]?key|--token|--password|--secret)(\s+|=)\S+"
 )
-_RE_PARAMETRO_URL: Final = re.compile(r"([?&](?:key|token|t)=)[^&\s]+")
+# v0.2.2: también los parámetros de OAuth, SOLO como parámetro de URL (``?code=``, ``&state=``…),
+# nunca en texto suelto ("code=1" o "state=ok" en una frase no se tocan).
+_RE_PARAMETRO_URL: Final = re.compile(
+    r"([?&](?:key|token|t|code|state|access_token|refresh_token|client_secret|code_verifier)=)[^&\s]+")
 _RE_ALTA_ENTROPIA: Final = re.compile(r"[A-Za-z0-9_\-+/=]{24,}")
 
 
@@ -1232,11 +1467,17 @@ def redactar(texto: str, secretos: Iterable[str] = (), *, alta_entropia: bool = 
     1. Cada secreto literal de 6 o más caracteres → ``«secreto»``.
     2. Token de bot de Telegram en URL → ``bot«token»``.
     3. Claves de Google (``AIza…``) → ``«clave-google»``.
+       3b. (v0.2.2) Tokens OAuth de Google (``ya29.…``, ``1//…``) → ``«token-google»``; secreto del
+       cliente OAuth (``GOCSPX-…``) → ``«secreto-cliente»``.
     4. Claves de ElevenLabs (``sk_…``) → ``«clave-elevenlabs»``.
     5. ``clave: valor`` / ``clave=valor`` de cabeceras y parámetros sensibles → ``«secreto»``
        (si el valor empieza por ``Bearer``/``Basic``/``Token``, también la credencial siguiente).
+       v0.2.2: también ``client_secret``, ``refresh_token``, ``access_token``, ``id_token`` y
+       ``code_verifier``.
     6. ``Bearer x``, ``--token x``, ``--api-key=x``… → ``«secreto»``.
-    7. Parámetros de URL ``?key=``, ``&token=``, ``?t=`` → ``«secreto»``.
+    7. Parámetros de URL ``?key=``, ``&token=``, ``?t=`` → ``«secreto»``. v0.2.2: también ``code``,
+       ``state``, ``access_token``, ``refresh_token``, ``client_secret`` y ``code_verifier`` (solo
+       como parámetro de URL).
     8. Solo con ``alta_entropia``: secuencias de 24+ caracteres tipo clave → ``«oculto»``.
 
     Es idempotente y no lanza.
@@ -1259,6 +1500,8 @@ def redactar(texto: str, secretos: Iterable[str] = (), *, alta_entropia: bool = 
         texto = texto.replace(valor, "«secreto»")
     texto = _RE_BOT_TOKEN.sub("bot«token»", texto)
     texto = _RE_CLAVE_GOOGLE.sub("«clave-google»", texto)
+    texto = _RE_TOKEN_GOOGLE.sub("«token-google»", texto)
+    texto = _RE_SECRETO_CLIENTE_GOOGLE.sub("«secreto-cliente»", texto)
     texto = _RE_CLAVE_ELEVEN.sub("«clave-elevenlabs»", texto)
     texto = _RE_ASIGNACION.sub(r"\1\2«secreto»", texto)
     texto = _RE_ARGUMENTO.sub(r"\1\2«secreto»", texto)
@@ -1451,6 +1694,221 @@ def _destinos_permitidos(items: Any) -> Mapping[str, str]:
     except TypeError as exc:  # elementos no hashables: solo el catálogo base
         log.debug("destinos_items no válido (%s); uso solo DESTINOS_BASE", type(exc).__name__)
         return _destinos_permitidos_cache(())
+
+
+# ---------------------------------------------------------------------------
+# v0.2.2: contactos de correo, plataforma del taller y carpetas del usuario
+# ---------------------------------------------------------------------------
+
+
+def _taller_soportado(plataforma: str) -> bool:
+    """El taller de scripts solo existe en Windows y Linux (§2.2): ``win32`` o ``linux*``."""
+    return plataforma == "win32" or str(plataforma).startswith("linux")
+
+
+@functools.lru_cache(maxsize=16)
+def _contactos_correo_cache(items: tuple[Any, ...]) -> Mapping[str, str]:
+    """``{alias: correo}`` de los pares válidos (alias normalizado y ``CORREO_RE``), de solo lectura."""
+    contactos: dict[str, str] = {}
+    for par in items:
+        try:
+            alias, correo = par
+        except (TypeError, ValueError) as exc:
+            log.debug("correo_contactos_items: entrada no válida (%s); se ignora", type(exc).__name__)
+            continue
+        if (isinstance(alias, str) and isinstance(correo, str) and _RE_ALIAS_CONTACTO.fullmatch(alias)
+                and CORREO_RE.fullmatch(correo)):
+            contactos.pop(alias, None)  # el último gana, conservando el orden de aparición
+            contactos[alias] = correo
+    return types.MappingProxyType(contactos)
+
+
+def _contactos_correo(items: Any) -> Mapping[str, str]:
+    """Alias → correo (ver :attr:`Settings.correo_contactos`); nunca lanza."""
+    try:
+        return _contactos_correo_cache(_como_tupla(items))
+    except TypeError as exc:  # elementos no hashables: sin contactos
+        log.debug("correo_contactos_items no válido (%s); sin contactos", type(exc).__name__)
+        return _contactos_correo_cache(())
+
+
+def _ruta_absoluta(texto: str | None) -> Path | None:
+    """``Path`` de ``texto`` solo si es absoluta (nunca relativa a ``os.getcwd()``); si no, ``None``."""
+    if not texto or "\x00" in texto:
+        return None
+    try:
+        ruta = Path(texto)
+    except (TypeError, ValueError) as exc:
+        log.debug("Ruta de carpeta no válida (%s)", type(exc).__name__)
+        return None
+    return ruta if ruta.is_absolute() else None
+
+
+def _carpetas_windows_api() -> dict[str, Path]:
+    """Carpetas conocidas con ``SHGetKnownFolderPath`` (respeta OneDrive y las carpetas movidas).
+
+    Solo lectura: no crea carpetas (``dwFlags=0``) y libera cada cadena con ``CoTaskMemFree``,
+    también si la llamada falla. Usa sus propias instancias de ``WinDLL`` (no toca los
+    ``argtypes`` compartidos de ``ctypes.windll``). Fuera de Windows o ante cualquier error
+    devuelve lo que tenga (``{}`` como mucho). Nunca lanza.
+    """
+    resultado: dict[str, Path] = {}
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        shell32 = ctypes.WinDLL("shell32")  # type: ignore[attr-defined]
+        ole32 = ctypes.WinDLL("ole32")  # type: ignore[attr-defined]
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [("Data1", ctypes.c_uint32), ("Data2", ctypes.c_uint16),
+                        ("Data3", ctypes.c_uint16), ("Data4", ctypes.c_ubyte * 8)]
+
+        obtener = shell32.SHGetKnownFolderPath
+        obtener.argtypes = [ctypes.POINTER(_GUID), wintypes.DWORD, wintypes.HANDLE,
+                            ctypes.POINTER(ctypes.c_void_p)]
+        obtener.restype = ctypes.c_long   # HRESULT
+        liberar = ole32.CoTaskMemFree
+        liberar.argtypes = [ctypes.c_void_p]
+        liberar.restype = None
+    except (ImportError, OSError, AttributeError, TypeError) as exc:  # sin Windows o sin shell32
+        log.debug("SHGetKnownFolderPath no disponible (%s)", type(exc).__name__)
+        return resultado
+    for clave, (folderid, _nombre, _xdg) in _CARPETAS_CONOCIDAS.items():
+        puntero = ctypes.c_void_p()
+        try:
+            uid = uuid.UUID(folderid)
+            guid = _GUID(uid.time_low, uid.time_mid, uid.time_hi_version,
+                         (ctypes.c_ubyte * 8)(*uid.bytes[8:]))
+            codigo = obtener(ctypes.byref(guid), 0, None, ctypes.byref(puntero))
+            if codigo == 0 and puntero.value:
+                ruta = _ruta_absoluta(ctypes.wstring_at(puntero.value))
+                if ruta is not None:
+                    resultado[clave] = ruta
+            else:
+                log.debug("SHGetKnownFolderPath falló para %s (0x%08X)", clave, codigo & 0xFFFFFFFF)
+        except (OSError, ValueError, TypeError, ctypes.ArgumentError) as exc:
+            log.debug("SHGetKnownFolderPath falló para %s (%s)", clave, type(exc).__name__)
+        finally:
+            if puntero.value:
+                liberar(puntero)
+    return resultado
+
+
+def _leer_user_dirs(ruta: Path, home: Path) -> dict[str, Path]:
+    """Lee ``user-dirs.dirs`` (``XDG_DOWNLOAD_DIR="$HOME/Descargas"``…) → ``{clave: Path}``.
+
+    Solo admite ``$HOME``/``${HOME}`` al principio y rutas absolutas; ignora las líneas que no
+    entiende, las variables desconocidas y un archivo de más de 64 KiB. Nunca lanza.
+    """
+    try:
+        with ruta.open("rb") as archivo:
+            crudo = archivo.read(_MAX_USER_DIRS + 1)
+    except OSError as exc:  # no existe o no se puede leer: se usan los nombres por defecto
+        log.debug("Sin user-dirs.dirs legible (%s)", type(exc).__name__)
+        return {}
+    if len(crudo) > _MAX_USER_DIRS:
+        log.debug("user-dirs.dirs demasiado grande; se ignora")
+        return {}
+    por_variable = {xdg: clave for clave, (_guid, _nombre, xdg) in _CARPETAS_CONOCIDAS.items()}
+    resultado: dict[str, Path] = {}
+    for linea in crudo.decode("utf-8", "replace").splitlines():
+        if linea.lstrip().startswith("#"):
+            continue
+        coincidencia = _RE_LINEA_USER_DIRS.match(linea)
+        if coincidencia is None:
+            continue
+        clave = por_variable.get(coincidencia.group(1))
+        if clave is None:
+            continue
+        entre_comillas = coincidencia.group(2)
+        crudo_valor = entre_comillas if entre_comillas is not None else (coincidencia.group(3) or "")
+        con_home = _RE_HOME_USER_DIRS.match(crudo_valor)
+        resto = crudo_valor[con_home.end():] if con_home is not None else crudo_valor
+        if "$" in resto:   # otra variable (o un "$" escapado): no se adivina, se usa el nombre por defecto
+            continue
+        resto = _RE_ESCAPE_USER_DIRS.sub(r"\1", resto)
+        valor = str(home) + resto if con_home is not None else resto
+        ruta_carpeta = _ruta_absoluta(valor)
+        if ruta_carpeta is not None:
+            resultado[clave] = ruta_carpeta
+    return resultado
+
+
+def _carpeta_util(ruta: Path | None, home: Path | None) -> bool:
+    """La carpeta existe como directorio y no es la raíz de un disco, el propio perfil ni un
+    directorio que lo contenga (xdg-user-dirs marca con ``$HOME`` una carpeta desactivada, y el
+    perfil entero nunca se expone como «carpeta del usuario»)."""
+    if ruta is None:
+        return False
+    try:
+        if ruta.parent == ruta or (home is not None and (ruta == home or ruta in home.parents)):
+            return False
+        return ruta.is_dir()
+    except (OSError, ValueError) as exc:
+        log.debug("No se pudo comprobar una carpeta del usuario (%s)", type(exc).__name__)
+        return False
+
+
+def carpetas_usuario(*, entorno: Mapping[str, str] | None = None, plataforma: str | None = None,
+                     usar_api: bool = True) -> dict[str, Path]:
+    """Carpetas conocidas del usuario (claves de CARPETAS_USUARIO) que EXISTEN como directorio.
+
+    - Windows con usar_api: SHGetKnownFolderPath (ctypes, shell32/ole32; FOLDERID_Downloads,
+      Documents, Desktop, Pictures, Music, Videos) — respeta OneDrive y las carpetas movidas.
+      Si falla: %USERPROFILE%\\Downloads, Documents, Desktop, Pictures, Music, Videos.
+    - Linux: ~/.config/user-dirs.dirs (XDG_DOWNLOAD_DIR…, con $HOME expandido; solo rutas absolutas)
+      y, si falta, ~/Downloads, ~/Documents, ~/Desktop, ~/Pictures, ~/Music, ~/Videos.
+    ``entorno`` (por defecto os.environ) solo se lee para USERPROFILE/HOME/XDG_CONFIG_HOME (variables de
+    plataforma, regla 6 de la receta). Nunca lanza; una carpeta inexistente no aparece.
+
+    Detalles: el perfil sale de ``USERPROFILE`` (Windows) o ``HOME``; con ``entorno`` explícito
+    nunca se consulta el perfil real (sin esas variables, solo cuenta la API de Windows). Otros
+    sistemas usan la regla de Linux. Nunca devuelve la raíz de un disco, el propio perfil (así
+    marca xdg-user-dirs una carpeta desactivada) ni un directorio que lo contenga. El orden es el
+    de ``CARPETAS_USUARIO``.
+    """
+    resultado: dict[str, Path] = {}
+    try:
+        fuente: Mapping[str, Any] = os.environ if entorno is None else entorno
+        obtener = getattr(fuente, "get", None)
+        if not callable(obtener):
+            log.debug("carpetas_usuario: entorno no legible")
+            return resultado
+        sistema = sys.platform if plataforma is None else str(plataforma)
+        variables = ("USERPROFILE", "HOME") if sistema == "win32" else ("HOME",)
+        home: Path | None = None
+        for variable in variables:
+            home = _ruta_absoluta(_valor_entorno(obtener, variable))
+            if home is not None:
+                break
+        if home is None and entorno is None:
+            try:
+                home = Path.home()
+            except (RuntimeError, KeyError, OSError) as exc:
+                log.debug("Sin directorio personal (%s)", type(exc).__name__)
+        candidatas: dict[str, Path] = {}
+        if sistema == "win32":
+            if usar_api:
+                try:
+                    candidatas = dict(_carpetas_windows_api())
+                except Exception as exc:  # nunca debería: se usan los nombres bajo el perfil
+                    log.debug("carpetas_usuario: la API de Windows falló (%s)", type(exc).__name__)
+        else:
+            config_xdg = _ruta_absoluta(_valor_entorno(obtener, "XDG_CONFIG_HOME"))
+            if config_xdg is None and home is not None:
+                config_xdg = home / ".config"
+            if config_xdg is not None and home is not None:
+                candidatas = _leer_user_dirs(config_xdg / "user-dirs.dirs", home)
+        for clave in CARPETAS_USUARIO:
+            nombre = _CARPETAS_CONOCIDAS[clave][1]
+            for ruta in (candidatas.get(clave), home / nombre if home is not None else None):
+                if _carpeta_util(ruta, home):
+                    resultado[clave] = ruta  # type: ignore[assignment]
+                    break
+    except Exception as exc:  # contrato: nunca lanza (entorno exótico, sistema de archivos raro…)
+        log.debug("carpetas_usuario: error inesperado (%s)", type(exc).__name__)
+    return resultado
 
 
 class FiltroSecretos(logging.Filter):

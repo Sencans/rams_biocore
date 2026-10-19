@@ -13,16 +13,24 @@ v0.2 "Amadeus Companion" (``docs/COMPANION.md`` §C2.2): canal local ``escritori
 ``curiosidad_web``, tipos de acción de ``ControlPC``, catálogos cerrados del escritorio y de la
 visión, ``DESTINOS_BASE``, ``PATRON_TITULO_SENSIBLE`` y ``ContextoBroca.percepcion``.
 
+v0.2.2 "Correo, Drive y taller de scripts" (``docs/V022_CORREO_DRIVE_SCRIPTS.md`` §3.1): catálogos
+de Google, de las tarjetas aprobables y del taller, tiempos y topes del protocolo, y las funciones
+puras :func:`huella_contenido`, :func:`largo_utf16` y :func:`bytes_json` (nunca lanzan).
+
 Dependencias: solo la biblioteca estándar. Sin degradación posible: no toca E/S. No importa
 ``core.config`` (``config`` sí importa de aquí: no hay ciclo).
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import re
+import sys
 import time
+import unicodedata
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
@@ -44,8 +52,17 @@ __all__ = [
     "ACCIONES_ORDEN_ESCRITORIO", "EVENTOS_ESCRITORIO", "CONTROLES_ESCRITORIO",
     "CONDUCTAS_SOLICITUD", "SAFE_ALIAS_RE", "DESTINOS_BASE", "PATRON_TITULO_SENSIBLE",
     "CLAVES_PERCEPCION", "TITULO_CORTO_MAX",
+    # constantes v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §3.1)
+    "SERVICIOS_GOOGLE", "CARPETAS_USUARIO", "DESTINOS_DESCARGA", "OPERACIONES_DRIVE", "FORMATOS_DRIVE",
+    "ROLES_DRIVE", "CLASES_TARJETA", "ESTADOS_TARJETA", "BOTONES_TARJETA", "DECISIONES_TARJETA",
+    "RESULTADOS_TARJETA", "LENGUAJES_SCRIPT", "NIVELES_RIESGO", "NIVELES_EJECUTABLES",
+    "CATEGORIAS_RIESGO", "TTL_TARJETA_S", "TTL_TARJETA_TELEGRAM_S", "TTL_DOBLE_CONFIRMACION_S",
+    "MAX_TARJETAS_VIVAS", "MAX_CODIGO_SCRIPT", "MAX_SALIDA_TARJETA", "MAX_HALLAZGOS_TARJETA",
+    "MAX_BYTES_TARJETA", "MAX_BYTES_DECISION_TARJETA", "MAX_CUERPO_CORREO", "MAX_ASUNTO_CORREO",
+    "MAX_ADJUNTOS_CORREO", "ID_TARJETA_RE", "HUELLA_RE", "CORREO_RE", "PATRON_ARCHIVO_SENSIBLE",
     # funciones
     "formatear_decimal", "banda", "resumen_nexus", "normalizar_percepcion",
+    "huella_contenido", "largo_utf16", "bytes_json",
     # tipos
     "HomeostaticState", "Etiquetas", "Segmento", "BrocaReply", "Utterance", "Telemetria",
     "ResultadoVistazo", "EstadoPresencia", "ResultadoWeb", "Recuerdo", "Turno", "ItemAgenda",
@@ -143,6 +160,125 @@ ORIGENES_UTTERANCE: Final = ("respuesta", "iniciativa", "agenda", "alerta", "sis
 CANALES_UTTERANCE: Final = ("auto", "voz", "terminal", "telegram")
 ERRORES_VISTAZO: Final = ("camara_deshabilitada", "sin_opencv", "no_abre", "intervalo", "ocupada",
                           "backoff", "limite_diario", "denegada", "tiempo_agotado")
+
+# --- v0.2.2: Google, tarjetas y taller (docs/V022_CORREO_DRIVE_SCRIPTS.md) ---
+SERVICIOS_GOOGLE: Final = ("correo", "drive")
+CARPETAS_USUARIO: Final = ("descargas", "documentos", "escritorio", "imagenes", "musica", "videos")
+DESTINOS_DESCARGA: Final = ("descargas", "documentos", "escritorio")
+OPERACIONES_DRIVE: Final = ("buscar", "info", "descargar", "leer", "crear_carpeta", "subir", "papelera", "compartir")
+FORMATOS_DRIVE: Final = ("pdf", "texto", "original")
+ROLES_DRIVE: Final = ("reader", "commenter", "writer")
+CLASES_TARJETA: Final = ("correo", "drive", "script", "salida")
+ESTADOS_TARJETA: Final = ("pendiente", "info", "cerrada")
+BOTONES_TARJETA: Final = ("aprobar", "aprobar_publico", "editar", "guardar", "copiar", "descartar")
+DECISIONES_TARJETA: Final = ("aprobar", "aprobar_publico", "editar", "guardar", "descartar")   # "copiar" es local
+RESULTADOS_TARJETA: Final = ("enviado", "hecho", "ejecutado", "descartado", "caducado", "reemplazado",
+                             "denegado", "fallo")
+LENGUAJES_SCRIPT: Final = ("powershell", "python", "bash")
+NIVELES_RIESGO: Final = ("bajo", "medio", "alto", "critico")            # orden creciente
+NIVELES_EJECUTABLES: Final = frozenset({"bajo", "medio", "alto"})
+CATEGORIAS_RIESGO: Final = ("borrado", "sobrescritura", "registro", "servicios", "red", "descarga_ejecucion",
+                            "credenciales", "elevacion", "apagado", "seguridad", "persistencia", "ofuscacion",
+                            "dinamico", "fuera_de_carpeta", "subproceso", "winapi", "interactivo", "sintaxis",
+                            "tamano", "analisis_degradado")
+TTL_TARJETA_S: Final = 1800.0              # preparada en el PC
+TTL_TARJETA_TELEGRAM_S: Final = 43200.0    # preparada por Telegram (12 h)
+TTL_DOBLE_CONFIRMACION_S: Final = 120.0    # entre el 1.er y el 2.º clic de "compartir en público"
+MAX_TARJETAS_VIVAS: Final = 4              # una por clase
+# Presupuesto de tamaño (§12.2): TODO mensaje WS de tarjeta, en los dos sentidos, cabe en 60 KiB, por
+# debajo de los 64 KiB que aceptan el servidor del HUD, Electron (MAX_WS_ENTRANTE), el HUD y el puente
+# de movil/ (max_size=65536, que CIERRA la conexión si se pasa). Los topes de texto del protocolo se
+# miden en unidades UTF-16 (lo que mide String.length en JS): largo_utf16().
+MAX_CODIGO_SCRIPT: Final = 24_576          # bytes UTF-8 (sin controles salvo "\n" y "\t", §9.3) ⇒ ≤ 48 KiB escapado
+MAX_SALIDA_TARJETA: Final = 8_192          # unidades UTF-16 por flujo (stdout, stderr) en la tarjeta "salida"
+MAX_HALLAZGOS_TARJETA: Final = 20          # hallazgos en la vista del script (los más graves); el resto se cuenta
+MAX_BYTES_TARJETA: Final = 60 * 1024       # bytes_json del mensaje WS {"tipo":"tarjeta","datos":…} (§12.2)
+MAX_BYTES_DECISION_TARJETA: Final = 60 * 1024   # bytes UTF-8 de tarjeta_decision (§12.3)
+MAX_CUERPO_CORREO: Final = 10_000          # unidades UTF-16
+MAX_ASUNTO_CORREO: Final = 200             # unidades UTF-16
+MAX_ADJUNTOS_CORREO: Final = 5
+ID_TARJETA_RE: Final = re.compile(r"^[0-9a-f]{8}$")
+HUELLA_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+CORREO_RE: Final = re.compile(
+    r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63})*\.[A-Za-z]{2,24}$")
+# Archivos que nunca se adjuntan, suben ni analizan como datos del usuario (sobre el nombre o la ruta
+# con "/"; minúsculas). Además, todo lo que esté bajo base_dir o data_dir del proyecto.
+PATRON_ARCHIVO_SENSIBLE: Final = (
+    r"(?:^|/)(?:\.env(?:\..*)?|.*\.(?:pem|key|p12|pfx|kdbx|ovpn|ppk|gpg|asc|keychain)"
+    r"|id_(?:rsa|dsa|ecdsa|ed25519)(?:\.pub)?|login data|cookies|web data|key[34]\.db|logins\.json"
+    r"|ctl_token|escritorio\.json|google_(?:cliente|token)\.json|client_secret[^/]*\.json)$")
+
+
+def _canonico(valor: Any) -> Any:
+    """Forma canónica de ``valor`` para :func:`huella_contenido` (recursiva).
+
+    Textos (también las claves) con ``"\\r\\n"``/``"\\r"`` → ``"\\n"`` y en NFC; ``Mapping`` → ``dict``;
+    tuplas y listas → listas; el resto, tal cual (``json.dumps`` decide si es serializable). Lanza
+    ``ValueError`` si dos claves coinciden tras normalizar: la huella sería ambigua (fail-closed).
+    """
+    if isinstance(valor, str):
+        return unicodedata.normalize("NFC", valor.replace("\r\n", "\n").replace("\r", "\n"))
+    if isinstance(valor, Mapping):
+        resultado: dict[Any, Any] = {}
+        for clave, contenido in valor.items():
+            canonica = _canonico(clave) if isinstance(clave, str) else clave
+            if canonica in resultado:
+                raise ValueError("claves repetidas tras normalizar")
+            resultado[canonica] = _canonico(contenido)
+        return resultado
+    if isinstance(valor, (list, tuple)):
+        return [_canonico(v) for v in valor]
+    return valor
+
+
+def huella_contenido(contenido: Mapping[str, Any]) -> str:
+    """sha256 (64 hex) del JSON canónico de ``contenido`` (huella de una tarjeta).
+
+    Canónico: textos en NFC con "\\r\\n" y "\\r" → "\\n" (recursivo), tuplas → listas,
+    ``json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)``
+    en UTF-8. Si no es serializable (bytes, NaN, objetos…), devuelve ``""`` con ``log.debug`` (nunca
+    lanza): quien la use trata ``""`` como huella inválida (fail-closed).
+
+    También da ``""`` si ``contenido`` no es un ``Mapping``, si dos claves coinciden tras normalizar
+    o si hay sustitutos sueltos (U+D800–U+DFFF, que no son UTF-8 válido: los módulos los cambian por
+    U+FFFD antes de huellar). El registro solo lleva el tipo del error, nunca el contenido.
+    """
+    try:
+        if not isinstance(contenido, Mapping):
+            raise TypeError("el contenido no es un Mapping")
+        texto = json.dumps(_canonico(contenido), ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False)
+        return hashlib.sha256(texto.encode("utf-8")).hexdigest()
+    except Exception as exc:  # contrato: nunca lanza (TypeError, ValueError, UnicodeError, RecursionError…)
+        log.debug("huella_contenido: contenido no huellable (%s); huella vacía", type(exc).__name__)
+        return ""
+
+
+def largo_utf16(texto: str) -> int:
+    """Longitud en unidades UTF-16 (= ``String.length`` de JavaScript): ``len(texto.encode("utf-16-le",
+    "surrogatepass")) // 2``. Un carácter fuera del BMP (emoji) cuenta 2. Nunca lanza (no-str ⇒ 0)."""
+    if not isinstance(texto, str):
+        return 0
+    try:
+        return len(str.encode(texto, "utf-16-le", "surrogatepass")) // 2
+    except Exception as exc:  # red de seguridad: el mismo cálculo, carácter a carácter
+        log.debug("largo_utf16: codificación fallida (%s); cuento por caracteres", type(exc).__name__)
+        return sum(2 if ord(caracter) > 0xFFFF else 1 for caracter in texto)
+
+
+def bytes_json(valor: Any) -> int:
+    """Bytes UTF-8 de ``json.dumps(valor, ensure_ascii=False, separators=(",", ":"))``, la forma en que
+    escritorio_link serializa. No serializable o con sustitutos sueltos ⇒ ``sys.maxsize`` (fail-closed: no
+    cabe en ningún tope). Nunca lanza.
+
+    ``NaN`` e infinitos también dan ``sys.maxsize`` (``allow_nan=False``: no son JSON válido).
+    """
+    try:
+        return len(json.dumps(valor, ensure_ascii=False, separators=(",", ":"),
+                              allow_nan=False).encode("utf-8"))
+    except Exception as exc:  # contrato: nunca lanza (TypeError, ValueError, UnicodeError, RecursionError…)
+        log.debug("bytes_json: valor no serializable (%s); uso sys.maxsize", type(exc).__name__)
+        return sys.maxsize
 
 
 def formatear_decimal(x: float, decimales: int = 1) -> str:
@@ -934,7 +1070,8 @@ class DiagnosticoModulo:
     clave: str        # "memoria" | "conectoma" | "broca" | "camara" | "telemetria" | "hyprland" | "nexus" |
                       # "vts" | "voz" | "telegram" | "web" | "hud" | "control"
                       # v0.2: "escritorio" | "control_pc" | "vision_camara" | "vision_pantalla"
-    nombre: str       # nombre para el arranque, p. ej. "Área de Broca (Gemini)"
+                      # v0.2.2: "google" | "correo" | "drive" | "taller"
+    nombre: str      # nombre para el arranque, p. ej. "Área de Broca (Gemini)"
     estado: EstadoModulo
     detalle: str = ""
     latencia_ms: int | None = None

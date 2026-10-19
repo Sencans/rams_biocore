@@ -87,14 +87,59 @@ test('preload-overlay: onCursor/onOrder/onVisibility se suscriben y se cancelan'
   assert.equal(typeof api.onOrder('no es función'), 'function');
 });
 
-test('preload-chat: window.amadeusChat v1 con la API exacta', () => {
+test('preload-chat: window.amadeusChat v2 con la API exacta (la v1 + tarjetas)', () => {
   const { expuesto } = cargarPreload('preload-chat.js');
   assert.deepEqual(Object.keys(expuesto), ['amadeusChat']);
   const api = expuesto.amadeusChat;
-  assert.deepEqual(Object.keys(api).sort(), ['abrirEnlace', 'confirmar', 'control', 'hide', 'onMessage', 'onPermiso',
-    'onStatus', 'onVoz', 'send', 'version'].sort());
-  assert.equal(api.version, 1);
+  assert.deepEqual(Object.keys(api).sort(), ['abrirEnlace', 'confirmar', 'control', 'copiarCodigo', 'decidirTarjeta',
+    'hide', 'onMessage', 'onPermiso', 'onStatus', 'onTarjeta', 'onVoz', 'send', 'version'].sort());
+  assert.equal(api.version, 2);
   assert.ok(!('ipcRenderer' in api));
+});
+
+test('preload-chat: tarjetas — decidirTarjeta con extra plano (nunca recorta) y copiarCodigo solo con el id', async () => {
+  const { expuesto, enviados, emitir } = cargarPreload('preload-chat.js');
+  const api = expuesto.amadeusChat;
+  const H = 'ab'.repeat(32);
+  assert.equal(await api.decidirTarjeta('0a1b2c3d', H, 'aprobar'), false); // false = no salió
+  const cuerpo = '😀'.repeat(5000); // 10 000 unidades: justo en el tope, intacto
+  api.decidirTarjeta('0a1b2c3d', H, 'editar', { campos: { cuerpo, para: 'a@b.co', firma: 'x', otro: 1 }, extra: 'y' });
+  api.decidirTarjeta('0a1b2c3d', H, 'editar', { campos: { cuerpo: `${cuerpo}x` } }); // 10 001 → campos null
+  api.decidirTarjeta('0a1b2c3d', H, 'editar', { campos: { asunto: 42 } });          // no string → campos null
+  api.decidirTarjeta('0a1b2c3d', H, 'editar', { campos: ['cuerpo'] });
+  api.decidirTarjeta('5c1a7e00', H, 'guardar', { nombre: 'limpiar descargas' });
+  api.decidirTarjeta('5c1a7e00', H, 'guardar', { nombre: 'n'.repeat(41) });
+  api.decidirTarjeta({ malo: 1 }, H, 'aprobar', 'texto');
+  // La versión que se ve: solo un entero 1..2³¹−1; si no, null (y R.A.M.S. no acepta la decisión).
+  api.decidirTarjeta('0a1b2c3d', H, 'aprobar', { version: 4, otra: 1 });
+  api.decidirTarjeta('0a1b2c3d', H, 'aprobar', { version: '4' });
+  api.decidirTarjeta('0a1b2c3d', H, 'aprobar', { version: 2 ** 31 });
+  api.decidirTarjeta('0a1b2c3d', H, 'editar', { version: 2, campos: { asunto: 'x' } });
+  api.copiarCodigo('5c1a7e00-y-mas');
+  api.copiarCodigo({ toString: () => 'deadbeef' });
+  assert.deepEqual(enviados.slice(8, 12), [
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'aprobar', { version: 4 }],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'aprobar', { version: null }],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'aprobar', { version: null }],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'editar', { version: 2, campos: { asunto: 'x' } }],
+  ]);
+  enviados.splice(8, 4);
+  assert.deepEqual(enviados, [
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'aprobar', {}],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'editar', { campos: { cuerpo, para: 'a@b.co' } }],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'editar', { campos: null }],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'editar', { campos: null }],
+    ['invoke', 'chat:tarjeta', '0a1b2c3d', H, 'editar', { campos: null }],
+    ['invoke', 'chat:tarjeta', '5c1a7e00', H, 'guardar', { nombre: 'limpiar descargas' }],
+    ['invoke', 'chat:tarjeta', '5c1a7e00', H, 'guardar', { nombre: null }],
+    ['invoke', 'chat:tarjeta', null, H, 'aprobar', {}],
+    ['send', 'chat:copiar', '5c1a7e00'],
+    ['send', 'chat:copiar', 'deadbeef'],
+  ]);
+  const recibidas = [];
+  api.onTarjeta((t) => recibidas.push(t));
+  emitir('chat:tarjeta', { id: '0a1b2c3d', clase: 'correo', estado: 'cerrada', resultado: 'enviado', motivo: '' });
+  assert.equal(recibidas.length, 1);
 });
 
 test('preload-chat: canales', async () => {

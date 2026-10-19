@@ -235,7 +235,8 @@ def test_telegram_no_actua_sobre_el_pc(settings_prueba: Settings, monkeypatch: p
     llamadas: list[str] = []
 
     async def principal() -> list[ContextoBroca]:
-        orq, _salida = _orquestador(settings_prueba)
+        # v0.2.1: con RAMS_TELEGRAM_ACCIONES=0 Telegram vuelve a no tocar el PC (ver los tests v0.2.1).
+        orq, _salida = _orquestador(settings_prueba.con(telegram_acciones=False))
         try:
             await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
             assert orq.aura is not None, "lobes.aura_vision_pc no disponible"
@@ -1064,6 +1065,18 @@ def modulos_v02_falsos(monkeypatch: pytest.MonkeyPatch) -> list[ControlPCFalso]:
     modulo_vision.VisionContinua = VisionContinua  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "lobes.vision_continua", modulo_vision)
     return instancias
+
+
+MODULOS_V022: tuple[str, ...] = ("lobes.google_cuenta", "lobes.correo", "lobes.drive", "lobes.taller_scripts")
+
+
+@pytest.fixture(autouse=True)
+def modulos_v022_ausentes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """v0.2.2: los tests de main nunca usan los módulos reales de Google ni del taller (§14.8: «todo con
+    módulos falsos»). Por defecto quedan AUSENTES (``None`` en ``sys.modules`` → «módulo no instalado»);
+    la fixture ``v022`` los sustituye por dobles con las firmas de §6-§9."""
+    for nombre in MODULOS_V022:
+        monkeypatch.setitem(sys.modules, nombre, None)
 
 
 def _escuchar(orq: Any, *nombres: str) -> list[tuple[str, dict[str, Any]]]:
@@ -2356,3 +2369,2122 @@ def test_integracion_con_control_pc_y_hud_reales(settings_prueba: Settings, monk
         assert "?t=" not in (escritorio.detalle or "")
         if escritorio.estado == EstadoModulo.OK:
             assert r["token_vivo"] is True and not r["token"].exists()     # el HUD lo borra al cerrar
+
+
+# --- respaldo Puter (§C2.15) ------------------------------------------------------
+
+
+def _ajustes_puter(settings: Settings, **cambios: Any) -> Settings:
+    """``settings.con(...)``; salta el test si ``core/config.py`` aún no tiene algún campo (frente base)."""
+    import dataclasses
+
+    campos = {f.name for f in dataclasses.fields(settings)}
+    faltan = [c for c in cambios if c not in campos]
+    if faltan:
+        pytest.skip(f"core/config.py aún sin {', '.join(faltan)} (frente base)")
+    return settings.con(**cambios)
+
+
+def _espiar_set_respaldo(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Registra cada ``BrocaLLM.set_respaldo`` (y llama al original si existe)."""
+    import lobes.broca_llm as broca_mod
+
+    fijados: list[Any] = []
+    original = getattr(broca_mod.BrocaLLM, "set_respaldo", None)
+
+    def espia(self: Any, proveedor: Any) -> None:
+        fijados.append(proveedor)
+        if callable(original):
+            original(self, proveedor)
+
+    monkeypatch.setattr(broca_mod.BrocaLLM, "set_respaldo", espia, raising=False)
+    return fijados
+
+
+def test_respaldo_puter_cableado_diagnostico_y_estado(settings_prueba: Settings,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin --offline y con /escritorio: RespaldoPuter → broca.set_respaldo; un Amadeus Desktop falso
+    anuncia su sesión de Puter y el diagnóstico ``puter`` pasa de EN ESPERA a OK (también en /estado)."""
+    import inspect
+
+    pytest.importorskip("websockets")
+    from websockets.asyncio.client import connect
+
+    ajustes = _ajustes_puter(settings_prueba, offline=False, voz_habilitada=False, puter_habilitado=True,
+                             puter_modelo="", puter_primero=False)
+    fijados = _espiar_set_respaldo(monkeypatch)
+    kw: dict[str, Any] = {"proxy": None} if "proxy" in inspect.signature(connect).parameters else {}
+
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(ajustes)
+        try:
+            diags = {d.clave: d for d in await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)}
+            r: dict[str, Any] = {"diags": diags, "puter": orq.puter,
+                                 "enlace": getattr(orq.hud, "escritorio", None)}
+            datos = json.loads(Path(ajustes.escritorio_token_file).read_text(encoding="utf-8"))
+            async with connect(f"{datos['url']}?t={datos['token']}", open_timeout=5, **kw) as ws:
+                assert json.loads(await asyncio.wait_for(ws.recv(), 3))["tipo"] == "hola"
+                await ws.send(json.dumps({"tipo": "puter.estado", "datos": {
+                    "listo": True, "sesion": True, "modelo": "openai/gpt-falso", "error": None}}))
+                r["ok"] = await _esperar(lambda: orq._diagnosticos.get("puter") is not None
+                                         and orq._diagnosticos["puter"].estado == EstadoModulo.OK, 3.0)
+                r["diag_ok"] = orq._diagnosticos.get("puter")
+                r["disponible"] = orq.puter.disponible if orq.puter is not None else None
+                await orq.procesar_entrada("/estado")
+                r["estado"] = salida.getvalue()
+                # Saldo de Puter agotado: la línea dice «en pausa» con la cuenta atrás y la fila de la
+                # tabla es el diagnóstico de ahora, no el último publicado (aquí, uno viejo a propósito).
+                orq.puter._efecto_error("cuota")
+                await asyncio.sleep(0.05)
+                orq._diagnosticos["puter"] = DiagnosticoModulo("puter", "Respaldo Puter (Amadeus Desktop)",
+                                                               EstadoModulo.OK, "detalle viejo")
+                await orq.procesar_entrada("/estado")
+                r["estado_cuota"] = salida.getvalue()[len(r["estado"]):]
+            r["sin_app"] = await _esperar(lambda: orq._diagnosticos["puter"].estado == EstadoModulo.EN_ESPERA, 3.0)
+            return r
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    diag = r["diags"]["puter"]
+    assert diag.nombre == "Respaldo Puter (Amadeus Desktop)"
+    assert diag.estado == EstadoModulo.EN_ESPERA and diag.detalle == "sin app de escritorio"
+    assert type(r["puter"]).__name__ == "RespaldoPuter" and r["enlace"].puter is r["puter"]
+    assert fijados and fijados[-1] is r["puter"]
+    assert r["ok"] and r["diag_ok"].detalle == "openai/gpt-falso" and r["disponible"] is True
+    assert "Respaldo Puter (Amadeus Desktop)" in r["estado"]
+    tope = getattr(ajustes, "puter_max_llamadas_dia", None)
+    cuenta = f"hoy 0 de {tope} pedidos" if tope else "en esta sesión 0 pedidos"
+    assert f"IA de respaldo (Puter): lista · si Gemini no puede · {cuenta}, 0 con respuesta" in r["estado"]
+    assert ("IA de respaldo (Puter): en pausa (saldo de Puter agotado, reintento en 10 min) · "
+            f"si Gemini no puede · {cuenta}, 0 con respuesta") in r["estado_cuota"]
+    assert "DEGRADADO (saldo de Puter agotado · pausa de 10 min)" in r["estado_cuota"]
+    assert "detalle viejo" not in r["estado_cuota"]
+    assert r["sin_app"]                                   # la app se fue → EN ESPERA otra vez
+
+
+def test_respaldo_puter_off_segun_configuracion(settings_prueba: Settings,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    fijados = _espiar_set_respaldo(monkeypatch)
+    casos = [
+        (settings_prueba.con(conectoma_fuente="stub"), "modo offline", True),
+        (_ajustes_puter(settings_prueba, offline=False, voz_habilitada=False, puter_habilitado=False),
+         "deshabilitado (RAMS_PUTER=0)", False),
+        (_ajustes_puter(settings_prueba, offline=False, voz_habilitada=False, escritorio_habilitado=False),
+         "sin /escritorio (RAMS_ESCRITORIO=0)", False),
+        (_ajustes_puter(settings_prueba, offline=False, voz_habilitada=False, puter_max_llamadas_dia=0),
+         "tope diario 0 (PUTER_MAX_CALLS_DAY=0)", False),
+    ]
+
+    async def principal(ajustes: Settings, imprimir: bool) -> tuple[DiagnosticoModulo, Any, Any, str]:
+        orq, salida = _orquestador(ajustes)
+        try:
+            diags = {d.clave: d for d in await orq.iniciar(lanzar_tareas=False, imprimir_arranque=imprimir)}
+            enlace = getattr(orq.hud, "escritorio", None) if orq.hud is not None else None
+            return diags["puter"], orq.puter, enlace, salida.getvalue()
+        finally:
+            await orq.apagar()
+
+    for ajustes, detalle, imprimir in casos:
+        diag, puter, enlace, texto = asyncio.run(principal(ajustes, imprimir))
+        assert diag.estado == EstadoModulo.OFF and diag.detalle == detalle, detalle
+        assert puter is None and (enlace is None or enlace.puter is None), detalle
+        if imprimir:      # una línea propia en la secuencia de arranque
+            assert "Respaldo Puter (Amadeus Desktop)" in texto and "OFF (modo offline)" in texto
+    assert fijados == []
+
+
+def test_respaldo_puter_sin_soporte_en_broca(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    import lobes.broca_llm as broca_mod
+
+    monkeypatch.delattr(broca_mod.BrocaLLM, "set_respaldo", raising=False)
+    ajustes = settings_prueba.con(offline=False, voz_habilitada=False)
+
+    async def principal() -> tuple[DiagnosticoModulo, Any, Any]:
+        orq, _ = _orquestador(ajustes)
+        try:
+            diags = {d.clave: d for d in await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)}
+            return diags["puter"], orq.puter, orq.hud.escritorio
+        finally:
+            await orq.apagar()
+
+    diag, puter, enlace = asyncio.run(principal())
+    assert diag.estado == EstadoModulo.OFF and diag.detalle == "Broca sin respaldo"
+    assert puter is None and enlace is not None and enlace.puter is None   # no queda nada vinculado
+
+
+def test_respaldo_puter_broca_lo_rechaza(settings_prueba: Settings) -> None:
+    """``set_respaldo`` que lanza: DEGRADADO, el respaldo se desvincula y nada se cae."""
+    from interface.escritorio_link import EnlaceEscritorio
+
+    orq, _ = _orquestador(settings_prueba.con(offline=False))
+    enlace = EnlaceEscritorio(orq.settings, orq.bus, evitar_token="x")
+
+    def falla(_proveedor: Any) -> None:
+        raise RuntimeError("no")
+
+    orq.hud = SimpleNamespace(escritorio=enlace)
+    orq.broca = SimpleNamespace(set_respaldo=falla)
+    orq._configurar_respaldo_puter()
+    diag = orq._diag_ausentes["puter"]
+    assert diag.estado == EstadoModulo.DEGRADADO and diag.detalle == "Broca rechazó el respaldo"
+    assert orq.puter is None and enlace.puter is None
+
+
+def test_texto_estado_puter_segun_broca_y_la_app(settings_prueba: Settings) -> None:
+    """Línea de ``/estado``: lista / en espera / tope diario / en pausa, con los contadores del día
+    de Broca (o los de la sesión del respaldo si Broca no los da) y nunca lanza."""
+    orq, _ = _orquestador(_ajustes_puter(settings_prueba, offline=False, puter_max_llamadas_dia=5,
+                                         puter_primero=True))
+    puter = SimpleNamespace(disponible=True, estadisticas=lambda: {"pedidos": 1, "respuestas": 1})
+    orq.puter = puter
+    base = "IA de respaldo (Puter): "
+    orq.broca = SimpleNamespace(respaldo_disponible=True,
+                                llamadas_hoy=lambda: {"gemini": 9, "respaldo": 3, "respaldo_ok": 2})
+    assert orq._texto_estado_puter() == base + "lista · antes que Gemini · hoy 3 de 5 pedidos, 2 con respuesta"
+    orq.broca = SimpleNamespace(respaldo_disponible=False,
+                                llamadas_hoy=lambda: {"gemini": 0, "respaldo": 5, "respaldo_ok": 4})
+    assert orq._texto_estado_puter() == (base + "tope diario alcanzado · antes que Gemini · "
+                                         "hoy 5 de 5 pedidos, 4 con respuesta")
+    orq.broca = SimpleNamespace(respaldo_disponible=False, llamadas_hoy=lambda: {"respaldo": 2, "respaldo_ok": 0})
+    assert orq._texto_estado_puter() == base + "en pausa · antes que Gemini · hoy 2 de 5 pedidos, 0 con respuesta"
+    puter.disponible = False
+    assert orq._texto_estado_puter().startswith(base + "en espera · antes que Gemini · hoy 2 de 5")
+    # Saldo de Puter agotado con la app conectada y con sesión: «en pausa» con la cuenta atrás de
+    # ahora (no «en espera», que es sin app o sin sesión).
+    puter.estado = lambda: {"conectado": True, "listo": True, "enfriamiento_s": 540.0}
+    assert orq._texto_estado_puter() == (base + "en pausa (saldo de Puter agotado, reintento en 9 min) · "
+                                         "antes que Gemini · hoy 2 de 5 pedidos, 0 con respuesta")
+    puter.estado = lambda: {"conectado": True, "listo": True, "enfriamiento_s": 20.5}
+    assert "(saldo de Puter agotado, reintento en 1 min)" in orq._texto_estado_puter()
+    puter.estado = lambda: {"conectado": False, "listo": False, "enfriamiento_s": 540.0}
+    assert orq._texto_estado_puter().startswith(base + "en espera · ")
+    puter.estado = lambda: {"conectado": True, "listo": True, "enfriamiento_s": 0.0}
+    assert orq._texto_estado_puter().startswith(base + "en espera · ")
+    del puter.estado
+    # Broca sin esa API: manda la app y los contadores de la sesión del respaldo.
+    orq.broca = SimpleNamespace()
+    puter.disponible = True
+    assert orq._texto_estado_puter() == (base + "lista · antes que Gemini · en esta sesión 1 pedido, "
+                                         "1 con respuesta")
+    orq.puter = SimpleNamespace()                      # roto: no lanza
+    assert orq._texto_estado_puter() == base + "sin datos · antes que Gemini"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: apps del menú Inicio, órdenes desde Telegram, fotos y notas de voz
+# ---------------------------------------------------------------------------
+# Todo con dobles: ni la API de Telegram, ni la cámara, ni capturas reales, ni apps reales.
+
+
+class _AppFalsa:
+    """Imita ``lobes.control_pc.AppLocal`` (solo lo que main lee)."""
+
+    def __init__(self, clave: str, nombre: str) -> None:
+        self.clave, self.nombre = clave, nombre
+
+
+class ControlPCConApps(ControlPCFalso):
+    """``ControlPC`` falso con índice del menú Inicio, teclas multimedia y título de la ventana activa."""
+
+    def __init__(self, apps: dict[str, tuple[str, str, str]] | None = None) -> None:
+        super().__init__(None)
+        # nombre normalizado → (clave, nombre visible, nivel)
+        self.apps = apps if apps is not None else {"steam": ("steam", "Steam", "descubierta")}
+        self.aprobadas: list[str] = []
+        self.titulo: str | None = "Documento - Bloc de notas"
+
+    async def resolver_app_local(self, nombre: str) -> Any:
+        self.llamadas.append(("resolver_app_local", nombre))
+        consulta = nombre.strip().lower()
+        for norm, (clave, visible, nivel) in self.apps.items():
+            if consulta in (norm, clave):
+                return SimpleNamespace(estado="unica", app=_AppFalsa(clave, visible), opciones=(), nivel=nivel,
+                                       motivo="")
+        if consulta.startswith("st"):
+            return SimpleNamespace(estado="ninguna", app=None, opciones=("Steam",), nivel="", motivo="")
+        return SimpleNamespace(estado="ninguna", app=None, opciones=(), nivel="", motivo="")
+
+    def nivel_app_local(self, clave: str) -> tuple[str, str] | None:
+        for clave_app, visible, nivel in self.apps.values():
+            if clave_app == clave:
+                return ("permitida" if clave in self.aprobadas and nivel != "sensible" else nivel), visible
+        return None
+
+    async def aprobar_app_local(self, clave: str) -> bool:
+        self.llamadas.append(("aprobar_app_local", clave))
+        self.aprobadas.append(clave)
+        return True
+
+    async def lanzar_app_local(self, clave: str) -> _ResultadoControl:
+        self.llamadas.append(("lanzar_app_local", clave))
+        visible = next((v for c, v, _n in self.apps.values() if c == clave), clave)
+        return _ResultadoControl(True, f"Abrí {visible}.", {"app": clave})
+
+    async def media(self, orden: str) -> _ResultadoControl:
+        self.llamadas.append(("media", orden))
+        return _ResultadoControl(True, "Pausé o reanudé la música.", {"orden": orden})
+
+    def titulo_activa(self) -> str | None:
+        return self.titulo
+
+
+def _con_apps(orq: Any, monkeypatch: pytest.MonkeyPatch, **kw: Any) -> ControlPCConApps:
+    """Sustituye el ControlPC del orquestador (la compuerta lee su índice en cada llamada)."""
+    control = ControlPCConApps(**kw)
+    orq.control_pc = control
+    monkeypatch.setattr(orq, "_apps_locales_activas", lambda: True)
+    return control
+
+
+def _sin_aura(monkeypatch: pytest.MonkeyPatch, orq: Any) -> list[Any]:
+    llamadas: list[Any] = []
+
+    async def prohibido(accion: Any) -> Any:
+        llamadas.append(accion)
+        raise AssertionError("aura.ejecutar no debe llamarse")
+
+    if orq.aura is not None:
+        monkeypatch.setattr(orq.aura, "ejecutar", prohibido)
+    return llamadas
+
+
+def _auditoria(orq: Any) -> list[dict[str, Any]]:
+    texto = _leer_seguro(orq._ruta_datos("acciones_pc.jsonl"))
+    return [json.loads(linea) for linea in texto.splitlines() if linea.strip()]
+
+
+def _respuestas(entregas: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Solo las respuestas de los turnos (sin el saludo ni la despedida del apagado)."""
+    return [e for e in entregas if e.get("origen") == "respuesta"]
+
+
+def _con_telegram(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Telegram «configurado» sin red: las salidas reales se espían en cada test."""
+    monkeypatch.setattr(Settings, "tiene_telegram", property(lambda _s: True))
+
+
+class CapturasFalsas:
+    """Módulo ``lobes.capturas`` falso: registra cada pedido y devuelve un JPEG en memoria."""
+
+    def __init__(self) -> None:
+        self.pedidos: list[dict[str, Any]] = []
+        self.buses: list[Any] = []          # bus de cada pedido (indicador vision.camara, §C2.13)
+
+    async def capturar_jpeg(self, fuente: str, *, settings: Any, vision: Any = None,
+                            ventana_titulo: str | None = None, calidad: int = 85, max_lado: int = 1600,
+                            bus: Any = None) -> Any:
+        from core.config import titulo_sensible
+
+        self.pedidos.append({"fuente": fuente, "vision": vision, "ventana_titulo": ventana_titulo})
+        self.buses.append(bus)
+        if fuente == "pantalla" and titulo_sensible(ventana_titulo):
+            return SimpleNamespace(ok=False, jpeg=None, ancho=0, alto=0, fuente=fuente, motivo="ventana_sensible")
+        return SimpleNamespace(ok=True, jpeg=b"\xff\xd8\xff\xe0jpeg", ancho=640, alto=480, fuente=fuente, motivo=None)
+
+
+@pytest.fixture
+def capturas(monkeypatch: pytest.MonkeyPatch) -> CapturasFalsas:
+    falsas = CapturasFalsas()
+    modulo = types.ModuleType("lobes.capturas")
+    modulo.capturar_jpeg = falsas.capturar_jpeg  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "lobes.capturas", modulo)
+    return falsas
+
+
+def _espiar_telegram(orq: Any, *, foto_ok: bool = True, voz_ok: bool = True) -> dict[str, list[Any]]:
+    envios: dict[str, list[Any]] = {"fotos": [], "voces": []}
+
+    async def enviar_foto_telegram(jpeg: bytes, *, leyenda: str = "") -> bool:
+        envios["fotos"].append((jpeg, leyenda))
+        return foto_ok
+
+    async def enviar_voz_telegram(texto: str, *, tone: str = "calido") -> bool:
+        envios["voces"].append((texto, tone))
+        return voz_ok
+
+    orq.riko.enviar_foto_telegram = enviar_foto_telegram
+    orq.riko.enviar_voz_telegram = enviar_voz_telegram
+    return envios
+
+
+# --- apps del menú Inicio -----------------------------------------------------
+
+
+def test_compuerta_recibe_el_indice_de_apps(settings_prueba: Settings) -> None:
+    async def principal() -> Any:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            orq.control_pc = ControlPCConApps()
+            return orq.permisos.nivel_app("steam"), orq.permisos.nivel_app("otra")
+        finally:
+            await orq.apagar()
+
+    assert asyncio.run(principal()) == (("descubierta", "Steam"), None)
+
+
+def test_app_local_se_confirma_una_vez_y_se_recuerda(settings_prueba: Settings,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            control = _con_apps(orq, monkeypatch)
+            aura = _sin_aura(monkeypatch, orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            tarea = asyncio.create_task(orq.procesar_entrada("asistente abre steam porfavor"))
+            await _esperar_pendiente(orq)
+            pregunta = salida.getvalue()
+            orq.permisos.resolver("s")
+            await asyncio.wait_for(tarea, 5.0)
+            primera = contextos[-1].accion
+            segunda_reply = await orq.procesar_entrada("Kurisu, ¿me abres Steam?")
+            return {"pregunta": pregunta, "primera": primera, "segunda": contextos[-1].accion,
+                    "pendiente": orq.permisos.hay_pendiente(), "llamadas": list(control.llamadas), "aura": aura,
+                    "auditoria": _auditoria(orq), "reply": segunda_reply}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert "⚠ Confirmación requerida: Abrir «Steam»" in r["pregunta"]
+    assert r["primera"].ok is True and "La próxima vez la abro sin preguntarte" in r["primera"].mensaje
+    assert r["primera"].datos["nombre_destino"] == "Steam"
+    assert r["segunda"].ok is True and r["pendiente"] is False
+    tipos = [c[0] for c in r["llamadas"] if c[0] in ("aprobar_app_local", "lanzar_app_local")]
+    assert tipos == ["aprobar_app_local", "lanzar_app_local", "lanzar_app_local"]
+    assert r["aura"] == []
+    registros = [e for e in r["auditoria"] if e["tipo"] == "lanzar_app"]
+    assert [e["resultado"] for e in registros] == ["ok", "ok"] and registros[0]["alias"] == "steam"
+    assert all(e["canal"] == "terminal" for e in registros)
+
+
+def test_app_local_no_encontrada_sugiere_y_no_abre_nada(settings_prueba: Settings,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> tuple[list[ContextoBroca], ControlPCConApps, bool]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            control = _con_apps(orq, monkeypatch)
+            contextos = _espiar_broca(monkeypatch, orq)
+            await orq.procesar_entrada("abre stem")
+            await orq.procesar_entrada("abre el reproductor misterioso")
+            await orq.procesar_entrada("pon visual studio")      # "pon" sin app única: conversación
+            return contextos, control, orq.permisos.hay_pendiente()
+        finally:
+            await orq.apagar()
+
+    contextos, control, pendiente = asyncio.run(principal())
+    sugerencia, nada, charla = (c.accion for c in contextos)
+    assert sugerencia.ok is False and "¿Quisiste decir «Steam»?" in sugerencia.mensaje
+    assert nada.ok is False and "No encuentro «reproductor misterioso» en el menú Inicio" in nada.mensaje
+    assert charla is None
+    assert control.de_tipo("lanzar_app_local") == [] and pendiente is False
+
+
+def test_app_local_tentativa_sin_parecido_es_conversacion(settings_prueba: Settings,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    """"lanza una moneda" / "arranca el carro" no son apps: charla, no «No encuentro…»."""
+    async def principal() -> tuple[list[ContextoBroca], ControlPCConApps, bool]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            control = _con_apps(orq, monkeypatch, apps={"steam": ("steam", "Steam", "permitida")})
+            contextos = _espiar_broca(monkeypatch, orq)
+            for texto in ("lanza una moneda", "arranca el carro", "¿podrías lanzar una moneda?", "abre un archivo",
+                          "lanza stem", "lanza steam", "abre steam y discord"):
+                await orq.procesar_entrada(texto)
+            return contextos, control, orq.permisos.hay_pendiente()
+        finally:
+            await orq.apagar()
+
+    contextos, control, pendiente = asyncio.run(principal())
+    moneda, carro, pregunta, archivo, parecida, steam, dos = (c.accion for c in contextos)
+    assert moneda is None and carro is None and pregunta is None and archivo is None
+    # Con sugerencias sigue ayudando; si la app existe, "lanza" la abre.
+    assert parecida.ok is False and "¿Quisiste decir «Steam»?" in parecida.mensaje
+    assert steam.ok is True and control.de_tipo("lanzar_app_local") == [("lanzar_app_local", "steam")]
+    assert dos.ok is False and "de una en una" in dos.mensaje
+    assert "«abre steam» y luego «abre discord»" in dos.mensaje
+    assert pendiente is False
+
+
+def test_mensaje_de_app_excluida_no_llama_desinstalador_a_la_app() -> None:
+    import main
+
+    mensaje = main.Orquestador._mensaje_app_no_unica("steam", "excluida", (), "es un desinstalador")
+    assert mensaje == "Lo que encuentro como «steam» en el menú Inicio es un desinstalador: eso no lo abro."
+
+
+def test_app_local_sin_indice_lo_dice(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> list[ContextoBroca]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            monkeypatch.setattr(orq, "_apps_locales_activas", lambda: True)   # ControlPCFalso sin índice
+            contextos = _espiar_broca(monkeypatch, orq)
+            await orq.procesar_entrada("abre steam")
+            return contextos
+        finally:
+            await orq.apagar()
+
+    accion = asyncio.run(principal())[-1].accion
+    assert accion.ok is False and "menú Inicio no está disponible" in accion.mensaje
+
+
+def test_media_en_windows_va_por_controlpc(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> tuple[ControlPCConApps, list[Any], list[ContextoBroca]]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            control = _con_apps(orq, monkeypatch)
+            monkeypatch.setattr(orq, "_media_en_control_pc", lambda: True)
+            aura = _sin_aura(monkeypatch, orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("porfa pausa la música")
+            await orq.procesar_entrada("siguiente canción", canal="telegram")
+            return control, aura, contextos
+        finally:
+            await orq.apagar()
+
+    control, aura, contextos = asyncio.run(principal())
+    assert control.de_tipo("media") == [("media", "play_pause"), ("media", "siguiente")]
+    assert aura == [] and all(c.accion.ok for c in contextos)
+
+
+# --- Telegram: acciones de bajo riesgo ------------------------------------------
+
+
+def test_telegram_abre_youtube_y_lo_anuncia_en_el_pc(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                                     modulos_v02_falsos: list[ControlPCFalso]) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            eventos = _escuchar(orq, "escritorio.sistema", "pc.accion")
+            contextos = _espiar_broca(monkeypatch, orq)
+            entregas = _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("Puedes abrir YouTube en el PC pls", canal="telegram")
+            await _esperar(lambda: _de(eventos, "pc.accion") and _de(eventos, "escritorio.sistema"))
+            return {"salida": salida.getvalue(), "eventos": eventos, "contexto": contextos[-1], "entregas": entregas,
+                    "auditoria": _auditoria(orq), "control": orq.control_pc}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["control"].de_tipo("abrir_destino") == [("abrir_destino", "youtube")]
+    assert "📱 Desde Telegram: Abierto." in r["salida"]
+    assert any("📱 Desde Telegram" in d["texto"] for d in _de(r["eventos"], "escritorio.sistema"))
+    assert _de(r["eventos"], "pc.accion")[-1]["tipo"] == "abrir_destino"
+    assert r["auditoria"][-1]["canal"] == "telegram" and r["auditoria"][-1]["origen"] == "usuario"
+    accion = r["contexto"].accion
+    assert accion.ok is True and accion.datos["nombre_destino"] == "YouTube"
+    assert r["contexto"].modo_salida == "telegram" and _respuestas(r["entregas"])[-1]["canal"] == "telegram"
+
+
+def test_telegram_app_no_aprobada_no_pregunta_y_la_aprobada_se_abre(settings_prueba: Settings,
+                                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            control = _con_apps(orq, monkeypatch, apps={"steam": ("steam", "Steam", "descubierta"),
+                                                       "discord": ("discord_app", "Discord", "permitida")})
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("abre steam", canal="telegram")
+            pendiente = orq.permisos.hay_pendiente()
+            await orq.procesar_entrada("asistente abre discord_app pls", canal="telegram")
+            return {"contextos": contextos, "pendiente": pendiente, "control": control, "salida": salida.getvalue(),
+                    "auditoria": _auditoria(orq)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    steam, discord = (c.accion for c in r["contextos"])
+    assert r["pendiente"] is False
+    assert steam.ok is False and "aún no está aprobada" in steam.mensaje
+    assert discord.ok is True
+    assert r["control"].de_tipo("lanzar_app_local") == [("lanzar_app_local", "discord_app")]
+    assert r["control"].de_tipo("aprobar_app_local") == []
+    assert "📱 Desde Telegram pidieron «abrir Steam»" in r["salida"] and "📱 Desde Telegram: Abrí Discord." in r["salida"]
+    assert [e["resultado"] for e in r["auditoria"] if e["tipo"] == "lanzar_app"] == ["denegada", "ok"]
+
+
+def test_telegram_lo_demas_sigue_siendo_solo_local(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                                   modulos_v02_falsos: list[ControlPCFalso]) -> None:
+    async def principal() -> tuple[list[ContextoBroca], Any]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            for texto in ("escribe ahí: hola", "cierra la ventana", "escríbele a mamá por whatsapp: hola"):
+                await orq.procesar_entrada(texto, canal="telegram")
+            return contextos, orq.control_pc
+        finally:
+            await orq.apagar()
+
+    contextos, control = asyncio.run(principal())
+    assert [c.accion.mensaje for c in contextos] == [MENSAJE_SOLO_LOCAL] * 3
+    assert [c for c in control.llamadas if c[0] != "cerrar"] == []
+
+
+# --- fotos y capturas ------------------------------------------------------------
+
+
+def test_foto_por_telegram_desactivada_explica_como_activarla(settings_prueba: Settings,
+                                                             monkeypatch: pytest.MonkeyPatch,
+                                                             capturas: CapturasFalsas) -> None:
+    _con_telegram(monkeypatch)
+
+    async def principal() -> tuple[ContextoBroca, dict[str, list[Any]]]:
+        orq, _ = _orquestador(settings_prueba.con(telegram_fotos=False))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándame una foto", canal="telegram")
+            return contextos[-1], envios
+        finally:
+            await orq.apagar()
+
+    contexto, envios = asyncio.run(principal())
+    accion = contexto.accion
+    assert accion.ok is False and accion.accion_tipo == "enviar_foto"
+    assert accion.datos == {"fuente": "camara", "motivo": "fotos_desactivadas"}
+    assert "RAMS_TELEGRAM_FOTOS=1" in accion.mensaje
+    assert capturas.pedidos == [] and envios["fotos"] == []
+
+
+def test_foto_por_telegram_se_envia_y_se_avisa_en_el_pc(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                                        capturas: CapturasFalsas) -> None:
+    import main
+
+    _con_telegram(monkeypatch)
+
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(settings_prueba.con(telegram_fotos=True))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            monkeypatch.setattr(orq, "_camara_bloqueada", lambda: None)     # cámara habilitada (falsa)
+            envios = _espiar_telegram(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("¿cómo me veo?", canal="telegram")
+            return {"contexto": contextos[-1], "envios": envios, "salida": salida.getvalue(),
+                    "auditoria": _auditoria(orq), "fotos": orq.permisos.fotos_ultima_hora(), "bus": orq.bus}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert capturas.pedidos == [{"fuente": "camara", "vision": None, "ventana_titulo": None}]
+    # El bus va a capturas: si abre la cámara un instante, publica vision.camara (indicador §C2.13).
+    assert capturas.buses == [r["bus"]]
+    (jpeg, leyenda), = r["envios"]["fotos"]
+    assert jpeg.startswith(b"\xff\xd8") and leyenda in main.LEYENDAS_FOTO["camara"]
+    assert "📸 Envié una foto de la cámara a tu Telegram (la pediste desde Telegram)." in r["salida"]
+    accion = r["contexto"].accion
+    assert accion.ok is True and accion.accion_tipo == "enviar_foto" and accion.datos == {"fuente": "camara"}
+    assert r["auditoria"][-1]["tipo"] == "enviar_foto" and r["auditoria"][-1]["canal"] == "telegram"
+    assert r["auditoria"][-1]["alias"] == "camara" and r["fotos"] == 1
+    # La imagen nunca toca el disco: en data/ solo están los archivos de siempre.
+    assert not list(Path(settings_prueba.data_dir).rglob("*.jp*g"))
+
+
+def test_captura_con_ventana_privada_no_se_envia(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                                 capturas: CapturasFalsas) -> None:
+    _con_telegram(monkeypatch)
+
+    async def principal() -> tuple[ContextoBroca, dict[str, list[Any]]]:
+        orq, _ = _orquestador(settings_prueba.con(telegram_fotos=True))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            control = _con_apps(orq, monkeypatch)
+            control.titulo = "Bancolombia - Sucursal Virtual Personas"
+            envios = _espiar_telegram(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("¿qué hay en mi pantalla?", canal="telegram")
+            return contextos[-1], envios
+        finally:
+            await orq.apagar()
+
+    contexto, envios = asyncio.run(principal())
+    assert capturas.pedidos[0]["ventana_titulo"] == "Bancolombia - Sucursal Virtual Personas"
+    assert contexto.accion.ok is False and contexto.accion.datos["motivo"] == "ventana_sensible"
+    assert envios["fotos"] == []
+
+
+def test_captura_pedida_en_el_pc_va_al_telegram(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                                capturas: CapturasFalsas) -> None:
+    _con_telegram(monkeypatch)
+
+    async def principal() -> tuple[ContextoBroca, dict[str, list[Any]], str]:
+        orq, salida = _orquestador(settings_prueba)          # RAMS_TELEGRAM_FOTOS=0 no aplica en local
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            _con_apps(orq, monkeypatch)
+            envios = _espiar_telegram(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            await orq.procesar_entrada("kurisu, mándame una captura de pantalla")
+            return contextos[-1], envios, salida.getvalue()
+        finally:
+            await orq.apagar()
+
+    contexto, envios, texto = asyncio.run(principal())
+    assert capturas.pedidos[0]["fuente"] == "pantalla"
+    assert capturas.pedidos[0]["ventana_titulo"] == "Documento - Bloc de notas"
+    assert len(envios["fotos"]) == 1 and contexto.accion.ok is True
+    assert "📸 Envié una captura de la pantalla a tu Telegram." in texto and "(la pediste" not in texto
+
+
+def test_foto_rechazos_sin_telegram_pausa_o_sin_backend(settings_prueba: Settings,
+                                                        monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> list[Any]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq)
+            motivos = [(await orq._enviar_foto("camara", "terminal")).datos["motivo"]]   # sin Telegram
+            monkeypatch.setattr(Settings, "tiene_telegram", property(lambda _s: True))
+            vision = VisionFalsa()
+            vision.estado_dict["camara"] = "pausada"
+            orq.vision = vision
+            motivos.append((await orq._enviar_foto("camara", "terminal")).datos["motivo"])
+            orq.vision = None
+            motivos.append((await orq._enviar_foto("camara", "terminal")).datos["motivo"])   # RAMS_CAMERA=0
+            monkeypatch.setitem(sys.modules, "lobes.capturas", None)        # módulo ausente
+            motivos.append((await orq._enviar_foto("pantalla", "terminal")).datos["motivo"])
+            motivos.append((await orq._enviar_foto("microfono", "terminal")).datos["motivo"])
+            return [motivos, envios]
+        finally:
+            await orq.apagar()
+
+    motivos, envios = asyncio.run(principal())
+    assert motivos == ["sin_telegram", "pausada", "deshabilitada", "sin_backend", "error"]
+    assert envios["fotos"] == []
+
+
+class VisionConPausa(VisionFalsa):
+    """Visión con la cámara "pausada": por el usuario o por la autopausa (ausente, bloqueada…)."""
+
+    def __init__(self, del_usuario: bool | None) -> None:
+        super().__init__()
+        self.estado_dict["camara"] = "pausada"
+        self.del_usuario = del_usuario
+
+    def pausada_por_usuario(self) -> bool:
+        if self.del_usuario is None:
+            raise RuntimeError("visión rota")
+        return self.del_usuario
+
+
+def test_foto_por_telegram_con_autopausa_si_se_envia(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                                     capturas: CapturasFalsas) -> None:
+    """La autopausa (usuario ausente: justo cuando pide la foto por Telegram) no es "no me mires"."""
+    _con_telegram(monkeypatch)
+
+    async def principal() -> dict[str, Any]:
+        # Sin cámara real: lobes.capturas es falso y aura no hace vistazos aquí.
+        orq, _ = _orquestador(settings_prueba.con(telegram_fotos=True, camara_habilitada=True))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq)
+            resultados: dict[str, Any] = {}
+            for clave, del_usuario in (("autopausa", False), ("usuario", True), ("rota", None)):
+                orq.vision = VisionConPausa(del_usuario)
+                resultados[clave] = await orq._enviar_foto("camara", "telegram")
+            orq.vision = None
+            return {"resultados": resultados, "envios": envios}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    autopausa, usuario, rota = (r["resultados"][k] for k in ("autopausa", "usuario", "rota"))
+    assert autopausa.ok is True and autopausa.datos == {"fuente": "camara"}
+    assert [p["fuente"] for p in capturas.pedidos] == ["camara"]          # solo la de la autopausa
+    assert len(r["envios"]["fotos"]) == 1
+    assert usuario.ok is False and usuario.datos["motivo"] == "pausada"
+    assert rota.ok is False and rota.datos["motivo"] == "pausada"           # ante la duda, privacidad
+
+
+def test_foto_que_telegram_no_acepta(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch,
+                                     capturas: CapturasFalsas) -> None:
+    _con_telegram(monkeypatch)
+
+    async def principal() -> tuple[Any, str]:
+        orq, salida = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            monkeypatch.setattr(orq, "_camara_bloqueada", lambda: None)
+            _espiar_telegram(orq, foto_ok=False)
+            return await orq._enviar_foto("camara", "terminal"), salida.getvalue()
+        finally:
+            await orq.apagar()
+
+    resultado, texto = asyncio.run(principal())
+    assert resultado.ok is False and resultado.datos["motivo"] == "envio" and "📸" not in texto
+
+
+# --- notas de voz ------------------------------------------------------------------
+
+
+def test_nota_de_voz_se_responde_con_voz(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    import main
+
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(settings_prueba)      # RAMS_TELEGRAM_AUDIO=auto (defecto)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq)
+            entregas = _espiar_decir(monkeypatch, orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            pasos = []
+            for texto, voz in (("hola", True), ("hola", False), ("cuéntame un chiste por audio", False),
+                               ("mándame un audio", False)):
+                await orq.procesar_entrada(texto, canal="telegram", voz=voz)
+                pasos.append((len(envios["voces"]), len(_respuestas(entregas))))
+            return {"pasos": pasos, "envios": envios, "contextos": contextos, "salida": salida.getvalue()}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["pasos"] == [(1, 0), (1, 1), (2, 1), (3, 1)]
+    texto, tono = r["envios"]["voces"][0]
+    assert texto and tono in ("sarcastico", "analitico", "calido", "nervioso", "serio", "jugueton", "somnoliento")
+    assert "[→ Telegram 🎤]" in r["salida"]
+    assert main.INSTRUCCION_AUDIO in (r["contextos"][-1].instruccion_extra or "")
+
+
+@pytest.mark.parametrize("modo, esperado", [("off", 0), ("siempre", 2)])
+def test_modo_de_audio_en_telegram(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch, modo: str,
+                                   esperado: int) -> None:
+    async def principal() -> tuple[int, int]:
+        orq, _ = _orquestador(settings_prueba.con(telegram_audio=modo))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq)
+            entregas = _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("hola", canal="telegram")
+            await orq.procesar_entrada("mándame un audio", canal="telegram", voz=True)
+            return len(envios["voces"]), len(_respuestas(entregas))
+        finally:
+            await orq.apagar()
+
+    voces, textos = asyncio.run(principal())
+    assert voces == esperado and textos == 2 - esperado
+
+
+def test_nota_de_voz_fallida_responde_por_texto(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> tuple[dict[str, list[Any]], list[dict[str, Any]]]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq, voz_ok=False)
+            entregas = _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("hola", canal="telegram", voz=True)
+            return envios, entregas
+        finally:
+            await orq.apagar()
+
+    envios, entregas = asyncio.run(principal())
+    respuestas = _respuestas(entregas)
+    assert len(envios["voces"]) == 1 and len(respuestas) == 1 and respuestas[0]["canal"] == "telegram"
+
+
+def test_audio_al_telegram_pedido_desde_el_pc(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    _con_telegram(monkeypatch)
+
+    async def principal() -> tuple[dict[str, list[Any]], list[dict[str, Any]]]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            envios = _espiar_telegram(orq)
+            entregas = _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándame un audio al telegram")
+            await orq.procesar_entrada("hola")          # un turno normal nunca manda audio
+            return envios, entregas
+        finally:
+            await orq.apagar()
+
+    envios, entregas = asyncio.run(principal())
+    assert len(envios["voces"]) == 1 and len(_respuestas(entregas)) == 2
+
+
+def test_manejar_telegram_pasa_la_marca_de_voz(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    import inspect
+
+    async def principal() -> list[tuple[str, str, dict[str, Any]]]:
+        orq, _ = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            vistos: list[tuple[str, str, dict[str, Any]]] = []
+
+            async def espia(texto: str, canal: str = "terminal", **kw: Any) -> None:
+                vistos.append((texto, canal, kw))
+
+            monkeypatch.setattr(orq, "procesar_entrada", espia)
+            await orq._manejar_telegram("hola por voz", voz=True)
+            await orq._manejar_telegram("hola por texto")
+            await _esperar(lambda: len(vistos) == 2)
+            return vistos
+        finally:
+            await orq.apagar()
+
+    import main
+
+    parametro = inspect.signature(main.Orquestador._manejar_telegram).parameters["voz"]
+    assert parametro.kind is inspect.Parameter.KEYWORD_ONLY and parametro.default is False
+    vistos = asyncio.run(principal())
+    assert ("hola por voz", "telegram", {"voz": True}) in vistos
+    assert ("hola por texto", "telegram", {}) in vistos
+
+
+def test_transcriptor_de_telegram_segun_ajustes(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    import main
+
+    async def transcribir(audio: bytes, mime: str) -> str | None:
+        return "hola"
+
+    fijados: list[Any] = []
+    monkeypatch.setattr(Settings, "tiene_gemini", property(lambda _s: True))
+    for transcribe, esperado in ((True, transcribir), (False, None)):
+        orq = main.Orquestador(settings_prueba.con(telegram_transcribir=transcribe))
+        orq.riko = SimpleNamespace(set_transcriptor=fijados.append)
+        orq.broca = SimpleNamespace(transcribir_audio=transcribir)
+        orq._conectar_transcriptor()
+        assert fijados[-1] is esperado
+    monkeypatch.setattr(Settings, "tiene_gemini", property(lambda _s: False))
+    orq = main.Orquestador(settings_prueba)
+    orq.riko = SimpleNamespace(set_transcriptor=fijados.append)
+    orq.broca = SimpleNamespace(transcribir_audio=transcribir)
+    orq._conectar_transcriptor()
+    assert fijados[-1] is None
+    # Una mensajería sin set_transcriptor (versión anterior) no rompe nada.
+    orq.riko = SimpleNamespace()
+    orq._conectar_transcriptor()
+
+
+# ---------------------------------------------------------------------------
+# v0.2.2: Google, correo, Drive y taller (docs/V022_CORREO_DRIVE_SCRIPTS.md §14.8)
+# ---------------------------------------------------------------------------
+# Dobles con las firmas de §6-§9 (CuentaGoogle, Correo, Drive, TallerScripts): sin red, sin Gemini y sin
+# subprocesos. Las huellas usan contracts.huella_contenido, como los módulos reales.
+
+import dataclasses  # noqa: E402
+import hashlib  # noqa: E402
+import uuid  # noqa: E402
+
+from core.config import parece_secreto  # noqa: E402
+from core.contracts import MAX_SALIDA_TARJETA, huella_contenido, largo_utf16  # noqa: E402
+
+CONTACTOS_FALSOS = {"mamá": "mama@x.com", "mama": "mama@x.com", "mi jefe": "jefe@x.com"}
+
+
+@dataclasses.dataclass(frozen=True)
+class EnvioFalso:
+    ok: bool
+    codigo: str
+    mensaje: str
+    gmail_id: str | None = None
+    n_destinatarios: int = 0
+    n_adjuntos: int = 0
+    bytes: int = 0
+
+    @property
+    def pudo_salir(self) -> bool:
+        return self.codigo in ("enviado", "red_ambigua", "error")
+
+
+@dataclasses.dataclass(frozen=True)
+class BorradorFalso:
+    id: str
+    version: int
+    para: tuple[str, ...]
+    cc: tuple[str, ...]
+    cco: tuple[str, ...]
+    asunto: str
+    cuerpo: str
+    adjuntos: tuple[Any, ...]
+    problemas: tuple[str, ...]
+    avisos: tuple[str, ...]
+    canal_origen: str
+    creado: float
+    caduca: float
+
+    @property
+    def n_destinatarios(self) -> int:
+        return len(self.para) + len(self.cc) + len(self.cco)
+
+    @property
+    def listo(self) -> bool:
+        return not self.problemas and self.n_destinatarios > 0
+
+    def huella(self) -> str:
+        return huella_contenido({"clase": "correo", "para": self.para, "cc": self.cc, "cco": self.cco,
+                                 "asunto": self.asunto, "cuerpo": self.cuerpo, "adjuntos": []})
+
+    def vista(self) -> dict[str, Any]:
+        return {"para": list(self.para), "cc": list(self.cc), "cco": list(self.cco), "asunto": self.asunto,
+                "cuerpo": self.cuerpo, "adjuntos": [], "problemas": list(self.problemas),
+                "avisos": list(self.avisos), "listo": self.listo}
+
+
+class CuentaGoogleFalsa:
+    def __init__(self, settings: Any, bus: Any = None, *, cliente: Any = None) -> None:
+        self.settings, self.bus = settings, bus
+        self.conectado = True
+        self.conectando = False
+        self.motivo = ""
+        self.liberar: asyncio.Event | None = None
+        self.llamadas: list[str] = []
+        self.cliente_en_disco = False
+
+    async def iniciar(self) -> DiagnosticoModulo:
+        return DiagnosticoModulo("google", "Cuenta de Google", EstadoModulo.OK, "falsa")
+
+    async def releer_cliente(self) -> str:
+        self.llamadas.append("releer_cliente")
+        if self.motivo in ("sin_cliente", "cliente_invalido") and self.cliente_en_disco:
+            self.motivo = "sin_conectar"
+        return self.motivo
+
+    def estado(self) -> Any:
+        datos = {"conectado": self.conectado, "correo": self.conectado, "drive_leer": self.conectado,
+                 "drive_escribir": self.conectado, "drive_completo": False,
+                 "cuenta": "ju***@gmail.com" if self.conectado else None, "motivo": self.motivo}
+        return SimpleNamespace(a_dict=lambda: dict(datos))
+
+    @property
+    def disponible(self) -> bool:
+        return self.conectado
+
+    async def conectar(self, *, timeout_s: float = 300.0, mostrar_url: Any = None) -> Any:
+        self.llamadas.append("conectar")
+        self.conectando = True
+        if mostrar_url is not None:
+            mostrar_url("https://accounts.google.com/o/oauth2/v2/auth?state=URL_SOLO_CONSOLA")
+        if self.liberar is not None:
+            await self.liberar.wait()
+        self.conectando = False
+        self.conectado = True
+        return SimpleNamespace(ok=True, codigo="conectado", mensaje="Cuenta de Google conectada: Gmail (solo enviar).",
+                               concedidos=("https://www.googleapis.com/auth/gmail.send",
+                                           "https://www.googleapis.com/auth/drive.file"), faltan=())
+
+    async def desconectar(self) -> Any:
+        self.llamadas.append("desconectar")
+        self.conectado = False
+        return SimpleNamespace(ok=True, codigo="desconectado", mensaje="Listo: desconecté tu cuenta de Google.")
+
+    async def cerrar(self) -> None:
+        self.llamadas.append("cerrar")
+
+
+class CorreoFalso:
+    def __init__(self, settings: Any, cuenta: Any = None, bus: Any = None) -> None:
+        self.settings, self.cuenta = settings, cuenta
+        self.preparados: list[dict[str, Any]] = []
+        self.ediciones: list[tuple[str, dict[str, Any]]] = []
+        self.envios: list[tuple[str, str]] = []
+        self.descartados: list[str] = []
+        self.resultados: list[Any] = []
+        self._borradores: dict[str, BorradorFalso] = {}
+
+    async def iniciar(self) -> DiagnosticoModulo:
+        return DiagnosticoModulo("correo", "Correo (Gmail)", EstadoModulo.OK, "falso")
+
+    @property
+    def disponible(self) -> bool:
+        return bool(getattr(self.cuenta, "disponible", False))
+
+    async def preparar(self, *, para: Any, cc: Any = (), cco: Any = (), asunto: str | None, cuerpo: str | None,
+                       adjuntos: Any = (), canal_origen: str, ttl_s: float, avisos: Any = ()) -> BorradorFalso:
+        self.preparados.append({"para": list(para), "cc": list(cc), "cco": list(cco), "asunto": asunto,
+                                "cuerpo": cuerpo, "adjuntos": list(adjuntos), "canal_origen": canal_origen,
+                                "ttl_s": ttl_s, "avisos": list(avisos)})
+        texto = cuerpo or ""
+        problemas = []
+        for n, linea in enumerate(texto.split("\n"), start=1):          # anti-secretos sobre el texto CRUDO
+            if parece_secreto(linea, self.settings.secretos()):
+                problemas.append(f"la línea {n} parece llevar una contraseña, un código o una clave")
+                break
+        b = BorradorFalso(uuid.uuid4().hex[:8], 1, tuple(CONTACTOS_FALSOS.get(p, p) for p in para), tuple(cc),
+                          tuple(cco), asunto or texto[:60] or "(sin asunto)", texto, (), tuple(problemas),
+                          tuple(avisos), canal_origen, time.time(), time.time() + ttl_s)
+        self._borradores = {b.id: b}
+        return b
+
+    async def editar(self, id: str, campos: Any) -> BorradorFalso | None:  # noqa: A002
+        self.ediciones.append((id, dict(campos)))
+        b = self._borradores.get(id)
+        if b is None:
+            return None
+        nuevo = dataclasses.replace(b, version=b.version + 1, cuerpo=campos.get("cuerpo", b.cuerpo),
+                                    asunto=campos.get("asunto", b.asunto), problemas=())
+        self._borradores[id] = nuevo
+        return nuevo
+
+    def borrador(self, id: str) -> BorradorFalso | None:  # noqa: A002
+        return self._borradores.get(id)
+
+    def descartar(self, id: str) -> bool:  # noqa: A002
+        self.descartados.append(id)
+        return self._borradores.pop(id, None) is not None
+
+    async def enviar(self, id: str, huella: str) -> Any:  # noqa: A002
+        self.envios.append((id, huella))
+        resultado = self.resultados.pop(0) if self.resultados else EnvioFalso(True, "enviado", "Enviado.", "gm-1", 1)
+        if isinstance(resultado, BaseException):
+            raise resultado
+        if resultado.ok:
+            self._borradores.pop(id, None)
+        return resultado
+
+    async def cerrar(self) -> None:
+        pass
+
+
+@dataclasses.dataclass(frozen=True)
+class ArchivoFalso:
+    id: str
+    nombre: str
+    tipo_mime: str = "application/pdf"
+    tamano: int | None = 1234
+    modificado: str = "2026-10-12T10:00:00Z"
+    enlace: str | None = None
+    propio: bool = True
+    puede_descargar: bool = True
+    puede_editar: bool = True
+    puede_papelera: bool = True
+    puede_compartir: bool = True
+
+    def tipo_legible(self) -> str:
+        return "PDF"
+
+    def linea(self, n: int) -> str:
+        return f"{n}. {self.nombre} · PDF · 12 oct · tuyo"
+
+
+@dataclasses.dataclass(frozen=True)
+class OperacionFalsa:
+    id: str
+    version: int
+    op: str
+    archivo: ArchivoFalso | None
+    compartir_con: str | None
+    rol: str | None
+    publico: bool
+    problemas: tuple[str, ...]
+    canal_origen: str
+    caduca: float
+    local_bytes: int | None = None
+
+    @property
+    def listo(self) -> bool:
+        return not self.problemas
+
+    def huella(self) -> str:
+        return huella_contenido({"clase": "drive", "op": self.op, "archivo_id": getattr(self.archivo, "id", None),
+                                 "compartir_con": self.compartir_con, "rol": self.rol, "publico": self.publico})
+
+    def vista(self) -> dict[str, Any]:
+        archivo = None if self.archivo is None else {"nombre": self.archivo.nombre, "tipo": "PDF", "tamano": 1234,
+                                                     "modificado": "2026-10-12", "propio": True}
+        compartir = ({"con": self.compartir_con or "", "rol": self.rol, "publico": self.publico}
+                     if self.op == "compartir" else None)
+        return {"op": self.op, "paso": 1, "archivo": archivo, "local": None, "carpeta_destino": None,
+                "compartir": compartir, "problemas": list(self.problemas), "listo": self.listo}
+
+
+class DriveFalso:
+    ARCHIVOS = (ArchivoFalso("drv-1", "Informe secreto Q3.pdf"), ArchivoFalso("drv-2", "Presupuesto.xlsx"))
+
+    def __init__(self, settings: Any, cuenta: Any = None, bus: Any = None) -> None:
+        self.settings, self.cuenta = settings, cuenta
+        self.busquedas: list[Any] = []
+        self.ejecuciones: list[tuple[str, str]] = []
+        self.descartados: list[str] = []
+        self._operaciones: dict[str, OperacionFalsa] = {}
+
+    async def iniciar(self) -> DiagnosticoModulo:
+        return DiagnosticoModulo("drive", "Google Drive", EstadoModulo.OK, "falso")
+
+    @property
+    def disponible(self) -> bool:
+        return bool(getattr(self.cuenta, "disponible", False))
+
+    @property
+    def puede_escribir(self) -> bool:
+        return True
+
+    async def buscar(self, consulta: Any, *, carpeta: Any = None, limite: int = 10) -> Any:
+        self.busquedas.append(consulta)
+        return SimpleNamespace(ok=True, codigo="hecho", mensaje="", archivos=self.ARCHIVOS, datos={})
+
+    def _nueva(self, op: str, *, canal_origen: str, ttl_s: float, **kw: Any) -> OperacionFalsa:
+        operacion = OperacionFalsa(uuid.uuid4().hex[:8], 1, op, self.ARCHIVOS[0], kw.get("correo"), kw.get("rol"),
+                                   bool(kw.get("publico")), (), canal_origen, time.time() + ttl_s)
+        self._operaciones = {operacion.id: operacion}
+        return operacion
+
+    async def preparar_compartir(self, ref: str, *, correo: Any, rol: str, publico: bool, canal_origen: str,
+                                 ttl_s: float) -> OperacionFalsa:
+        return self._nueva("compartir", canal_origen=canal_origen, ttl_s=ttl_s, correo=correo, rol=rol,
+                           publico=publico)
+
+    async def preparar_papelera(self, ref: str, *, canal_origen: str, ttl_s: float) -> OperacionFalsa:
+        return self._nueva("papelera", canal_origen=canal_origen, ttl_s=ttl_s)
+
+    def operacion(self, id: str) -> OperacionFalsa | None:  # noqa: A002
+        return self._operaciones.get(id)
+
+    def descartar(self, id: str) -> bool:  # noqa: A002
+        self.descartados.append(id)
+        return self._operaciones.pop(id, None) is not None
+
+    async def ejecutar(self, id: str, huella: str) -> Any:  # noqa: A002
+        self.ejecuciones.append((id, huella))
+        self._operaciones.pop(id, None)
+        return SimpleNamespace(ok=True, codigo="hecho", mensaje="Compartido.", archivos=(),
+                               datos={"enlace": "https://drive.google.com/file/d/x"})
+
+    async def cerrar(self) -> None:
+        pass
+
+
+@dataclasses.dataclass(frozen=True)
+class AnalisisFalso:
+    nivel: str = "medio"
+    ejecutable: bool = True
+
+    def motivo_no_ejecutable(self) -> str:
+        return "" if self.ejecutable else "riesgo crítico: no lo ejecuto desde la app"
+
+
+@dataclasses.dataclass(frozen=True)
+class PropuestaFalsa:
+    id: str
+    version: int
+    tarea: str
+    lenguaje: str
+    codigo: str
+    analisis: AnalisisFalso
+    habilidad: str | None = None
+    habilidad_cambiada: bool = False
+    ejecuciones: int = 0
+    canal_origen: str = "escritorio"
+
+    def huella(self) -> str:
+        return huella_contenido({"clase": "script", "lenguaje": self.lenguaje, "codigo": self.codigo})
+
+    def vista(self) -> dict[str, Any]:
+        return {"lenguaje": self.lenguaje, "plataforma": "windows", "codigo": self.codigo, "explicacion": "Lista.",
+                "efectos": [], "requisitos": [], "nivel": self.analisis.nivel, "ejecutable": self.analisis.ejecutable,
+                "motivo_no_ejecutable": self.analisis.motivo_no_ejecutable(), "metodo": "ast", "hallazgos": [],
+                "hallazgos_omitidos": 0, "habilidad": self.habilidad, "habilidad_cambiada": self.habilidad_cambiada,
+                "ejecuciones": self.ejecuciones}
+
+
+class TallerFalso:
+    def __init__(self, settings: Any, bus: Any = None, *, generador: Any = None) -> None:
+        self.settings, self.generador = settings, generador
+        self.tareas: list[str] = []
+        self.ejecuciones: list[tuple[str, str]] = []
+        self.guardadas: list[str] = []
+        self.analisis = AnalisisFalso()
+        self.salida = "hola\n"
+        self._propuestas: dict[str, PropuestaFalsa] = {}
+
+    async def iniciar(self) -> DiagnosticoModulo:
+        return DiagnosticoModulo("taller", "Taller de scripts", EstadoModulo.OK, "falso")
+
+    @property
+    def disponible(self) -> bool:
+        return True
+
+    def lenguajes(self) -> tuple[str, ...]:
+        return ("powershell", "python")
+
+    async def proponer(self, tarea: str, *, canal_origen: str, ttl_s: float) -> PropuestaFalsa:
+        self.tareas.append(tarea)
+        propuesta = PropuestaFalsa(uuid.uuid4().hex[:8], 1, tarea, "python", "print('CODIGO_PRIVADO')",
+                                   self.analisis, canal_origen=canal_origen)
+        self._propuestas = {propuesta.id: propuesta}
+        return propuesta
+
+    def propuesta(self, id: str) -> PropuestaFalsa | None:  # noqa: A002
+        return self._propuestas.get(id)
+
+    def descartar(self, id: str) -> bool:  # noqa: A002
+        return self._propuestas.pop(id, None) is not None
+
+    def reabrir(self, id: str) -> PropuestaFalsa | None:  # noqa: A002
+        propuesta = self._propuestas.get(id)
+        return propuesta
+
+    async def ejecutar(self, id: str, huella: str) -> Any:  # noqa: A002
+        self.ejecuciones.append((id, huella))
+        propuesta = self._propuestas[id]
+        self._propuestas[id] = dataclasses.replace(propuesta, ejecuciones=propuesta.ejecuciones + 1)
+        return SimpleNamespace(ok=True, codigo="ejecutado", mensaje="", codigo_salida=0, tiempo_agotado=False,
+                               duracion_s=1.2, stdout=self.salida, stderr="", recortada=False,
+                               bytes_salida=len(self.salida.encode()), carpeta="data/scripts/ejecuciones/x-1")
+
+    async def guardar_habilidad(self, id: str, huella: str, nombre: str) -> Any:  # noqa: A002
+        self.guardadas.append(nombre)
+        return SimpleNamespace(id="habilidad", nombre=nombre, lenguaje="python", nivel="medio", huella=huella, usos=0)
+
+    def habilidades(self) -> tuple[Any, ...]:
+        return tuple(SimpleNamespace(nombre=n, lenguaje="python", nivel="medio", usos=2) for n in self.guardadas)
+
+    async def olvidar_habilidad(self, nombre: str) -> bool:
+        return nombre in self.guardadas
+
+    async def cerrar(self) -> None:
+        pass
+
+
+@pytest.fixture
+def v022(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    """Instala los dobles de los 4 módulos (los crea main) y deja Google «habilitado» sin red."""
+    creados = SimpleNamespace(google=None, correo=None, drive=None, taller=None)
+
+    def fabrica(atributo: str, base: type) -> type:
+        class Doble(base):  # type: ignore[valid-type, misc]
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                super().__init__(*a, **kw)
+                setattr(creados, atributo, self)
+        return Doble
+
+    for ruta, clase, atributo, base in (("lobes.google_cuenta", "CuentaGoogle", "google", CuentaGoogleFalsa),
+                                        ("lobes.correo", "Correo", "correo", CorreoFalso),
+                                        ("lobes.drive", "Drive", "drive", DriveFalso),
+                                        ("lobes.taller_scripts", "TallerScripts", "taller", TallerFalso)):
+        modulo = types.ModuleType(ruta)
+        setattr(modulo, clase, fabrica(atributo, base))
+        monkeypatch.setitem(sys.modules, ruta, modulo)
+    monkeypatch.setattr(Settings, "tiene_google", property(lambda s: bool(s.google_habilitado)))
+    return creados
+
+
+def _ajustes_v022(settings: Settings, **cambios: Any) -> Settings:
+    return settings.con(**{"google_habilitado": True, "taller_habilitado": True, **cambios})
+
+
+def _espiar_entradas(monkeypatch: pytest.MonkeyPatch, orq: Any) -> list[tuple[ContextoBroca, str | None]]:
+    """Contextos y ENTRADAS que recibe Broca."""
+    vistos: list[tuple[ContextoBroca, str | None]] = []
+    original = orq.broca.verbalizar
+
+    async def espia(contexto: ContextoBroca, entrada: str | None, **kwargs: Any) -> BrocaReply:
+        vistos.append((contexto, entrada))
+        return await original(contexto, entrada, **kwargs)
+
+    monkeypatch.setattr(orq.broca, "verbalizar", espia)
+    return vistos
+
+
+async def _iniciar_v022(orq: Any, *, clientes: int = 1) -> None:
+    await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+    orq.bus.publicar("escritorio.conectado", {"clientes": clientes, "overlay": False, "hud": clientes})
+
+
+async def _boton(orq: Any, ident: str, sha: str, decision: str, **extra: Any) -> None:
+    orq.bus.publicar("escritorio.tarjeta", {"id": ident, "sha256": sha, "decision": decision, **extra})
+    await asyncio.sleep(0)
+    async with orq._lock_tarjetas:       # espera a que termine la decisión en curso
+        pass
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+def test_v022_tablas_y_constantes() -> None:
+    import main
+
+    assert main._ARGS_CITA_USUARIO == ("consulta", "contenido", "mensaje")
+    orden = main._ORDEN_ARRANQUE
+    assert orden[orden.index("control") - 4:orden.index("control")] == ("google", "correo", "drive", "taller")
+    for clave in ("google", "correo", "drive", "taller"):
+        assert clave in main._NOMBRES_MODULO
+    assert set(MODULOS_V022) <= set(main._MODULOS_OPCIONALES)
+    assert {"taller_ofrece", "tarjeta_lista", "google_navegador"} <= set(main._CATEGORIAS_OBLIGATORIAS)
+    assert {"/google", "/script", "/habilidades"} <= set(main._DESCRIPCION_COMANDOS)
+
+
+def test_v022_modulos_ausentes_o_apagados_quedan_off(settings_prueba: Settings, v022: SimpleNamespace,
+                                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal(ajustes: Settings) -> dict[str, DiagnosticoModulo]:
+        orq, _ = _orquestador(ajustes)
+        try:
+            diags = await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            return {d.clave: d for d in diags}
+        finally:
+            await orq.apagar()
+
+    # Con los dobles: se construyen siempre y su diagnóstico sale de iniciar().
+    diags = asyncio.run(principal(_ajustes_v022(settings_prueba)))
+    assert all(diags[c].estado == EstadoModulo.OK for c in ("google", "correo", "drive", "taller"))
+    assert v022.taller.generador is None                 # sin clave de Gemini no hay generador
+    # Ausentes: OFF con «módulo no instalado», sin romper el arranque.
+    for nombre in MODULOS_V022:
+        monkeypatch.setitem(sys.modules, nombre, None)
+    diags = asyncio.run(principal(settings_prueba))
+    for clave in ("google", "correo", "drive", "taller"):
+        assert diags[clave].estado == EstadoModulo.OFF and "no instalado" in diags[clave].detalle, clave
+
+
+def test_v022_generador_del_taller_con_gemini(settings_prueba: Settings, v022: SimpleNamespace,
+                                             monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(Settings, "tiene_gemini", property(lambda _s: True))
+
+    async def principal() -> Any:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            return orq, v022.taller.generador
+        finally:
+            await orq.apagar()
+
+    orq, generador = asyncio.run(principal())
+    assert generador is not None and generador.__func__ is type(orq.broca).generar_script
+
+
+def test_v022_orden_de_apagado(settings_prueba: Settings, v022: SimpleNamespace,
+                               monkeypatch: pytest.MonkeyPatch) -> None:
+    import main
+
+    cerrados: list[str] = []
+    original = main.Orquestador._cerrar_modulo
+
+    async def espia(self: Any, nombre: str, modulo: Any, limite: float, **kw: Any) -> None:
+        cerrados.append(nombre)
+        await original(self, nombre, modulo, limite, **kw)
+
+    monkeypatch.setattr(main.Orquestador, "_cerrar_modulo", espia)
+
+    async def principal() -> None:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+        await orq.apagar()
+
+    asyncio.run(principal())
+    assert cerrados[cerrados.index("control_pc") + 1] == "taller"
+    i = cerrados.index("web")
+    assert cerrados[i + 1:i + 4] == ["drive", "correo", "google"]
+    assert v022.google.llamadas[-1] == "cerrar"
+
+
+def test_v022_conectar_google_en_segundo_plano(settings_prueba: Settings, v022: SimpleNamespace,
+                                              monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            v022.google.conectado = False
+            v022.google.liberar = asyncio.Event()
+            contextos = _espiar_broca(monkeypatch, orq)
+            herramientas: list[dict[str, bool]] = []
+            original = orq.broca.set_herramientas
+            monkeypatch.setattr(orq.broca, "set_herramientas", lambda h: (herramientas.append(dict(h)), original(h)))
+            with caplog.at_level(logging.DEBUG):
+                reply = await asyncio.wait_for(orq.procesar_entrada("conecta mi cuenta de Google"), timeout=5.0)
+                esperando = v022.google.conectando
+                v022.google.liberar.set()
+                await _esperar(lambda: "Cuenta de Google conectada" in salida.getvalue(), 3.0)
+                await _esperar(lambda: any(r.get("tipo") == "conectar_google" for r in _auditoria(orq)), 3.0)
+            return {"reply": reply, "esperando": esperando, "contexto": contextos[-1], "salida": salida.getvalue(),
+                    "auditoria": _auditoria(orq), "herramientas": herramientas}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert isinstance(r["reply"], BrocaReply) and r["esperando"] is True       # el turno NO esperó al navegador
+    accion = r["contexto"].accion
+    assert accion.ok is True and accion.accion_tipo == "google_conectar"
+    assert r["reply"].texto_plano in _textos_frases("google_navegador")         # sin Gemini: frase local
+    assert "URL_SOLO_CONSOLA" in r["salida"]                                    # la URL solo en la consola…
+    assert "URL_SOLO_CONSOLA" not in caplog.text                                # …y nunca en el log
+    registro = [e for e in r["auditoria"] if e["tipo"] == "conectar_google"][-1]
+    assert registro["servicios"] == ["correo", "drive_escribir"] and registro["codigo"] == "conectado"
+    assert r["herramientas"][-1]["google_conectado"] is True or r["herramientas"][-1]["correo"] is True
+
+
+def test_v022_cliente_oauth_guardado_con_rams_en_marcha(settings_prueba: Settings, v022: SimpleNamespace,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sin ``data/google_cliente.json``: guía clara. Guardado después (sin reiniciar): «conecta…» ya conecta y el
+    correo pide conectar en vez de repetir que falta el archivo."""
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            v022.google.conectado = False
+            v022.google.motivo = "sin_cliente"
+            contextos = _espiar_broca(monkeypatch, orq)
+            await orq.procesar_entrada("conecta mi cuenta de Google")
+            await orq.procesar_entrada("envíale un correo a ana@x.com diciendo que llego tarde", canal="escritorio")
+            antes = list(v022.google.llamadas)
+            v022.google.cliente_en_disco = True                  # el usuario guarda el JSON del cliente
+            await orq.procesar_entrada("envíale un correo a ana@x.com diciendo que llego tarde", canal="escritorio")
+            await orq.procesar_entrada("conecta mi cuenta de Google")
+            await _esperar(lambda: "conectar" in v022.google.llamadas, 3.0)
+            return {"contextos": contextos, "antes": antes, "llamadas": list(v022.google.llamadas),
+                    "preparados": list(v022.correo.preparados)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    sin_archivo, correo_sin_archivo, correo_con_archivo, con_archivo = (c.accion for c in r["contextos"][:4])
+    assert sin_archivo.ok is False and "google_cliente.json" in sin_archivo.mensaje and "§17" in sin_archivo.mensaje
+    assert correo_sin_archivo.ok is False and "google_cliente.json" in correo_sin_archivo.mensaje
+    assert "conectar" not in r["antes"] and "releer_cliente" in r["antes"]
+    assert correo_con_archivo.ok is False and correo_con_archivo.mensaje.startswith("Primero conecta")
+    assert con_archivo.ok is True and con_archivo.accion_tipo == "google_conectar"
+    assert "conectar" in r["llamadas"] and r["preparados"] == []
+
+
+def test_v022_google_apagado_y_estado_por_telegram(settings_prueba: Settings, v022: SimpleNamespace,
+                                                  monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(settings_prueba.con(taller_habilitado=True))
+        try:
+            await _iniciar_v022(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("conecta mi cuenta de Google")
+            enviados: list[str] = []
+
+            async def enviar(texto: str) -> bool:
+                enviados.append(texto)
+                return True
+
+            orq.riko.enviar_telegram_texto = enviar
+            sin_respuesta = await orq.procesar_entrada("/google conectar", canal="telegram")
+            await orq.procesar_entrada("/google", canal="telegram")
+            return {"contexto": contextos[0], "enviados": enviados, "sin_respuesta": sin_respuesta,
+                    "llamadas": list(v022.google.llamadas)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["contexto"].accion.ok is False and "RAMS_GOOGLE=1" in r["contexto"].accion.mensaje
+    assert r["sin_respuesta"] is None and "solo se hace desde el computador" in r["enviados"][0]
+    assert r["enviados"][1].startswith("Cuenta de Google: apagada")
+    assert "conectar" not in r["llamadas"]
+
+
+def test_v022_correo_desde_el_escritorio_texto_crudo_y_turno_sin_contenido(
+        settings_prueba: Settings, v022: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    cuerpo = "el archivo informe_final_ventas_2026_q3 ya está listo"
+
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "usuario.entrada")
+            vistos = _espiar_entradas(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada(f"mándale un correo a mamá y a ana@x.com diciendo que {cuerpo}",
+                                       canal="escritorio")
+            await orq.procesar_entrada("envíale un correo a juan@y.com diciendo password: hunter22",
+                                       canal="escritorio")
+            turnos = await orq.memoria.ventana_activa()
+            return {"eventos": eventos, "vistos": vistos, "turnos": turnos, "temas": list(orq._temas),
+                    "preparados": v022.correo.preparados, "t": orq.permisos.tarjetas()}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    primero, segundo = r["preparados"]
+    assert primero["cuerpo"] == cuerpo[0].upper() + cuerpo[1:]               # intacto (sin «oculto»)
+    assert primero["para"] == ["mamá", "ana@x.com"] and primero["canal_origen"] == "escritorio"
+    assert primero["ttl_s"] == 1800.0
+    assert segundo["cuerpo"] == "Password: hunter22"                         # crudo: el módulo decide
+    tarjetas = _de(r["eventos"], "tarjeta.mostrar")
+    assert tarjetas[0]["clase"] == "correo" and tarjetas[0]["botones"] == ["aprobar", "editar", "descartar"]
+    assert tarjetas[0]["correo"]["cuerpo"] == primero["cuerpo"] and tarjetas[0]["version"] == 1
+    assert tarjetas[0]["caduca_ts"] == pytest.approx(time.time() + 1800.0, abs=30)
+    assert tarjetas[1]["correo"]["problemas"] and tarjetas[1]["correo"]["listo"] is False
+    for campo in ("titulo", "resumen", "aviso"):
+        assert "@" not in tarjetas[0][campo] and "informe_final" not in tarjetas[0][campo]
+    # Broca y la memoria: sin cuerpo ni direcciones.
+    for contexto, entrada in r["vistos"]:
+        texto = f"{entrada} {contexto.accion.mensaje} {contexto.accion.datos}"
+        assert "informe_final" not in texto and "hunter22" not in texto and "@" not in texto
+        assert contexto.accion.datos == {"que": "el borrador del correo"}
+    assert r["vistos"][0][1] == "(pidió preparar un correo para mamá y 1 dirección más)"
+    for turno in r["turnos"]:
+        assert "informe_final" not in turno.texto and "hunter22" not in turno.texto and "@" not in turno.texto
+    assert not any("@" in t or "informe" in t for t in r["temas"])
+    # Solo queda vigente la última tarjeta de la clase correo (la primera se reemplazó).
+    assert [t.clase for t in r["t"]] == ["correo"]
+
+
+def test_v022_correo_desde_la_terminal_y_sin_clientes(settings_prueba: Settings, v022: SimpleNamespace,
+                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq, clientes=0)
+            orq._overlay_conectado = True
+            eventos = _escuchar(orq, "escritorio.orden")
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo que llegué bien")
+            return {"salida": salida.getvalue(), "eventos": eventos, "contexto": contextos[-1]}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert "Cuerpo:" in r["salida"] and "Llegué bien" in r["salida"] and "mama@x.com" in r["salida"]
+    assert {"accion": "abrir_chat"} in _de(r["eventos"], "escritorio.orden")
+    assert "Abre el chat de Amadeus Desktop o el del HUD" in r["contexto"].accion.mensaje
+
+
+def test_v022_correo_desde_telegram(settings_prueba: Settings, v022: SimpleNamespace,
+                                    monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal(ajustes: Settings) -> dict[str, Any]:
+        orq, salida = _orquestador(ajustes)
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "escritorio.sistema")
+            contextos = _espiar_broca(monkeypatch, orq)
+            entregas = _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo que ya salí del trabajo", canal="telegram")
+            return {"eventos": eventos, "contexto": contextos[-1], "entregas": entregas, "salida": salida.getvalue(),
+                    "preparados": list(getattr(v022.correo, "preparados", []))}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal(_ajustes_v022(settings_prueba)))
+    tarjeta = _de(r["eventos"], "tarjeta.mostrar")[-1]
+    assert tarjeta["canal_origen"] == "telegram" and r["preparados"][0]["ttl_s"] == 43200.0
+    assert tarjeta["caduca_ts"] == pytest.approx(time.time() + 43200.0, abs=30)
+    assert "📱 Desde Telegram preparaste un correo para mamá" in r["salida"]
+    assert any("📱 Desde Telegram" in d["texto"] for d in _de(r["eventos"], "escritorio.sistema"))
+    accion = r["contexto"].accion
+    assert "Apruébalo en el computador" in accion.mensaje and "@" not in accion.mensaje
+    assert _respuestas(r["entregas"])[-1]["canal"] == "telegram"
+    # Sin LLM, lo que llega al celular dice que se aprueba en el computador (§1.3), no «la tarjeta del chat».
+    texto_telegram = _respuestas(r["entregas"])[-1]["texto"]
+    assert "Apruébalo en el computador" in texto_telegram and "tarjeta del chat" not in texto_telegram
+    # Con RAMS_TELEGRAM_CORREO=0: desactivado y sin borrador.
+    r = asyncio.run(principal(_ajustes_v022(settings_prueba, telegram_correo=False)))
+    assert "RAMS_TELEGRAM_CORREO=1" in r["contexto"].accion.mensaje and r["preparados"] == []
+
+
+def test_v022_redaccion_del_tema_y_de_la_tarea(settings_prueba: Settings, v022: SimpleNamespace,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    token = "zq8Xw3Lp0Rt7Yu2Io9Pa4Sd6Fg1Hj5Kk"
+
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            _espiar_decir(monkeypatch, orq)
+            pedidos: list[tuple[str, str]] = []
+
+            async def redactar_correo(tema: str, *, destinatario: str = "", **kw: Any) -> dict[str, str]:
+                pedidos.append((tema, destinatario))
+                return {"asunto": "Vacaciones", "cuerpo": "Hola jefe, quisiera pedir vacaciones."}
+
+            monkeypatch.setattr(orq.broca, "redactar_correo", redactar_correo)
+            await orq.procesar_entrada(f"redacta un correo a mi jefe y a jefe2@x.com pidiendo {token}",
+                                       canal="escritorio")
+            await orq.procesar_entrada(f"hazme un script que renombre {token}", canal="escritorio")
+            return {"pedidos": pedidos, "tareas": list(v022.taller.tareas), "preparados": v022.correo.preparados}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    tema, destinatario = r["pedidos"][0]
+    assert token not in tema and "Pidiendo" in tema
+    assert destinatario == "mi jefe" and "@" not in destinatario            # solo el alias, nunca la dirección
+    assert token not in r["tareas"][0] and r["tareas"][0].startswith("renombre")
+    assert r["preparados"][0]["cuerpo"] == "Hola jefe, quisiera pedir vacaciones."
+    assert r["preparados"][0]["asunto"] == "Vacaciones"
+
+
+def test_v022_redactar_sin_gemini_usa_el_texto_tal_cual(settings_prueba: Settings, v022: SimpleNamespace,
+                                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> list[dict[str, Any]]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("redacta un correo a mi jefe pidiendo vacaciones", canal="escritorio")
+            return v022.correo.preparados
+        finally:
+            await orq.apagar()
+
+    preparado = asyncio.run(principal())[0]
+    assert preparado["cuerpo"] == "Pidiendo vacaciones"
+    assert preparado["avisos"] == ["No tengo a Gemini: usé tu texto tal cual"]
+
+
+def _tarjeta_de(eventos: list[tuple[str, dict[str, Any]]], clase: str) -> dict[str, Any]:
+    return [d for d in _de(eventos, "tarjeta.mostrar") if d["clase"] == clase][-1]
+
+
+def test_v022_aprobar_envia_una_vez_aunque_haya_doble_clic(settings_prueba: Settings, v022: SimpleNamespace,
+                                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada", "pc.accion", "escritorio.sistema")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("envía un email a ana@x.com con asunto Reunión: mañana no puedo",
+                                       canal="escritorio")
+            tarjeta = _tarjeta_de(eventos, "correo")
+            orq.bus.publicar("escritorio.tarjeta", {"id": tarjeta["id"], "sha256": tarjeta["sha256"],
+                                                    "decision": "aprobar"})
+            await _boton(orq, tarjeta["id"], tarjeta["sha256"], "aprobar")
+            return {"eventos": eventos, "envios": list(v022.correo.envios), "salida": salida.getvalue(),
+                    "auditoria": _auditoria(orq), "recientes": orq.permisos.correos_recientes()}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert len(r["envios"]) == 1
+    cerradas = _de(r["eventos"], "tarjeta.cerrada")
+    assert cerradas[0]["resultado"] == "enviado" and cerradas[0]["clase"] == "correo"
+    assert "📧 Enviado a Gmail: «Reunión» para 1 destinatario." in r["salida"]
+    sistema = [d["texto"] for d in _de(r["eventos"], "escritorio.sistema")]
+    assert "Esa tarjeta ya no está vigente." in sistema               # el 2.º clic no envía nada
+    assert r["recientes"] == (1, 1)
+    registro = [e for e in r["auditoria"] if e["tipo"] == "enviar_correo"][-1]
+    assert registro["resultado"] == "ok" and registro["canal"] == "escritorio" and registro["origen"] == "usuario"
+    assert registro["n_destinatarios"] == 1 and registro["asunto_len"] == len("Reunión")
+    assert registro["cuerpo_len"] == len("Mañana no puedo") and len(registro["cuerpo_sha256"]) == 12
+    assert registro["gmail_id"] == "gm-1" and registro["alias"] == "gmail"
+    texto_auditoria = json.dumps(r["auditoria"], ensure_ascii=False)
+    assert "ana@x.com" not in texto_auditoria and "Mañana no puedo" not in texto_auditoria
+    assert _de(r["eventos"], "pc.accion")[-1] == {"tipo": "enviar_correo", "resultado": "ok", "destino": "gmail"}
+
+
+def test_v022_doble_clic_de_dos_clientes_no_ejecuta_el_script_dos_veces(
+        settings_prueba: Settings, v022: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    # La reapertura tras ejecutar conserva id y huella: un 2.º clic encolado (Desktop y RINE a la vez) no
+    # debe pasar la compuerta otra vez. Un clic NUEVO sobre la versión reabierta sí («Ejecutar otra vez»).
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq, clientes=2)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("hazme un script que liste mis descargas", canal="escritorio")
+            s = _tarjeta_de(eventos, "script")
+            orq.bus.publicar("escritorio.tarjeta", {"id": s["id"], "sha256": s["sha256"], "decision": "aprobar"})
+            await _boton(orq, s["id"], s["sha256"], "aprobar")
+            tras_doble = len(v022.taller.ejecuciones)
+            reabierta = _tarjeta_de(eventos, "script")
+            await _boton(orq, s["id"], reabierta["sha256"], "aprobar")
+            return {"tras_doble": tras_doble, "reabierta": reabierta, "ejecuciones": list(v022.taller.ejecuciones),
+                    "auditoria": _auditoria(orq)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["tras_doble"] == 1
+    assert r["reabierta"]["version"] == 2 and r["reabierta"]["sha256"] == r["ejecuciones"][0][1]
+    assert len(r["ejecuciones"]) == 2                                       # el clic nuevo sí ejecuta
+    assert len([e for e in r["auditoria"] if e["tipo"] == "ejecutar_script"]) == 2
+
+
+def test_v022_doble_clic_tras_red_ambigua_no_reenvia_el_correo(settings_prueba: Settings, v022: SimpleNamespace,
+                                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    # §1.2: «nunca se reintenta solo». Tras «red_ambigua» la tarjeta se reabre con la misma huella y el aviso
+    # «Puede que ya se haya enviado»; el 2.º clic encolado no lo reenvía ni borra ese aviso.
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq, clientes=2)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("envía un email a ana@x.com con asunto Reunión: mañana no puedo",
+                                       canal="escritorio")
+            c = _tarjeta_de(eventos, "correo")
+            v022.correo.resultados = [EnvioFalso(False, "red_ambigua", "Puede que ya se haya enviado: revisa "
+                                                                       "Enviados."),
+                                      EnvioFalso(True, "enviado", "Enviado.", "gm-2", 1)]
+            orq.bus.publicar("escritorio.tarjeta", {"id": c["id"], "sha256": c["sha256"], "decision": "aprobar"})
+            await _boton(orq, c["id"], c["sha256"], "aprobar")
+            tras_doble = {"envios": len(v022.correo.envios), "ultima": _tarjeta_de(eventos, "correo"),
+                          "recientes": orq.permisos.correos_recientes(),
+                          "vigente": orq.permisos.tarjeta(c["id"]) is not None}
+            await _boton(orq, c["id"], tras_doble["ultima"]["sha256"], "aprobar")    # decisión nueva y consciente
+            return {**tras_doble, "envios_final": len(v022.correo.envios),
+                    "cerrada": _de(eventos, "tarjeta.cerrada")}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["envios"] == 1 and r["vigente"] is True and r["recientes"] == (1, 1)
+    assert r["ultima"]["version"] == 2 and r["ultima"]["aviso"].startswith("Puede que ya se haya enviado")
+    assert r["envios_final"] == 2 and r["cerrada"][-1]["resultado"] == "enviado"
+
+
+def test_v022_correo_avisa_lo_que_el_enrutador_dejo_fuera(settings_prueba: Settings, v022: SimpleNamespace,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    lista = ", ".join(f"p{n}@x.com" for n in range(1, 13))
+
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada(f"manda un correo a {lista} adjunta ../../.env: hola", canal="escritorio")
+            fuera = (contextos[-1].accion.mensaje, list(v022.correo.preparados[-1]["avisos"]))
+            await orq.procesar_entrada("manda un correo a juan@x.com adjunta informe.pdf: hola", canal="escritorio")
+            return {"fuera": fuera, "normal": (contextos[-1].accion.mensaje, v022.correo.preparados[-1]["avisos"])}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    mensaje, avisos = r["fuera"]
+    assert any(a.startswith("No entraron 2 destinatarios") for a in avisos)
+    assert any(a.startswith("No adjunté 1 archivo:") and "documentos/plan.xlsx" in a for a in avisos)
+    assert "Ojo: dejé fuera 2 destinatarios y 1 adjunto" in mensaje
+    assert ".env" not in mensaje and "@" not in mensaje and not any(".env" in a for a in avisos)
+    assert r["normal"][1] == [] and "dejé fuera" not in r["normal"][0]
+
+
+def test_v022_huella_vieja_editar_y_descartar(settings_prueba: Settings, v022: SimpleNamespace,
+                                              monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo hola", canal="escritorio")
+            t1 = _tarjeta_de(eventos, "correo")
+            await _boton(orq, t1["id"], "f" * 64, "aprobar")                      # huella vieja
+            vieja = _tarjeta_de(eventos, "correo")
+            await _boton(orq, t1["id"], t1["sha256"], "editar", campos={"cuerpo": "hola\nnos vemos"})
+            editada = _tarjeta_de(eventos, "correo")
+            await _boton(orq, t1["id"], editada["sha256"], "descartar")
+            return {"vieja": vieja, "editada": editada, "eventos": eventos, "envios": list(v022.correo.envios),
+                    "ediciones": list(v022.correo.ediciones), "descartados": list(v022.correo.descartados),
+                    "vigente": orq.permisos.tarjeta(t1["id"])}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["envios"] == []
+    assert r["vieja"]["aviso"] == "Cambió: revisa la versión nueva." and r["vieja"]["version"] == 1
+    assert r["ediciones"][0][1] == {"cuerpo": "hola\nnos vemos"}                # crudo hacia correo.editar
+    assert r["editada"]["version"] == 2 and r["editada"]["correo"]["cuerpo"] == "hola\nnos vemos"
+    assert r["editada"]["sha256"] != r["vieja"]["sha256"]
+    assert _de(r["eventos"], "tarjeta.cerrada")[-1]["resultado"] == "descartado"
+    assert r["descartados"] and r["vigente"] is None
+
+
+@pytest.mark.parametrize("codigo, libera", [("red", True), ("desconectado", True), ("adjunto_cambio", True),
+                                            ("red_ambigua", False), ("error", False)])
+def test_v022_cupo_de_correo_tras_un_fallo(settings_prueba: Settings, v022: SimpleNamespace,
+                                          monkeypatch: pytest.MonkeyPatch, codigo: str, libera: bool) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo hola", canal="escritorio")
+            v022.correo.resultados = [EnvioFalso(False, codigo, f"Falló ({codigo}).")]
+            t1 = _tarjeta_de(eventos, "correo")
+            await _boton(orq, t1["id"], t1["sha256"], "aprobar")
+            return {"reabierta": _tarjeta_de(eventos, "correo"), "recientes": orq.permisos.correos_recientes(),
+                    "vigente": orq.permisos.tarjeta(t1["id"])}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["recientes"] == ((0, 0) if libera else (1, 1))
+    assert r["vigente"] is not None and r["reabierta"]["version"] == 2       # reapertura para reintentar
+    assert r["reabierta"]["aviso"] == f"Falló ({codigo})."
+
+
+def test_v022_excepcion_al_enviar_no_libera_y_cinco_fallos_no_agotan_el_cupo(
+        settings_prueba: Settings, v022: SimpleNamespace, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo hola", canal="escritorio")
+            v022.correo.resultados = [EnvioFalso(False, "red", "Sin red.")] * 5
+            for _ in range(5):
+                t = _tarjeta_de(eventos, "correo")
+                await _boton(orq, t["id"], t["sha256"], "aprobar")
+            sexto = _tarjeta_de(eventos, "correo")
+            await _boton(orq, sexto["id"], sexto["sha256"], "aprobar")         # el 6.º sí sale
+            enviado = _de(eventos, "tarjeta.cerrada")[-1]["resultado"]
+            recientes_ok = orq.permisos.correos_recientes()
+            await orq.procesar_entrada("mándale un correo a mamá diciendo otra vez", canal="escritorio")
+            v022.correo.resultados = [RuntimeError("boom")]
+            t = _tarjeta_de(eventos, "correo")
+            await _boton(orq, t["id"], t["sha256"], "aprobar")
+            return {"enviado": enviado, "recientes_ok": recientes_ok, "recientes": orq.permisos.correos_recientes(),
+                    "envios": len(v022.correo.envios), "reabierta": _tarjeta_de(eventos, "correo")}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["enviado"] == "enviado" and r["recientes_ok"] == (1, 1) and r["envios"] == 7
+    assert r["recientes"] == (2, 2)                                  # la excepción cuenta como «pudo salir»
+    assert "puede que haya salido" in r["reabierta"]["aviso"]
+
+
+def test_v022_fallo_sin_borrador_vigente_cierra_la_tarjeta(settings_prueba: Settings, v022: SimpleNamespace,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo hola", canal="escritorio")
+            t1 = _tarjeta_de(eventos, "correo")
+            original = v022.correo.enviar
+
+            async def enviar_y_perder(id: str, huella: str) -> Any:  # noqa: A002
+                resultado = await original(id, huella)
+                v022.correo._borradores.clear()             # el módulo ya no lo tiene (caducó o lo reemplazó)
+                return resultado
+
+            v022.correo.resultados = [EnvioFalso(False, "no_existe", "Ese borrador ya no existe.")]
+            monkeypatch.setattr(v022.correo, "enviar", enviar_y_perder)
+            await _boton(orq, t1["id"], t1["sha256"], "aprobar")
+            return {"eventos": eventos, "vigente": orq.permisos.tarjeta(t1["id"]),
+                    "versiones": [d["version"] for d in _de(eventos, "tarjeta.mostrar")]}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["vigente"] is None and r["versiones"] == [1]
+    assert _de(r["eventos"], "tarjeta.cerrada")[-1]["resultado"] == "fallo"
+
+
+def test_v022_drive_buscar_no_manda_nombres_a_broca(settings_prueba: Settings, v022: SimpleNamespace,
+                                                   monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            vistos = _espiar_entradas(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("busca en mi drive el informe", canal="terminal")
+            return {"salida": salida.getvalue(), "vistos": vistos, "busquedas": v022.drive.busquedas}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["busquedas"] == ["informe"]
+    assert "1. Informe secreto Q3.pdf" in r["salida"]
+    accion = r["vistos"][-1][0].accion
+    assert accion.mensaje == "Encontré 2 archivos en Drive; la lista está en pantalla."
+    assert "Informe secreto" not in json.dumps(accion.a_dict(), ensure_ascii=False)
+
+
+def test_v022_compartir_en_publico_en_dos_pasos(settings_prueba: Settings, v022: SimpleNamespace,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("haz público el 2", canal="escritorio")
+            paso1 = _tarjeta_de(eventos, "drive")
+            await _boton(orq, paso1["id"], paso1["sha256"], "aprobar")
+            paso2 = _tarjeta_de(eventos, "drive")
+            ejecuciones_tras_paso1 = len(v022.drive.ejecuciones)
+            await _boton(orq, paso2["id"], paso2["sha256"], "aprobar_publico")
+            return {"paso1": paso1, "paso2": paso2, "eventos": eventos, "tras1": ejecuciones_tras_paso1,
+                    "ejecuciones": list(v022.drive.ejecuciones), "salida": salida.getvalue(),
+                    "contexto": contextos[-1], "auditoria": _auditoria(orq)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["paso1"]["drive"]["paso"] == 1 and r["paso1"]["botones"] == ["aprobar", "descartar"]
+    assert r["paso2"]["drive"]["paso"] == 2 and r["paso2"]["botones"] == ["aprobar_publico", "descartar"]
+    assert r["paso2"]["version"] == 2 and r["tras1"] == 0
+    assert len(r["ejecuciones"]) == 1
+    assert _de(r["eventos"], "tarjeta.cerrada")[-1]["resultado"] == "hecho"
+    assert "Enlace: https://drive.google.com/file/d/x" in r["salida"]
+    assert r["contexto"].accion.datos == {"que": "la operación de Drive"}
+    registro = [e for e in r["auditoria"] if e["tipo"] == "drive_compartir"][-1]
+    assert registro["publico"] is True and registro["rol"] == "reader" and len(registro["archivo_sha12"]) == 12
+
+
+def test_v022_script_aprobar_salida_y_reapertura(settings_prueba: Settings, v022: SimpleNamespace,
+                                                monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.mostrar", "tarjeta.cerrada")
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            v022.taller.salida = "línea 😀\n" * 2000                              # > 8 192 unidades UTF-16
+            await orq.procesar_entrada("hazme un script que liste mis descargas", canal="escritorio")
+            script = _tarjeta_de(eventos, "script")
+            await _boton(orq, script["id"], script["sha256"], "aprobar")
+            salida_tarjeta = _tarjeta_de(eventos, "salida")
+            reabierta = _tarjeta_de(eventos, "script")
+            await _boton(orq, script["id"], reabierta["sha256"], "guardar", nombre="listar descargas")
+            guardada = _tarjeta_de(eventos, "script")
+            await _boton(orq, salida_tarjeta["id"], salida_tarjeta["sha256"], "descartar")
+            return {"script": script, "salida_tarjeta": salida_tarjeta, "reabierta": reabierta, "guardada": guardada,
+                    "eventos": eventos, "texto": salida.getvalue(), "contexto": contextos[-1],
+                    "guardadas": list(v022.taller.guardadas), "auditoria": _auditoria(orq)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["script"]["botones"] == ["aprobar", "guardar", "copiar", "descartar"]
+    assert r["contexto"].accion.datos == {"que": "el script"} and "CODIGO_PRIVADO" not in r["contexto"].accion.mensaje
+    seccion = r["salida_tarjeta"]["salida"]
+    assert largo_utf16(seccion["stdout"]) <= MAX_SALIDA_TARJETA and seccion["recortada"] is True
+    assert seccion["stdout"].startswith("línea 😀")
+    assert seccion["stdout"].endswith("… (salida recortada: completa en data/scripts/ejecuciones/x-1/salida.txt)")
+    assert r["salida_tarjeta"]["botones"] == ["descartar"] and r["salida_tarjeta"]["clase"] == "salida"
+    assert r["reabierta"]["version"] == 2 and r["reabierta"]["script"]["ejecuciones"] == 1
+    assert "Script terminado: código 0 en 1,2 s." in r["texto"]
+    assert r["guardadas"] == ["listar descargas"] and r["guardada"]["script"]["habilidad"] == "listar descargas"
+    assert "guardar" not in r["guardada"]["botones"]
+    assert _de(r["eventos"], "tarjeta.cerrada")[-1] == {"id": r["salida_tarjeta"]["id"], "clase": "salida",
+                                                       "resultado": "descartado", "motivo": "cerrada"}
+    registro = [e for e in r["auditoria"] if e["tipo"] == "ejecutar_script"][-1]
+    assert registro["lenguaje"] == "python" and registro["nivel"] == "medio" and registro["codigo_salida"] == 0
+    assert "CODIGO_PRIVADO" not in json.dumps(r["auditoria"]) and "línea" not in json.dumps(r["auditoria"])
+
+
+def test_v022_script_critico_no_se_ejecuta(settings_prueba: Settings, v022: SimpleNamespace,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            v022.taller.analisis = AnalisisFalso("critico", False)
+            eventos = _escuchar(orq, "tarjeta.mostrar")
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("hazme un script que formatee el disco", canal="escritorio")
+            tarjeta = _tarjeta_de(eventos, "script")
+            await _boton(orq, tarjeta["id"], tarjeta["sha256"], "aprobar")
+            return {"tarjeta": tarjeta, "republicada": _tarjeta_de(eventos, "script"),
+                    "ejecuciones": list(v022.taller.ejecuciones), "contexto": contextos[-1]}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["tarjeta"]["botones"] == ["copiar", "descartar"] and r["ejecuciones"] == []
+    assert "riesgo crítico" in r["republicada"]["aviso"]
+    assert "no lo ejecuto" in r["contexto"].accion.mensaje
+
+
+def test_v022_taller_apagado_y_comandos(settings_prueba: Settings, v022: SimpleNamespace,
+                                       monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal(ajustes: Settings) -> dict[str, Any]:
+        orq, salida = _orquestador(ajustes)
+        try:
+            await _iniciar_v022(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("hazme un script que liste mis fotos")
+            uso = await orq.procesar_entrada("/script")
+            await orq.procesar_entrada("/habilidades")
+            return {"contexto": contextos[0], "uso": uso, "salida": salida.getvalue(), "n": len(contextos)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal(settings_prueba))
+    assert "El taller está apagado (RAMS_TALLER=1" in r["contexto"].accion.mensaje
+    assert r["uso"] is None and "Uso: /script" in r["salida"] and r["n"] == 1   # los comandos no van a Broca
+    r = asyncio.run(principal(_ajustes_v022(settings_prueba)))
+    assert "No tengo habilidades guardadas todavía." in r["salida"]
+
+
+def test_v022_oferta_del_taller(settings_prueba: Settings, v022: SimpleNamespace,
+                                monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            contextos = _espiar_broca(monkeypatch, orq)
+            entregas = _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("renombra todas las fotos de Descargas con la fecha", canal="escritorio")
+            oferta = contextos[-1].accion
+            await orq.procesar_entrada("sí, hazlo con un script", canal="escritorio")
+            tras_si = list(v022.taller.tareas)
+            await orq.procesar_entrada("organiza mis descargas por tipo", canal="escritorio")
+            await orq.procesar_entrada("mejor cuéntame un chiste", canal="escritorio")
+            await orq.procesar_entrada("dale", canal="escritorio")              # ya no hay oferta
+            tras_otro = list(v022.taller.tareas)
+            await orq.procesar_entrada("organiza mis descargas por tipo", canal="telegram")
+            return {"oferta": oferta, "tras_si": tras_si, "tras_otro": tras_otro, "entregas": entregas,
+                    "telegram": contextos[-1].accion, "pendiente": orq._oferta_taller}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["oferta"].accion_tipo == "taller_oferta"
+    assert _respuestas(r["entregas"])[0]["texto"] in _textos_frases("taller_ofrece")
+    assert r["tras_si"] == ["renombra todas las fotos de Descargas con la fecha"]
+    assert r["tras_otro"] == r["tras_si"]                                  # otro mensaje anuló la oferta
+    assert r["telegram"] is None and r["pendiente"] is None                # nunca por Telegram
+
+
+def test_v022_purga_de_tarjetas_caducadas(settings_prueba: Settings, v022: SimpleNamespace,
+                                          monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, _ = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            eventos = _escuchar(orq, "tarjeta.cerrada")
+            _espiar_decir(monkeypatch, orq)
+            await orq.procesar_entrada("mándale un correo a mamá diciendo hola", canal="escritorio")
+            ahora = time.monotonic()
+            orq.permisos._reloj = lambda: ahora + 1801.0
+            await orq._paso_vigilancia()
+            return {"eventos": eventos, "descartados": list(v022.correo.descartados)}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    cerrada = _de(r["eventos"], "tarjeta.cerrada")[-1]
+    assert cerrada["resultado"] == "caducado" and cerrada["clase"] == "correo" and r["descartados"]
+
+
+def test_v022_google_estado_actualiza_capacidades_y_avisa(settings_prueba: Settings, v022: SimpleNamespace,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    async def principal() -> dict[str, Any]:
+        orq, salida = _orquestador(_ajustes_v022(settings_prueba))
+        try:
+            await _iniciar_v022(orq)
+            herramientas: list[dict[str, bool]] = []
+            monkeypatch.setattr(orq.broca, "set_herramientas", lambda h: herramientas.append(dict(h)))
+            base = {"conectado": True, "correo": True, "drive_leer": True, "drive_escribir": True,
+                    "drive_completo": False, "cuenta": "ju***@gmail.com", "motivo": ""}
+            orq.bus.publicar("google.estado", base)
+            v022.google.conectado = False
+            orq.bus.publicar("google.estado", {**base, "conectado": False, "motivo": "token_invalido"})
+            await asyncio.sleep(0)
+            return {"herramientas": herramientas, "salida": salida.getvalue()}
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    assert r["herramientas"][0]["google_conectado"] is True and r["herramientas"][0]["taller"] is True
+    assert r["herramientas"][-1]["google_conectado"] is False and r["herramientas"][-1]["correo"] is False
+    assert "Tu permiso de Google caducó o se revocó" in r["salida"]

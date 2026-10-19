@@ -2,7 +2,8 @@
 /**
  * Línea de órdenes de Amadeus Desktop (COMPANION.md §C2.7.5). Módulo puro: sin Electron.
  *
- *   amadeus-desktop --amadeus=toggle|show|hide|chat|quit|basta|vision_pausa|clics
+ *   amadeus-desktop --amadeus=toggle|show|hide|chat|quit|basta|vision_pausa|clics|puter
+ *                   (`puter` abre la ventanita «Conectar Puter», COMPANION.md §C2.15)
  *   amadeus-desktop --hidden        (arranque en la bandeja, sin mostrar nada)
  *   amadeus-desktop --smoke         (comprobación oculta de arranque, §C2.7.8)
  *
@@ -10,7 +11,7 @@
  * `additionalData` es más fiable que `argv`, porque Chromium puede reordenar o añadir argumentos.
  */
 
-const COMANDOS = Object.freeze(['toggle', 'show', 'hide', 'chat', 'quit', 'basta', 'vision_pausa', 'clics']);
+const COMANDOS = Object.freeze(['toggle', 'show', 'hide', 'chat', 'quit', 'basta', 'vision_pausa', 'clics', 'puter']);
 const PREFIJO = '--amadeus=';
 const VERSION_DATOS = 1;
 

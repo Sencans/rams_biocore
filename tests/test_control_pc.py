@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes
+import json
 import math
 import os
 import re
@@ -201,13 +202,17 @@ def crear(monkeypatch: pytest.MonkeyPatch, settings_prueba: Any) -> Callable[...
     monkeypatch.setattr(cpc_mod, "_descendientes", lambda base: set())
 
     def fabricar(plataforma: str = "win", *, api: Any = None, hypr: Any = None, reloj: RelojFalso | None = None,
-                 programas: dict[str, str | None] | None = None, settings: Any = None) -> ControlPC:
+                 programas: dict[str, str | None] | None = None, settings: Any = None,
+                 menu: Path | None = None, paquetes: Path | None = None) -> ControlPC:
         monkeypatch.setattr(cpc_mod, "_crear_api_win", lambda: api)
         monkeypatch.setattr(cpc_mod, "_crear_cliente_hypr", lambda: hypr)
         tabla = programas or {}
         monkeypatch.setattr(cpc_mod, "_buscar_programa", lambda nombre: tabla.get(nombre))
         reloj = reloj or RelojFalso()
-        control = ControlPC(settings or settings_prueba, reloj=reloj, plataforma=plataforma)
+        # v0.2.1: el índice del menú Inicio nunca lee el del usuario (carpeta vacía por defecto).
+        dirs = [menu] if menu is not None else [Path(settings_prueba.data_dir) / "menu_inicio_vacio"]
+        control = ControlPC(settings or settings_prueba, reloj=reloj, plataforma=plataforma,
+                            dirs_menu_inicio=dirs, dir_paquetes=paquetes)
         control._dormir = reloj.dormir
         return control
 
@@ -1372,3 +1377,292 @@ def test_api_win_real_resuelve_efectos_en_ctypes_windll(monkeypatch: pytest.Monk
                                    and monitor[0] <= punto[0] < monitor[0] + monitor[2]
                                    and monitor[1] <= punto[1] < monitor[1] + monitor[3])
     assert api.monitor_de(-10_000_000, -10_000_000) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="solo Windows")
+def test_api_win_tecla_media_solo_teclas_multimedia(monkeypatch: pytest.MonkeyPatch) -> None:
+    api = cpc_mod._ApiWin()
+    enviados: list[list[tuple[int, int, int, int]]] = []
+
+    def send_input(n: int, eventos: Any, tamano: int) -> int:
+        enviados.append([(e.type, e.ki.wVk, e.ki.wScan, e.ki.dwFlags) for e in eventos])
+        return n
+
+    monkeypatch.setattr(ctypes.windll.user32, "SendInput", send_input)  # type: ignore[attr-defined]
+    assert api.tecla_media(0xB3) == 2
+    assert enviados == [[(1, 0xB3, 0, 0x1), (1, 0xB3, 0, 0x3)]]
+    for vk in (0x0D, 0x41, 0x5B, 0xAF, -1):          # Enter, letras, Win, volumen: nunca
+        assert api.tecla_media(vk) == 0
+    assert len(enviados) == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: apps del menú Inicio, teclas multimedia y título de la ventana activa
+# ---------------------------------------------------------------------------
+
+
+ACCESOS: dict[str, bytes] = {
+    "Steam/Steam.lnk": b"lnk",
+    "Steam/Steam Support Center.url": b"[InternetShortcut]\nURL=https://help.steampowered.com/\n",
+    "Steam/Portal 2.url": b"[InternetShortcut]\r\nURL=steam://rungameid/620\r\n",
+    "Google Chrome.lnk": b"lnk",
+    "Chrome Remote Desktop.lnk": b"lnk",
+    "Visual Studio Code/Visual Studio Code.lnk": b"lnk",
+    "Visual Studio Code/Uninstall Visual Studio Code.lnk": b"lnk",
+    "Foo/Foo Editor.lnk": b"lnk",
+    "Foo/Foo Viewer.lnk": b"lnk",
+    "Foo/Foo Manual.lnk": b"lnk",
+    "Foo/Foo Website.url": b"[InternetShortcut]\nURL=https://foo.example/\n",
+    "Foo/Foo Setup.lnk": b"lnk",
+    "Windows PowerShell/Windows PowerShell.lnk": b"lnk",
+    "Python 3.12/Python 3.12 (64-bit).lnk": b"lnk",
+    "Notepad++.lnk": b"lnk",
+    "léeme.txt": b"no es un acceso",
+    "desktop.ini": b"[.ShellClassInfo]",
+}
+
+
+def _menu_inicio(tmp_path: Path) -> tuple[Path, Path]:
+    menu = tmp_path / "Start Menu" / "Programs"
+    for relativa, contenido in ACCESOS.items():
+        ruta = menu / relativa
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_bytes(contenido)
+    paquetes = tmp_path / "Packages"
+    (paquetes / "Microsoft.WindowsCalculator_8wekyb3d8bbwe").mkdir(parents=True)
+    return menu, paquetes
+
+
+class FakeWinMedia(FakeWin):
+    def __init__(self, insertados: int = 2) -> None:
+        super().__init__()
+        self.teclas_media: list[int] = []
+        self.insertados = insertados
+
+    def tecla_media(self, vk: int) -> int:
+        self.teclas_media.append(vk)
+        return self.insertados
+
+
+def test_normalizar_y_clasificar_nombres_de_apps() -> None:
+    assert cpc_mod.normalizar_nombre_app("Python 3.12 (64-bit)") == "python"
+    assert cpc_mod.normalizar_nombre_app("Microsoft® Word™ 2021") == "microsoft word 2021"
+    assert cpc_mod.normalizar_nombre_app("  Configuración  de   Windows ") == "configuracion de windows"
+    assert cpc_mod.normalizar_nombre_app("Notepad++") == "notepad"
+    assert cpc_mod.normalizar_nombre_app(None) == ""
+    assert cpc_mod.clasificar_nombre_app("uninstall steam") == ("excluida", "es un desinstalador")
+    assert cpc_mod.clasificar_nombre_app("desinstalar foo")[0] == "excluida"
+    assert cpc_mod.clasificar_nombre_app("foo setup") == ("excluida", "es un instalador")
+    assert cpc_mod.clasificar_nombre_app("steam support center") == ("excluida", "es un enlace a una página web")
+    assert cpc_mod.clasificar_nombre_app("foo manual")[0] == "excluida"
+    assert cpc_mod.clasificar_nombre_app("readme")[0] == "excluida"
+    assert cpc_mod.clasificar_nombre_app("windows powershell")[0] == "sensible"
+    assert cpc_mod.clasificar_nombre_app("simbolo del sistema")[0] == "sensible"
+    assert cpc_mod.clasificar_nombre_app("steam") == ("normal", "")
+
+
+def test_indice_del_menu_inicio_resuelve_por_nombre(crear: Callable[..., ControlPC], tmp_path: Path,
+                                                    correr: Any) -> None:
+    menu, paquetes = _menu_inicio(tmp_path)
+    control = crear("win", api=FakeWin(), menu=menu, paquetes=paquetes)
+
+    async def escenario() -> dict[str, Any]:
+        return {consulta: await control.resolver_app_local(consulta) for consulta in (
+            "steam", "Steam", "chrome", "visual", "vs code", "calc", "calculadora", "portal 2", "notepad++",
+            "uninstall visual studio code", "foo website", "foo", "powershell", "stem", "abc xyz", "léeme",
+            "foo manual", "")}
+
+    r = correr(escenario())
+    assert r["steam"].estado == "unica" and r["steam"].app.nombre == "Steam" and r["steam"].nivel == "descubierta"
+    assert r["Steam"].app == r["steam"].app
+    assert r["chrome"].app.nombre == "Google Chrome"          # gana la que menos palabras le sobran
+    assert r["visual"].app.nombre == r["vs code"].app.nombre == "Visual Studio Code"
+    assert r["calc"].app.nombre == r["calculadora"].app.nombre == "Calculadora"
+    assert r["calc"].app.objetivo == "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"
+    assert r["portal 2"].app.nombre == "Portal 2"             # .url de Steam (no es una web)
+    assert r["notepad++"].app.nombre == "Notepad++"
+    assert r["uninstall visual studio code"].estado == "excluida"
+    assert r["uninstall visual studio code"].motivo == "es un desinstalador"
+    assert r["foo website"].estado == "excluida" and "web" in r["foo website"].motivo
+    assert r["foo manual"].estado == "excluida"
+    assert r["foo"].estado == "varias" and set(r["foo"].opciones) == {"Foo Editor", "Foo Viewer"}
+    assert r["powershell"].estado == "unica" and r["powershell"].nivel == "sensible"
+    assert r["stem"].estado == "ninguna" and r["stem"].opciones == ("Steam",) and r["stem"].app is None
+    assert r["abc xyz"].estado == "ninguna" and r["abc xyz"].opciones == ()
+    assert r["léeme"].estado == "ninguna" and r[""].estado == "ninguna"
+    nombres = {a.nombre for a in control._apps}
+    assert "Foo Setup" not in nombres and "Steam Support Center" not in nombres and "desktop" not in nombres
+    assert all(cpc_mod.SAFE_CLAVE_APP_RE.fullmatch(a.clave) for a in control._apps)
+    assert control.nivel_app_local("steam") == ("descubierta", "Steam")
+    assert control.nivel_app_local("windows_powershell") == ("sensible", "Windows PowerShell")
+    assert control.nivel_app_local("no_existe") is None and control.nivel_app_local(None) is None  # type: ignore[arg-type]
+
+
+def test_desinstalador_entre_parentesis_no_ocupa_el_sitio_de_la_app(crear: Callable[..., ControlPC], tmp_path: Path,
+                                                                    correr: Any) -> None:
+    """"Steam (Uninstall).lnk" va antes que "Steam.lnk" (``sorted``) y se normaliza igual."""
+    menu = tmp_path / "Start Menu" / "Programs"
+    for relativa in ("Steam/Steam (Uninstall).lnk", "Steam/Steam.lnk", "Zoom/Zoom (Uninstall).lnk",
+                     "Discord/Discord (desinstalar).lnk", "Foo/Foo (beta).lnk", "Foo/Foo.lnk",
+                     "Anaconda3 (64-bit)/Anaconda Prompt (anaconda3).lnk", "Anaconda3 (64-bit)/Spyder (anaconda3).lnk",
+                     "Windows Subsystem for Linux.lnk", "System Tools/Run.lnk", "Temple Run.lnk"):
+        ruta = menu / relativa
+        ruta.parent.mkdir(parents=True, exist_ok=True)
+        ruta.write_bytes(b"lnk")
+    control = crear("win", api=FakeWin(), menu=menu, paquetes=None)
+
+    async def escenario() -> dict[str, Any]:
+        resueltas = {consulta: await control.resolver_app_local(consulta) for consulta in (
+            "steam", "zoom", "discord", "foo", "anaconda prompt", "spyder", "windows subsystem for linux", "run",
+            "temple run")}
+        resueltas["recordar_prompt"] = await control.aprobar_app_local(resueltas["anaconda prompt"].app.clave)
+        return resueltas
+
+    r = correr(escenario())
+    assert r["steam"].estado == "unica" and r["steam"].app.nombre == "Steam"
+    assert r["steam"].app.objetivo.endswith("Steam.lnk")
+    assert r["zoom"].estado == "excluida" and r["zoom"].motivo == "es un desinstalador"
+    assert r["discord"].estado == "excluida" and r["discord"].motivo == "es un desinstalador"
+    assert r["foo"].app.nombre == "Foo"                    # gana el nombre sin paréntesis
+    nombres = {a.nombre for a in control._apps}
+    assert not any("Uninstall" in n or "desinstalar" in n for n in nombres)
+    assert r["anaconda prompt"].nivel == "sensible" and r["recordar_prompt"] is False
+    assert r["windows subsystem for linux"].nivel == "sensible" and r["run"].nivel == "sensible"
+    assert r["spyder"].nivel == "descubierta" and r["temple run"].nivel == "descubierta"
+    assert cpc_mod.clasificar_nombre_app("anaconda prompt")[0] == "sensible"
+    assert cpc_mod.clasificar_nombre_app("ejecutar")[0] == "sensible"
+    assert cpc_mod.clasificar_nombre_app("temple run") == ("normal", "")
+
+
+def test_alias_de_rams_apps_y_aprobaciones_persistentes(crear: Callable[..., ControlPC], tmp_path: Path,
+                                                        settings_prueba: Any, correr: Any) -> None:
+    menu, paquetes = _menu_inicio(tmp_path)
+    ajustes = settings_prueba.con(apps_permitidas_items=(("juegos", "steam"),))
+    control = crear("win", api=FakeWin(), menu=menu, paquetes=paquetes, settings=ajustes)
+
+    async def escenario() -> tuple[Any, ...]:
+        por_alias = await control.resolver_app_local("juegos")
+        chrome = await control.resolver_app_local("chrome")
+        aprobada = await control.aprobar_app_local(chrome.app.clave)
+        consola = await control.aprobar_app_local("windows_powershell")
+        desconocida = await control.aprobar_app_local("no_existe")
+        otro = crear("win", api=FakeWin(), menu=menu, paquetes=paquetes, settings=ajustes)
+        await otro.resolver_app_local("steam")
+        return por_alias, chrome, aprobada, consola, desconocida, otro
+
+    por_alias, chrome, aprobada, consola, desconocida, otro = correr(escenario())
+    assert por_alias.app.nombre == "Steam" and por_alias.nivel == "permitida"
+    assert control.nivel_app_local("steam") == ("permitida", "Steam")
+    assert aprobada is True and control.nivel_app_local(chrome.app.clave)[0] == "permitida"
+    assert consola is False and desconocida is False      # las sensibles nunca se recuerdan
+    assert control.nivel_app_local("windows_powershell")[0] == "sensible"
+    datos = json.loads((Path(ajustes.data_dir) / "apps_aprobadas.json").read_text(encoding="utf-8"))
+    assert [e["nombre"] for e in datos["aprobadas"]] == ["Google Chrome"]
+    assert datos["aprobadas"][0]["objetivo"] == chrome.app.objetivo
+    assert otro.nivel_app_local(chrome.app.clave)[0] == "permitida"      # persiste entre arranques
+
+
+def test_lanzar_app_local_abre_el_acceso_con_startfile(crear: Callable[..., ControlPC], tmp_path: Path,
+                                                       abiertos: list[str], correr: Any) -> None:
+    menu, paquetes = _menu_inicio(tmp_path)
+    control = crear("win", api=FakeWin(), menu=menu, paquetes=paquetes)
+
+    async def escenario() -> list[ResultadoControl]:
+        resultados = [await control.lanzar_app_local("steam"), await control.lanzar_app_local("calculadora"),
+                      await control.lanzar_app_local("no_existe"), await control.lanzar_app_local("foo")]
+        (menu / "Google Chrome.lnk").unlink()
+        resultados.append(await control.lanzar_app_local("google_chrome"))
+        return resultados
+
+    steam, calc, nada, varias, borrada = correr(escenario())
+    assert steam.ok and steam.mensaje == "Abrí Steam." and steam.datos["app"] == "steam"
+    assert re.fullmatch(r"[0-9a-f]{12}", steam.datos["sha256_12"])
+    assert calc.ok
+    assert nada.ok is False and varias.ok is False
+    assert borrada.ok is False and "ya no está" in borrada.mensaje
+    assert abiertos == [str(menu / "Steam" / "Steam.lnk"),
+                        "shell:AppsFolder\\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App"]
+
+
+def test_lanzar_app_local_comparte_cupo_y_no_sale_del_menu(crear: Callable[..., ControlPC], tmp_path: Path,
+                                                           abiertos: list[str], correr: Any) -> None:
+    menu, paquetes = _menu_inicio(tmp_path)
+    control = crear("win", api=FakeWin(), menu=menu, paquetes=paquetes)
+
+    async def escenario() -> tuple[list[bool], ResultadoControl]:
+        oks = [(await control.abrir_destino("youtube")).ok for _ in range(5)]
+        oks.append((await control.lanzar_app_local("steam")).ok)
+        septima = await control.lanzar_app_local("steam")
+        return oks, septima
+
+    oks, septima = correr(escenario())
+    assert oks == [True] * 6 and septima.ok is False and "6 cosas" in septima.mensaje
+    fuera = tmp_path / "fuera.lnk"
+    fuera.write_bytes(b"lnk")
+    assert cpc_mod._dentro_de(str(fuera), [menu]) is False
+    assert cpc_mod._dentro_de(str(menu / "Steam" / ".." / ".." / ".." / "fuera.lnk"), [menu]) is False
+    assert cpc_mod._dentro_de(str(menu / "Steam" / "Steam.lnk"), [menu]) is True
+    assert cpc_mod._dentro_de("Steam.lnk", [menu]) is False
+    assert cpc_mod._dentro_de(str(menu / "léeme.txt"), [menu]) is False
+
+
+def test_apps_locales_solo_en_windows_y_con_el_ajuste(crear: Callable[..., ControlPC], tmp_path: Path,
+                                                      settings_prueba: Any, abiertos: list[str],
+                                                      correr: Any) -> None:
+    menu, paquetes = _menu_inicio(tmp_path)
+    linux = crear("hypr", hypr=FakeHypr(), programas=PROGRAMAS_LINUX, menu=menu, paquetes=paquetes)
+    apagado = crear("win", api=FakeWin(), menu=menu, paquetes=paquetes,
+                    settings=settings_prueba.con(apps_menu_inicio=False))
+
+    async def escenario() -> tuple[Any, ...]:
+        return (await linux.resolver_app_local("steam"), await apagado.resolver_app_local("steam"),
+                await apagado.lanzar_app_local("steam"))
+
+    en_linux, desactivada, lanzada = correr(escenario())
+    assert en_linux.estado == "desactivada" and en_linux.motivo == "solo en Windows"
+    assert desactivada.estado == "desactivada" and "RAMS_APPS_MENU_INICIO" in desactivada.motivo
+    assert lanzada.ok is False and abiertos == []
+    assert linux.apps_locales_disponibles is False and apagado.apps_locales_disponibles is False
+
+
+def test_media_con_teclas_multimedia(crear: Callable[..., ControlPC], correr: Any) -> None:
+    api = FakeWinMedia()
+    control = crear("win", api=api)
+
+    async def escenario() -> list[ResultadoControl]:
+        return [await control.media(orden) for orden in ("play_pause", "siguiente", "anterior", "subir_volumen")]
+
+    pausa, siguiente, anterior, invalida = correr(escenario())
+    assert pausa.ok and siguiente.ok and anterior.ok and invalida.ok is False
+    assert api.teclas_media == [0xB3, 0xB0, 0xB1]
+    assert control.ts_ultima_inyeccion() is not None
+    rechazo = crear("win", api=FakeWinMedia(insertados=0))
+    assert correr(rechazo.media("play_pause")).ok is False
+    linux = crear("hypr", hypr=FakeHypr(), programas=PROGRAMAS_LINUX)
+    assert correr(linux.media("play_pause")).ok is False
+
+
+def test_media_tiene_cupo_por_minuto(crear: Callable[..., ControlPC], correr: Any) -> None:
+    reloj = RelojFalso()
+    api = FakeWinMedia()
+    control = crear("win", api=api, reloj=reloj)
+
+    async def escenario() -> list[bool]:
+        return [(await control.media("siguiente")).ok for _ in range(31)]
+
+    resultados = correr(escenario())
+    assert resultados == [True] * 30 + [False] and len(api.teclas_media) == 30
+    reloj.t += 61.0
+    assert correr(control.media("siguiente")).ok is True
+
+
+def test_titulo_de_la_ventana_activa(crear: Callable[..., ControlPC]) -> None:
+    api = FakeWin()
+    control = crear("win", api=api)
+    assert control.titulo_activa() == "WhatsApp - Google Chrome"
+    api.fg = None
+    assert control.titulo_activa() is None
+    hypr = crear("hypr", hypr=FakeHypr(), programas=PROGRAMAS_LINUX)
+    hypr._hypr_activa = {"title": "Bancolombia — Firefox"}
+    assert hypr.titulo_activa() == "Bancolombia — Firefox"
+    assert crear("win", api=None).titulo_activa() is None

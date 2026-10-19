@@ -11,14 +11,24 @@
  * - Se conecta a R.A.M.S. por WebSocket `/escritorio` (WebSocket global de Node, sin Origin) con el
  *   token del archivo privado (lib/token.js). Nunca el renderer.
  * - Bandeja, atajos globales (Win/X11), CLI de 2.ª instancia (`--amadeus=…`), chat aparte.
+ * - Respaldo Puter del Área de Broca (§C2.15, lib/puter.js): ventana OCULTA con Puter.js en la
+ *   partición `persist:puter` y relevo WS `/escritorio` ↔ IPC en este proceso (`llm.pedir` →
+ *   `puter:pedir`, `puter:respuesta` → `llm.respuesta`, `puter.estado`). El token de R.A.M.S. nunca
+ *   llega a esas páginas. Inicio de sesión desde la bandeja con una ventanita y su botón.
  * - `--smoke`: comprobación oculta (sin bandeja, atajos, red ni ventanas visibles), ≤ 5 s.
  *
+ * - Tarjetas aprobables (v0.2.2, docs/V022_CORREO_DRIVE_SCRIPTS.md §13.3): `chat:tarjeta` (botones)
+ *   y `chat:copiar` (portapapeles) solo desde el chat; el portapapeles solo recibe el código de una
+ *   tarjeta de script vigente que envió R.A.M.S. La decisión sale con su propio tope (≤ 60 KiB,
+ *   MAX_WS_SALIENTE_TARJETA); todo lo demás sigue en 8 KiB.
+ *
  * Seguridad: contextIsolation + sandbox + preload mínimo; IPC validado por origen/emisor; CSP por
- * cabecera; navegación y ventanas nuevas bloqueadas; permisos del navegador denegados.
+ * cabecera; navegación y ventanas nuevas bloqueadas (salvo el inicio de sesión de puter.com);
+ * permisos del navegador denegados.
  */
 
 const {
-  app, BrowserWindow, Tray, Menu, globalShortcut, screen, ipcMain, nativeImage, session, shell, Notification,
+  app, BrowserWindow, Tray, Menu, globalShortcut, screen, ipcMain, nativeImage, session, shell, Notification, clipboard,
 } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
@@ -32,6 +42,10 @@ const { crearEscritorio } = require('./lib/mapeo');
 const { leerToken, urlConexion, urlSinSecreto } = require('./lib/token');
 const { hashesImportmap, mismosHashes, construirCsp, conCsp, esDocumentoDelVisor } = require('./lib/csp');
 const { origenVisor, resolverAtajos } = require('./lib/config');
+const { crearRelevoPuter, puterHabilitado, modeloDefecto, esfuerzoRazonamiento } = require('./lib/puter');
+const {
+  URL_TRABAJO, URL_CONECTAR, cabecerasPuter, resolverRecurso, esPaginaPuter, esUrlPuterPermitida,
+} = require('./lib/puter-sitio');
 
 // ---------------------------------------------------------------------------------------------
 // Configuración y plataforma
@@ -51,6 +65,13 @@ const T_OVERLAY = 'Amadeus Overlay'; // las reglas de Hyprland y ControlPC busca
 const T_CHAT = 'Amadeus Chat';
 const PART_OVERLAY = SMOKE ? 'amadeus-smoke-overlay' : 'amadeus-overlay'; // sesiones en memoria
 const PART_CHAT = SMOKE ? 'amadeus-smoke-chat' : 'amadeus-chat';
+// Puter (§C2.15): la sesión de Puter se guarda entre arranques; el smoke usa una en memoria.
+const T_PUTER = 'Amadeus Puter';      // ventana oculta: nunca se muestra
+const T_CONECTAR = 'Conectar Puter';
+const PART_PUTER = SMOKE ? 'amadeus-smoke-puter' : 'persist:puter';
+const PUTER = puterHabilitado(process.env);
+const CONFIG_PUTER = modeloDefecto(process.env);
+const DIR_PUTER = path.join(__dirname, 'puter');
 
 // Solo orígenes locales (§C2.12): el overlay carga este origen y le da window.amadeusDesktop.
 const CONFIG_VISOR = origenVisor(process.env.VTUBER_AI_URL);
@@ -72,6 +93,15 @@ const CICLO_GEOMETRIA_MS = 10000; // Hyprland: refresco de posición/suelo mient
 const TIMEOUT_HYPR_MS = 150;      // petición de cursor al socket de Hyprland
 const BACKOFF_MIN_MS = 1000;
 const BACKOFF_MAX_MS = 30000;
+const MAX_WS_ENTRANTE = 65536;            // entrantes de R.A.M.S. (caracteres)
+const MAX_WS_PEDIDO_LLM = 1024 * 1024;    // solo `llm.pedir` (R.A.M.S. lo limita a 768 KiB de JSON)
+const MAX_WS_SALIENTE = 8192;             // bytes UTF-8 (R.A.M.S. acepta ≤ 8 KiB; llm.respuesta ≤ 64 KiB)
+// v0.2.2 (§13.3): tope de lo que el mapeo puede pedir con `maxBytes` (solo tarjeta_decision, ≤ 60 KiB).
+const MAX_WS_SALIENTE_TARJETA = 61440;
+const RECARGA_PUTER_MIN_MS = 2000;
+const RECARGA_PUTER_MAX_MS = 60000;
+/** La ventana oculta lleva este tiempo cargada sin caerse: la espera de recarga vuelve al mínimo. */
+const RECARGA_PUTER_ESTABLE_MS = 60000;
 
 const log = (...a) => console.log('[amadeus]', ...a);
 const aviso = (...a) => console.warn('[amadeus]', ...a);
@@ -107,6 +137,10 @@ let cajaTimer = null;
 let ultimaCajaRel = null;
 let chatPosicionado = false;
 const notificaciones = new Set();
+let puterWin = null;                  // ventana oculta de Puter (trabajo.html)
+let puterListo = false;               // trabajo.html cargado: ya se le pueden mandar pedidos
+let conectar = null;                  // ventanita «Conectar Puter»
+const recargaPuter = { timer: null, espera: RECARGA_PUTER_MIN_MS, estable: null };
 
 const autoridad = new AutoridadClicks();
 const limitadorCaja = new LimitadorCaja({ intervaloMs: 500 });
@@ -234,7 +268,8 @@ const escritorio = crearEscritorio({
   overlayListo: () => overlayListo,
   enviarOverlay,
   enviarChat,
-  enviarWs: (obj) => enlace.enviar(obj),
+  // Sin `maxBytes` (todo salvo tarjeta_decision), 8 KiB como siempre; con él, nunca más de 60 KiB.
+  enviarWs: (obj, maxBytes) => enlace.enviar(obj, Math.min(Number.isInteger(maxBytes) && maxBytes > 0 ? maxBytes : MAX_WS_SALIENTE, MAX_WS_SALIENTE_TARJETA)),
   forzarClickThrough,
   notificar: mostrarNotificacion,
   abrirExterno: (url) => {
@@ -249,6 +284,19 @@ const escritorio = crearEscritorio({
   alCambiarVisibilidad,
   alCambiarEstado: () => reconstruirMenu(),
 }, { pid: process.pid, version: app.getVersion() });
+
+/** Relevo WS ↔ ventana oculta de Puter (lib/puter.js). Nunca registra prompts ni respuestas. */
+const relevo = crearRelevoPuter({
+  enviarWs: (obj, maxBytes) => enlace.enviar(obj, maxBytes),
+  enviarVentana: enviarPuter,
+  temporizador: (fn, ms) => {
+    const t = setTimeout(fn, ms);
+    return () => clearTimeout(t);
+  },
+  ahora: Date.now,
+  alCambiarEstado: () => reconstruirMenu(),
+  registrar: (texto) => log(texto),
+}, { habilitado: PUTER, modelo: CONFIG_PUTER.modelo, esfuerzo: esfuerzoRazonamiento(process.env) });
 
 // ---------------------------------------------------------------------------------------------
 // Cursor global y caja
@@ -556,19 +604,29 @@ const enlace = {
       if (ultimaCajaRel) ofrecerCaja(ultimaCajaRel);
     });
     ws.addEventListener('message', (ev) => {
-      if (typeof ev.data !== 'string' || ev.data.length > 65536) return;
+      if (this.ws !== ws || typeof ev.data !== 'string' || ev.data.length > MAX_WS_PEDIDO_LLM) return;
       let m;
       try {
         m = JSON.parse(ev.data);
       } catch {
         return;
       }
+      if (!m || typeof m !== 'object' || Array.isArray(m)) return;
+      // `llm.pedir` (≤ 1 MiB) va al relevo de Puter y no pasa por el mapeo: no cierra la revisión
+      // de confirmaciones ni toca el chat. Todo lo demás sigue limitado a 64 KiB.
+      if (m.tipo === 'llm.pedir') {
+        relevo.alPedido(m.datos);
+        return;
+      }
+      if (ev.data.length > MAX_WS_ENTRANTE) return;
       escritorio.alMensajeWs(m);
+      if (m.tipo === 'hola') relevo.alHola(); // puter.estado justo después del `hola`
     });
     ws.addEventListener('close', (ev) => {
       clearTimeout(apertura);
       if (this.ws !== ws) return;
       this.ws = null;
+      relevo.alDesconectado();
       escritorio.alDesconectado();
       if (ev && ev.code === 4001) this.registrar('otra instancia de Amadeus Desktop ocupó el enlace');
       else this.registrar(`conexión cerrada (${ev ? ev.code : '?'})`);
@@ -584,7 +642,8 @@ const enlace = {
     this.timer = setTimeout(() => this.conectar(), espera);
   },
 
-  enviar(obj) {
+  /** Envía `obj` como JSON si cabe en `maxBytes` (UTF-8). true si salió por el WebSocket. */
+  enviar(obj, maxBytes = MAX_WS_SALIENTE) {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return false;
     let s;
@@ -593,7 +652,7 @@ const enlace = {
     } catch {
       return false;
     }
-    if (s.length > 8192) return false;
+    if (typeof s !== 'string' || Buffer.byteLength(s, 'utf8') > maxBytes) return false;
     try {
       ws.send(s);
       return true;
@@ -630,9 +689,38 @@ function endurecerSesion(ses) {
   ses.on('will-download', (e) => e.preventDefault());
 }
 
+/**
+ * Páginas propias de Puter servidas en `http://amadeus-puter.localhost` SIN red ni puertos: el
+ * main intercepta `http:` solo en la partición de Puter. Lo que no está en la lista → 404 (Puter.js
+ * habla con puter.com por `https:`, que no se intercepta).
+ */
+async function servirPuter(req) {
+  const metodo = req && typeof req.method === 'string' ? req.method : 'GET';
+  const r = resolverRecurso(req && req.url, metodo);
+  const vacio = (status) => new Response(null, {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' },
+  });
+  if (!r) return vacio(404);
+  try {
+    const cuerpo = metodo === 'HEAD' ? null : await fs.promises.readFile(path.join(DIR_PUTER, r.archivo));
+    return new Response(cuerpo, { status: 200, headers: cabecerasPuter(r.tipo) });
+  } catch {
+    return vacio(500);
+  }
+}
+
+function prepararSesionPuter() {
+  if (!PUTER) return;
+  const ses = session.fromPartition(PART_PUTER);
+  endurecerSesion(ses); // sin cámara, micro, descargas…: Puter.js solo necesita red y localStorage
+  ses.protocol.handle('http', servirPuter);
+}
+
 function prepararSesiones() {
   const sesOverlay = session.fromPartition(PART_OVERLAY);
   for (const ses of [session.defaultSession, sesOverlay, session.fromPartition(PART_CHAT)]) endurecerSesion(ses);
+  prepararSesionPuter();
   if (SMOKE) return; // el stub de smoke es file:// (sin cabeceras)
   sesOverlay.webRequest.onHeadersReceived((det, cb) => {
     if (esDocumentoDelVisor(det.url, VTUBER, det.resourceType)) {
@@ -860,6 +948,275 @@ function crearChat() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Puter: ventana oculta, ventanita de inicio de sesión y relevo (§C2.15)
+// ---------------------------------------------------------------------------------------------
+
+/** Preferencias de las páginas propias de Puter (ventana oculta y ventanita de conexión). */
+function preferenciasPuter(extra = {}) {
+  return {
+    preload: path.join(__dirname, 'preload-puter.js'),
+    partition: PART_PUTER,
+    contextIsolation: true,
+    sandbox: true,
+    nodeIntegration: false,
+    nodeIntegrationInSubFrames: false,
+    webviewTag: false,
+    spellcheck: false,
+    ...extra,
+  };
+}
+
+/** IPC a la ventana oculta; false si no está cargada (el relevo responde «otro» al instante). */
+function enviarPuter(canal, datos) {
+  if (!vivo(puterWin) || !puterListo) return false;
+  try {
+    puterWin.webContents.send(canal, datos);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function cargarPuter() {
+  if (!vivo(puterWin) || saliendoApp) return;
+  puterListo = false;
+  puterWin.loadURL(URL_TRABAJO).catch(() => { /* did-fail-load reprograma */ });
+}
+
+/**
+ * Recarga tras un fallo, con espera creciente (2 s → 60 s) para no entrar en un bucle de caídas.
+ * La espera solo vuelve a 2 s cuando la página lleva RECARGA_PUTER_ESTABLE_MS cargada sin caerse
+ * (armarEstabilidadPuter): el primer `puter:estado` de la página NO cuenta, porque trabajo.js lo
+ * manda al arrancar, antes incluso de cargar puter.js, y lo que suele tumbar la ventana viene después.
+ */
+function programarRecargaPuter() {
+  cancelarEstabilidadPuter();
+  if (recargaPuter.timer || saliendoApp || SMOKE || !vivo(puterWin)) return;
+  const espera = recargaPuter.espera;
+  recargaPuter.espera = Math.min(espera * 2, RECARGA_PUTER_MAX_MS);
+  recargaPuter.timer = setTimeout(() => {
+    recargaPuter.timer = null;
+    cargarPuter();
+  }, espera);
+}
+
+/** trabajo.html terminó de cargar: si aguanta RECARGA_PUTER_ESTABLE_MS, la espera vuelve al mínimo. */
+function armarEstabilidadPuter() {
+  cancelarEstabilidadPuter();
+  if (SMOKE || saliendoApp) return;
+  recargaPuter.estable = setTimeout(() => {
+    recargaPuter.estable = null;
+    recargaPuter.espera = RECARGA_PUTER_MIN_MS;
+  }, RECARGA_PUTER_ESTABLE_MS);
+}
+
+function cancelarEstabilidadPuter() {
+  clearTimeout(recargaPuter.estable);
+  recargaPuter.estable = null;
+}
+
+/**
+ * Recarga la ventana oculta (sesión nueva o cerrada): lo que estaba en curso falla con `error` y
+ * el estado vuelve a «sin cargar» hasta que la página informe.
+ */
+function recargarPuter(error = 'otro') {
+  relevo.alReinicioVentana(error);
+  clearTimeout(recargaPuter.timer);
+  recargaPuter.timer = null;
+  cargarPuter();
+}
+
+function crearPuter() {
+  if (!PUTER) return;
+  puterWin = new BrowserWindow({
+    width: 480,
+    height: 360,
+    title: T_PUTER,
+    show: false,
+    skipTaskbar: true,
+    focusable: false,
+    paintWhenInitiallyHidden: false,
+    webPreferences: preferenciasPuter({ backgroundThrottling: false }), // oculta pero con plazos fiables
+  });
+  puterWin.on('page-title-updated', (e) => e.preventDefault());
+  puterWin.on('close', (e) => {
+    if (!saliendoApp) e.preventDefault(); // vive mientras viva la app
+  });
+  const wc = puterWin.webContents;
+  endurecerContenidos(wc, (url) => esPaginaPuter(url, 'trabajo.html')); // nunca abre ventanas
+  wc.on('did-start-navigation', (d) => {
+    if (!d || !d.isMainFrame || d.isSameDocument) return;
+    cancelarEstabilidadPuter(); // la estabilidad se mide por documento, desde su did-finish-load
+    if (!puterListo) return;
+    puterListo = false;
+    relevo.alReinicioVentana('otro');
+  });
+  wc.on('did-finish-load', () => {
+    if (wc.getURL() !== URL_TRABAJO) return;
+    puterListo = true;
+    armarEstabilidadPuter();
+    wc.send('puter:info', { modelo: relevo.modelo });
+  });
+  wc.on('did-fail-load', (_e, codigo, descripcion, _url, principal) => {
+    if (!principal || codigo === -3) return;
+    puterListo = false;
+    aviso(`no se pudo cargar la ventana de Puter (${codigo} ${descripcion}); reintento`);
+    programarRecargaPuter();
+  });
+  wc.on('render-process-gone', (_e, det) => {
+    puterListo = false;
+    aviso(`la ventana de Puter se cayó (${det && det.reason}); la recargo`);
+    relevo.alReinicioVentana('otro', 'ventana_caida');
+    programarRecargaPuter();
+  });
+  cargarPuter();
+}
+
+/**
+ * La ventana emergente de inicio de sesión (puter.com): sin más ventanas y sin salir de puter.com.
+ * Hereda la partición de su opener (la sesión queda en `persist:puter`).
+ */
+function endurecerPopupPuter(win) {
+  if (!win || typeof win.isDestroyed !== 'function' || win.isDestroyed()) return;
+  const wc = win.webContents;
+  wc.setWindowOpenHandler(() => ({ action: 'deny' }));
+  const bloquear = (e, urlVieja) => {
+    const url = (e && e.url) || urlVieja;
+    if (!esUrlPuterPermitida(url)) e.preventDefault();
+  };
+  wc.on('will-navigate', bloquear);
+  wc.on('will-redirect', bloquear);
+  wc.on('will-attach-webview', (e) => e.preventDefault());
+}
+
+/** window.open desde la ventanita: solo `https://puter.com` y subdominios, en una ventana sandbox. */
+function abrirVentanaPuter({ url } = {}) {
+  if (!esUrlPuterPermitida(url)) {
+    aviso('Puter: bloqueada una ventana fuera de puter.com');
+    return { action: 'deny' };
+  }
+  return {
+    action: 'allow',
+    overrideBrowserWindowOptions: {
+      width: 520,
+      height: 720,
+      title: 'Puter',
+      autoHideMenuBar: true,
+      backgroundColor: '#ffffff',
+      webPreferences: {
+        contextIsolation: true,
+        sandbox: true,
+        nodeIntegration: false,
+        nodeIntegrationInSubFrames: false,
+        webviewTag: false,
+        spellcheck: false,
+      },
+    },
+  };
+}
+
+/**
+ * Ventanita «Conectar Puter» (bandeja o `--amadeus=puter`, siempre por acción del usuario): el
+ * login de Puter abre una ventana emergente que necesita el gesto de su botón.
+ */
+function abrirConectarPuter() {
+  if (!PUTER || SMOKE) return false;
+  if (vivo(conectar)) {
+    conectar.show();
+    conectar.focus();
+    return true;
+  }
+  conectar = new BrowserWindow({
+    width: 440,
+    height: 400,
+    minWidth: 360,
+    minHeight: 320,
+    title: T_CONECTAR,
+    show: false,
+    resizable: true,
+    minimizable: false,
+    maximizable: false,
+    fullscreenable: false,
+    backgroundColor: '#0b0d12',
+    autoHideMenuBar: true,
+    webPreferences: preferenciasPuter(),
+  });
+  const ventana = conectar;
+  ventana.removeMenu();
+  ventana.on('page-title-updated', (e) => e.preventDefault());
+  ventana.once('ready-to-show', () => {
+    if (vivo(ventana)) {
+      ventana.show();
+      ventana.focus();
+    }
+  });
+  ventana.on('closed', () => {
+    if (conectar === ventana) conectar = null;
+  });
+  const wc = ventana.webContents;
+  endurecerContenidos(wc, (url) => esPaginaPuter(url, 'conectar.html'));
+  wc.setWindowOpenHandler(abrirVentanaPuter); // sustituye al «deny» de endurecerContenidos
+  wc.on('did-create-window', (win) => endurecerPopupPuter(win));
+  wc.on('did-finish-load', () => {
+    if (wc.getURL() === URL_CONECTAR) wc.send('puter:info', { modelo: relevo.modelo });
+  });
+  ventana.loadURL(URL_CONECTAR).catch(() => { /* la ventanita muestra su propio error */ });
+  return true;
+}
+
+/** `puter:conexion` de la ventanita: `{ok, nueva, error}`. */
+function alConexionPuter(d) {
+  if (!d || typeof d !== 'object') return;
+  if (d.ok !== true) {
+    const codigo = typeof d.error === 'string' && /^[a-z_]{1,24}$/.test(d.error) ? d.error : 'otro';
+    log(`Puter: no se pudo iniciar sesión (${codigo})`);
+    return;
+  }
+  // Sesión nueva o cambio de cuenta: la ventana oculta tiene que leer el token nuevo. Si ya estaba
+  // iniciada pero la ventana oculta no la ve (p. ej. no tenía la marca), también se recarga.
+  if (d.nueva === true || !relevo.estado().listo) {
+    log(d.nueva === true ? 'Puter: sesión iniciada' : 'Puter: sesión ya iniciada; recargo la ventana oculta');
+    recargarPuter('otro');
+  }
+}
+
+/** «Desconectar Puter»: borra la sesión de Puter (y la marca) de la partición y recarga. */
+async function desconectarPuter() {
+  if (!PUTER) return false;
+  if (vivo(conectar)) conectar.close();
+  relevo.alReinicioVentana('sin_sesion');
+  puterListo = false;
+  try {
+    await session.fromPartition(PART_PUTER).clearStorageData();
+  } catch (err) {
+    aviso('Puter: no se pudo borrar la sesión:', err && err.message);
+  }
+  log('Puter: sesión cerrada');
+  cargarPuter(); // sin la marca no vuelve a cargar puter.js
+  return true;
+}
+
+/** Entradas de Puter en la bandeja. */
+function menuPuter() {
+  if (!PUTER) return [];
+  const p = relevo.estado();
+  if (p.sesion) {
+    return [
+      {
+        label: p.listo
+          ? `Puter: conectado (${p.modelo}${p.error === 'modelo_desconocido' ? ', no aparece en Puter' : ''})`
+          : 'Puter: conectado (cargando…)',
+        enabled: false,
+      },
+      { label: 'Desconectar Puter', click: () => { desconectarPuter(); } },
+    ];
+  }
+  const items = [{ label: 'Conectar Puter (IA de respaldo)…', click: () => abrirConectarPuter() }];
+  if (p.error === 'carga_fallida') items.unshift({ label: 'Puter: sin conexión con puter.com', enabled: false });
+  return items;
+}
+
+// ---------------------------------------------------------------------------------------------
 // IPC (validado por emisor)
 // ---------------------------------------------------------------------------------------------
 
@@ -876,6 +1233,20 @@ function desdeChat(e) {
   if (!vivo(chat) || !e || e.sender !== chat.webContents) return false;
   const f = e.senderFrame;
   return !!f && !f.parent && f.url === URL_CHAT;
+}
+
+/** IPC de la ventana oculta de Puter: solo de su webContents con trabajo.html (origen propio). */
+function desdePuter(e) {
+  if (!vivo(puterWin) || !e || e.sender !== puterWin.webContents) return false;
+  const f = e.senderFrame;
+  return !!f && !f.parent && f.url === URL_TRABAJO;
+}
+
+/** IPC de la ventanita «Conectar Puter»: solo de su webContents con conectar.html. */
+function desdeConectar(e) {
+  if (!vivo(conectar) || !e || e.sender !== conectar.webContents) return false;
+  const f = e.senderFrame;
+  return !!f && !f.parent && f.url === URL_CONECTAR;
 }
 
 const smoke = { marcas: new Set(), esperas: new Map() };
@@ -942,6 +1313,32 @@ function registrarIpc() {
   ipcMain.on('chat:hide', (e) => {
     if (desdeChat(e) && vivo(chat)) chat.hide();
   });
+  // v0.2.2 (§13.3): botones de las tarjetas aprobables. Solo desde el chat.
+  ipcMain.handle('chat:tarjeta', (e, id, sha, decision, extra) => {
+    if (!desdeChat(e)) return false;
+    return escritorio.alDecidirTarjeta(id, sha, decision, extra); // false = no salió: el chat reactiva los botones
+  });
+  ipcMain.on('chat:copiar', (e, id) => {
+    if (!desdeChat(e)) return;
+    // Solo el código de una tarjeta de SCRIPT vigente que envió R.A.M.S.; nunca texto del renderer.
+    const c = escritorio.codigoDeTarjeta(id);
+    if (c) clipboard.writeText(c);
+  });
+  // Puter (§C2.15): cada canal solo desde la ventana que le corresponde.
+  ipcMain.on('puter:estado', (e, d) => {
+    // No reinicia la espera de recarga: eso solo lo hace la estabilidad (armarEstabilidadPuter).
+    if (!desdePuter(e) || !relevo.alEstadoVentana(d)) return;
+    if (SMOKE) smokeMarcar('puter');
+  });
+  ipcMain.on('puter:respuesta', (e, d) => {
+    if (desdePuter(e)) relevo.alRespuestaVentana(d);
+  });
+  ipcMain.on('puter:conexion', (e, d) => {
+    if (desdeConectar(e)) alConexionPuter(d);
+  });
+  ipcMain.on('puter:cerrar', (e) => {
+    if (desdeConectar(e) && vivo(conectar)) conectar.close();
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -997,6 +1394,7 @@ function reconstruirMenu() {
     { label: 'Pausar visión', click: () => escritorio.control('pausar_vision', 'local') },
     { label: 'Dejar pasar clics', click: () => escritorio.emergencia() },
     { type: 'separator' },
+    ...(PUTER ? [...menuPuter(), { type: 'separator' }] : []),
     { label: e.enLinea ? 'R.A.M.S.: en línea' : 'R.A.M.S.: desconectada', enabled: false },
     { label: 'Salir', click: () => salir() },
   ]);
@@ -1067,6 +1465,7 @@ function ejecutarComando(cmd) {
     case 'basta': return escritorio.control('basta_travesuras', 'local');
     case 'vision_pausa': return escritorio.control('pausar_vision', 'local');
     case 'clics': return escritorio.emergencia();
+    case 'puter': return abrirConectarPuter();
     default: return false;
   }
 }
@@ -1084,6 +1483,9 @@ function aplicarAutoarranque() {
 
 function salir() {
   saliendoApp = true;
+  clearTimeout(recargaPuter.timer);
+  recargaPuter.timer = null;
+  cancelarEstabilidadPuter();
   enlace.detener();
   detenerCursor();
   detenerGeometriaHypr();
@@ -1096,11 +1498,13 @@ function salir() {
 
 function arrancar() {
   if (CONFIG_VISOR.aviso) aviso(CONFIG_VISOR.aviso);
+  if (CONFIG_PUTER.aviso) aviso(CONFIG_PUTER.aviso);
   if (WIN) app.setAppUserModelId('co.rams.amadeus-desktop');
   prepararSesiones();
   registrarIpc();
   crearOverlay();
   crearChat();
+  crearPuter();
   crearBandeja();
   registrarAtajos();
   if (!WAYLAND) {
@@ -1190,13 +1594,44 @@ function limpiarPerfilesSmoke() {
   }
 }
 
+/**
+ * Smoke de Puter (§C2.15): la ventana oculta carga trabajo.html por el protocolo propio (con CSP
+ * y 404 para lo demás), expone solo `amadeusPuter` aislado, informa su estado y, sin sesión, NO
+ * carga puter.js; un `llm.pedir` falla al instante con «sin_sesion» sin abrir nada.
+ */
+async function smokePuter(cargado) {
+  await cargado;
+  await smokeEsperar('puter'); // primer puter:estado de la página, validado por emisor
+  const r = await puterWin.webContents.executeJavaScript(`(async () => {
+    const api = window.amadeusPuter;
+    if (!api || api.version !== 1 || typeof window.require !== 'undefined' ||
+        typeof window.ipcRenderer !== 'undefined' || typeof window.process !== 'undefined') return 'sin puente aislado';
+    if (typeof window.puter !== 'undefined' || document.querySelector('script[src*="puter.com"]')) {
+      return 'cargó puter.js sin que el usuario conectara Puter';
+    }
+    const pagina = await fetch('/trabajo.html', { cache: 'no-store' });
+    const csp = pagina.headers.get('content-security-policy') || '';
+    if (!csp.includes("script-src 'self' https://js.puter.com;") || !csp.includes("default-src 'none'")) return 'sin CSP';
+    const otra = await fetch('/main.js', { cache: 'no-store' });
+    return otra.status === 404 ? 'ok' : 'sirve archivos fuera de la lista';
+  })()`);
+  if (r !== 'ok') throw new Error(`ventana de Puter: ${r}`);
+  const e = relevo.estado();
+  if (e.listo || e.sesion || e.modelo !== relevo.modelo) throw new Error('estado de Puter incorrecto sin sesión');
+  const ventanas = BrowserWindow.getAllWindows().length;
+  relevo.alPedido({ id: '0123456789abcdef', modelo: '', system: '', mensajes: [{ rol: 'usuario', texto: 'smoke' }] });
+  const est = relevo.estadisticas();
+  if (est.fallos !== 1 || relevo.enCurso() !== 0) throw new Error('llm.pedir sin sesión debería fallar al instante');
+  if (BrowserWindow.getAllWindows().length !== ventanas) throw new Error('llm.pedir sin sesión abrió una ventana');
+}
+
 function iniciarSmoke() {
   const t0 = Date.now();
   const terminar = (codigo, texto) => {
     clearTimeout(guardia);
     escribir(codigo === 0 ? 1 : 2, texto);
     saliendoApp = true;
-    for (const w of [overlay, chat]) {
+    for (const w of [overlay, chat, puterWin]) {
       if (vivo(w)) w.destroy(); // termina los renderers antes de salir: cierre más rápido
     }
     app.exit(codigo);
@@ -1224,8 +1659,9 @@ function iniciarSmoke() {
   app.commandLine.appendSwitch('disable-features', 'SpareRendererForSitePerProcess');
   app.on('window-all-closed', () => { /* nada */ });
 
-  const requeridos = ['main.js', 'preload-overlay.js', 'preload-chat.js', 'chat.html', 'chat.js', 'chat.css',
-    path.join('test', 'stub-overlay.html')];
+  const requeridos = ['main.js', 'preload-overlay.js', 'preload-chat.js', 'preload-puter.js', 'chat.html', 'chat.js',
+    'chat.css', path.join('test', 'stub-overlay.html'),
+    ...['trabajo.html', 'trabajo.js', 'conectar.html', 'conectar.js', 'puter.css'].map((f) => path.join('puter', f))];
   for (const f of requeridos) {
     if (!fs.existsSync(path.join(__dirname, f))) {
       terminar(1, `smoke FALLÓ: falta ${f}`);
@@ -1242,6 +1678,11 @@ function iniciarSmoke() {
     registrarIpc();
     crearOverlay();
     crearChat();
+    crearPuter(); // perfil nuevo y en memoria: sin la marca de «conectado», no carga puter.js (sin red)
+    const puterCargado = !PUTER ? Promise.resolve() : new Promise((resolve, reject) => {
+      puterWin.webContents.once('did-finish-load', resolve);
+      puterWin.webContents.once('did-fail-load', (_e, c, d) => reject(new Error(`trabajo.html: ${c} ${d}`)));
+    });
     const rect = smokeEsperar('rect');
     const enviado = smokeEsperar('chat');
     const overlayCargado = new Promise((resolve, reject) => {
@@ -1264,7 +1705,8 @@ function iniciarSmoke() {
 
     await chatCargado;
     const chatOk = await chat.webContents.executeJavaScript(
-      "typeof window.amadeusChat === 'object' && window.amadeusChat.version === 1 && " +
+      "typeof window.amadeusChat === 'object' && window.amadeusChat.version === 2 && " +
+      "typeof window.amadeusChat.decidirTarjeta === 'function' && " +
       "typeof window.require === 'undefined' && typeof window.ipcRenderer === 'undefined' && " +
       "!!document.getElementById('lista') && !!document.getElementById('texto')");
     if (chatOk !== true) throw new Error('amadeusChat no está expuesto o chat.html no cargó bien');
@@ -1295,7 +1737,38 @@ function iniciarSmoke() {
       mirar();
     })`);
     if (tarjeta !== 'ok') throw new Error(`confirmación sin R.A.M.S.: ${tarjeta}`);
-    if (overlay.isVisible() || chat.isVisible()) throw new Error('una ventana quedó visible');
+    // Tarjeta de script (v0.2.2): el código COMPLETO como texto (nunca HTML) y, crítico, sin «Ejecutar».
+    const codigoSmoke = 'print("<b>smoke</b>")\n# línea 2\n';
+    chat.webContents.send('chat:tarjeta', {
+      id: '5c1a7e00', clase: 'script', version: 1, sha256: 'a'.repeat(64), titulo: 'smoke', resumen: '', aviso: '',
+      botones: ['copiar', 'descartar'], caduca_ts: null, canal_origen: 'escritorio', estado: 'pendiente',
+      correo: null, drive: null, salida: null,
+      script: {
+        lenguaje: 'python', plataforma: process.platform === 'win32' ? 'windows' : 'linux', codigo: codigoSmoke,
+        explicacion: '', efectos: [], requisitos: [], nivel: 'critico', ejecutable: false,
+        motivo_no_ejecutable: 'smoke', metodo: 'ast', hallazgos: [], hallazgos_omitidos: 0, habilidad: null,
+        habilidad_cambiada: false, ejecuciones: 0,
+      },
+    });
+    const tarjetaScript = await chat.webContents.executeJavaScript(`new Promise((fin) => {
+      const t0 = performance.now();
+      const mirar = () => {
+        const a = document.querySelector('article.msg.tarjeta.script[data-id="5c1a7e00"]');
+        const c = a && a.querySelector('pre code');
+        if (c) {
+          const ejecutar = [...a.querySelectorAll('button')].some((b) => /Ejecutar/.test(b.textContent));
+          return fin(c.textContent === ${JSON.stringify(codigoSmoke)} && !a.querySelector('b') && !ejecutar ? 'ok' : 'mal pintada');
+        }
+        if (performance.now() - t0 > 1500) return fin('sin tarjeta');
+        setTimeout(mirar, 10);
+      };
+      mirar();
+    })`);
+    if (tarjetaScript !== 'ok') throw new Error(`tarjeta de script: ${tarjetaScript}`);
+    if (PUTER) await smokePuter(puterCargado);
+    if (overlay.isVisible() || chat.isVisible() || (vivo(puterWin) && puterWin.isVisible())) {
+      throw new Error('una ventana quedó visible');
+    }
     if (tray !== null) throw new Error('se creó la bandeja');
     terminar(0, `smoke OK (${Date.now() - t0} ms)`);
   }).catch((err) => terminar(1, `smoke FALLÓ: ${err && err.message}`));

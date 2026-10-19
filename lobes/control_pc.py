@@ -21,6 +21,17 @@ Plataformas (``plataforma`` inyectable: ``"win"`` | ``"hypr"`` | ``"otro"``):
   Wayland no deja leer los botones del ratón: **no hay travesuras con el cursor real**.
 - **Otro** (``"otro"``): solo abrir enlaces con ``xdg-open`` si existe.
 
+v0.2.1 (Windows): **apps del menú Inicio** por nombre ("abre steam"). El índice se arma (en un
+hilo, sin PowerShell) con los accesos directos ``.lnk``/``.url`` de ``%APPDATA%`` y
+``%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs`` (más unas pocas apps de la Store
+verificadas por su carpeta de paquete), excluye desinstaladores, ayudas, manuales, licencias y
+sitios web, y marca como *sensibles* las consolas y herramientas del sistema. La coincidencia
+es por nombre normalizado (más los alias de ``RAMS_APPS``); se abre con ``os.startfile`` del
+acceso directo (que debe seguir dentro del menú Inicio). Las apps aprobadas por el usuario se
+recuerdan en ``data/apps_aprobadas.json`` (por ruta del acceso; nunca las sensibles). También:
+teclas multimedia de Windows (``media``) y el título de la ventana activa (para no capturar
+ventanas privadas; nunca se registra).
+
 Reglas: nunca un shell intermedio (solo ``create_subprocess_exec`` con argumentos sueltos) ni
 ``subprocess.run`` en el loop; nunca Enter (``\\r``, ``\\n`` y
 ``\\t`` se sanean y además se filtran las unidades de control antes de ``SendInput``);
@@ -52,11 +63,14 @@ import random
 import re
 import shutil
 import sys
+import tempfile
 import time
 import types
 import unicodedata
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import datetime, timezone
+from difflib import get_close_matches
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -90,8 +104,9 @@ except ImportError:  # pragma: no cover - el grupo base ya los publica
         r"incognito|inprivate|private browsing|navegacion privada|keepass|bitwarden|1password")
 
 __all__ = [
-    "PATRONES_TRAVESURA", "SAFE_ALIAS_RE", "TITULOS_PROPIOS_RE", "activar_dpi_por_monitor",
-    "ObjetivoVentana", "ResultadoControl", "ControlPC",
+    "PATRONES_TRAVESURA", "SAFE_ALIAS_RE", "SAFE_CLAVE_APP_RE", "TITULOS_PROPIOS_RE", "activar_dpi_por_monitor",
+    "ObjetivoVentana", "ResultadoControl", "AppLocal", "ResolucionApp", "ControlPC",
+    "normalizar_nombre_app", "clasificar_nombre_app",
 ]
 
 log = logging.getLogger("rams.control_pc")
@@ -145,6 +160,16 @@ UMBRAL_USUARIO_PX: Final = 6
 # Tras SetCursorPos el cursor debe estar donde se pidió (± redondeo de DPI). Si no, lo recolocó
 # Windows (fuera de todo monitor, ClipCursor): se para SIN culpar al usuario.
 TOLERANCIA_RECOLOCADO_PX: Final = 2
+MEDIA_MAX_MINUTO: Final = 30           # teclas multimedia (Windows)
+# Apps del menú Inicio (v0.2.1)
+MAX_APPS_INDICE: Final = 3000
+MAX_PROFUNDIDAD_MENU: Final = 6
+TTL_INDICE_APPS_S: Final = 300.0
+MAX_NOMBRE_APP: Final = 80
+MAX_URL_ACCESO: Final = 4096           # bytes que se leen de un .url
+MAX_APROBADAS: Final = 500
+ARCHIVO_APPS_APROBADAS: Final = "apps_aprobadas.json"
+SAFE_CLAVE_APP_RE: Final = re.compile(r"^[a-z0-9_]{1,40}$")
 INACTIVIDAD_MIN_S: Final = 4.0         # menos: el usuario está escribiendo o moviendo el ratón
 INACTIVIDAD_MAX_S: Final = 600.0       # más: el usuario no está
 
@@ -808,6 +833,332 @@ def _es_archivo(ruta: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Apps del menú Inicio (Windows, v0.2.1; R18 del diseño v0.3)
+# ---------------------------------------------------------------------------
+
+# Lo que nunca se abre por nombre: desinstaladores, instaladores, ayudas, manuales, licencias y webs.
+_RE_APP_EXCLUIDA: Final = re.compile(
+    r"\b(?:uninstall\w*|desinstal\w*|unins\d*|remove|repair|reparar|setup|instalador|install\w*|update\w*"
+    r"|actualizador|actualizacion|actualizar|readme|leeme|lee me|help|ayuda|manual\w*|user guide|guia del usuario|documentacion|documentation"
+    r"|license|licencia|eula|release notes|changelog|notas de la version|website|sitio web|pagina web|web site"
+    r"|homepage|support|soporte|feedback|faq|crash reporter|what s new|novedades)\b")
+# Consolas y herramientas del sistema: se abren solo con confirmación, cada vez.
+_RE_APP_SENSIBLE: Final = re.compile(
+    r"\b(?:powershell|pwsh|simbolo del sistema|command prompt|cmd|terminal|git bash|git cmd|wsl|ubuntu|debian"
+    r"|kali|regedit|editor del registro|registry editor|msconfig|configuracion del sistema|system configuration"
+    r"|panel de control|control panel|administrador de tareas|task manager|visor de eventos|event viewer"
+    r"|servicios|services|administracion de equipos|computer management|administrador de dispositivos"
+    r"|device manager|programador de tareas|task scheduler|directiva de grupo|group policy"
+    r"|herramientas de windows|windows tools|herramientas administrativas|administrative tools"
+    r"|unidad de recuperacion|recovery drive|developer command prompt|developer powershell|python|idle"
+    r"|node js|nodejs|java|consola|console|bash|seguridad de windows|windows security|configuracion|settings"
+    r"|prompt|subsystem for linux|miniconda|cygwin|msys2?|mingw\w*)\b"
+    r"|^(?:run|ejecutar)$")
+_RE_VERSION_APP: Final = re.compile(r"\b(?:v?\d+(?:\.\d+)+|x64|x86|64 ?-?bits?|32 ?-?bits?)\b")
+_RE_PARENTESIS_APP: Final = re.compile(r"[(\[{][^)\]}]*[)\]}]")
+_RE_NO_ALNUM_APP: Final = re.compile(r"[^a-z0-9]+")
+_EXTENSIONES_ACCESO: Final = (".lnk", ".url")
+# Sinónimos de serie (consulta normalizada → nombre normalizado del menú Inicio).
+SINONIMOS_APPS: Final[Mapping[str, str]] = types.MappingProxyType({
+    "vs code": "visual studio code", "vscode": "visual studio code", "code": "visual studio code",
+    "consola": "terminal", "cmd": "simbolo del sistema", "notepad": "bloc de notas", "bloc": "bloc de notas",
+    "calc": "calculadora", "calculator": "calculadora", "snipping tool": "recortes",
+})
+# Apps de la Store verificadas por su carpeta de paquete (no tienen .lnk en el menú Inicio).
+_APPS_STORE_WIN: Final = (
+    ("Calculadora", "Microsoft.WindowsCalculator_8wekyb3d8bbwe", ("calculadora", "calculator")),
+    ("Bloc de notas", "Microsoft.WindowsNotepad_8wekyb3d8bbwe", ("bloc de notas", "notepad")),
+    ("Paint", "Microsoft.Paint_8wekyb3d8bbwe", ("paint",)),
+    ("Recortes", "Microsoft.ScreenSketch_8wekyb3d8bbwe", ("recortes", "herramienta recortes", "snipping tool")),
+    ("Fotos", "Microsoft.Windows.Photos_8wekyb3d8bbwe", ("fotos", "photos")),
+    ("Reloj", "Microsoft.WindowsAlarms_8wekyb3d8bbwe", ("reloj", "alarmas", "clock")),
+)
+
+
+def normalizar_nombre_app(texto: Any) -> str:
+    """Nombre de app para comparar: minúsculas, sin tildes, sin ®™©, sin paréntesis, sin
+    versiones ni ``x64``/``64-bit`` y solo letras y dígitos separados por un espacio. Puro."""
+    crudo = "" if texto is None else str(texto)
+    base = _minusculas_sin_tildes(crudo.replace("®", " ").replace("™", " ").replace("©", " "))
+    base = _RE_PARENTESIS_APP.sub(" ", base)
+    base = _RE_VERSION_APP.sub(" ", base)
+    return " ".join(_RE_NO_ALNUM_APP.sub(" ", base).split())
+
+
+def _texto_clasificable(nombre: Any) -> str:
+    """Nombre crudo en minúsculas y sin tildes CON lo que va entre paréntesis y las versiones
+    ("Steam (Uninstall)" → "steam uninstall"). Solo para clasificar: ``normalizar_nombre_app``
+    quita los paréntesis y con ellos la palabra que delata un desinstalador. Puro."""
+    crudo = "" if nombre is None else str(nombre)
+    base = _minusculas_sin_tildes(crudo.replace("®", " ").replace("™", " ").replace("©", " "))
+    return " ".join(_RE_NO_ALNUM_APP.sub(" ", base).split())
+
+
+def _clasificar_acceso(nombre: str, norm: str) -> tuple[str, str]:
+    """Clasificación más estricta entre el nombre crudo (con paréntesis) y el normalizado. Puro."""
+    resultados = (clasificar_nombre_app(_texto_clasificable(nombre)), clasificar_nombre_app(norm))
+    for grado in ("excluida", "sensible"):
+        for obtenido, motivo in resultados:
+            if obtenido == grado:
+                return obtenido, motivo
+    return "normal", ""
+
+
+def clasificar_nombre_app(nombre_norm: str) -> tuple[str, str]:
+    """``("excluida", motivo)``, ``("sensible", motivo)`` o ``("normal", "")`` por el nombre. Puro.
+
+    El índice la aplica también al nombre crudo con paréntesis (``_clasificar_acceso``).
+    """
+    m = _RE_APP_EXCLUIDA.search(nombre_norm)
+    if m:
+        palabra = m.group(0)
+        if palabra.startswith(("unins", "desinstal", "uninstall", "remove", "repair", "reparar")):
+            return "excluida", "es un desinstalador"
+        if palabra.startswith(("setup", "instal", "install", "update", "actualiza")):
+            return "excluida", "es un instalador"
+        if palabra.startswith(("website", "sitio", "pagina", "web site", "homepage", "support", "soporte")):
+            return "excluida", "es un enlace a una página web"
+        return "excluida", "es una ayuda, un manual o una licencia"
+    if _RE_APP_SENSIBLE.search(nombre_norm):
+        return "sensible", "es una consola o una herramienta del sistema"
+    return "normal", ""
+
+
+@dataclass(frozen=True)
+class AppLocal:
+    """App del índice del menú Inicio. ``objetivo`` (ruta del acceso o ``shell:AppsFolder\\…``) no sale
+    de ControlPC salvo como huella (``sha256[:12]``)."""
+
+    clave: str                 # SAFE_CLAVE_APP_RE, única en el índice
+    nombre: str                # visible (≤ 80)
+    norm: str                  # nombre normalizado
+    objetivo: str
+    via: str                   # "acceso" (.lnk/.url) | "appsfolder"
+    sensible: bool = False
+    alias: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ResolucionApp:
+    """Resultado de buscar una app por nombre (sin abrir nada)."""
+
+    estado: str                        # "unica" | "varias" | "ninguna" | "excluida" | "desactivada"
+    app: AppLocal | None = None
+    opciones: tuple[str, ...] = ()     # nombres visibles (≤ 3): candidatas o sugerencias
+    nivel: str = ""                    # de la única: "permitida" | "descubierta" | "sensible"
+    motivo: str = ""
+
+
+def _dirs_menu_inicio() -> list[Path]:
+    """``Start Menu\\Programs`` del usuario (``%APPDATA%``) y de todos (``%ProgramData%``)."""
+    dirs: list[Path] = []
+    for variable in ("APPDATA", "ProgramData", "ALLUSERSPROFILE"):
+        base = os.environ.get(variable, "").strip()
+        if not base:
+            continue
+        directorio = Path(base) / "Microsoft" / "Windows" / "Start Menu" / "Programs"
+        if directorio not in dirs:
+            dirs.append(directorio)
+    return dirs
+
+
+def _dir_paquetes() -> Path | None:
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    return Path(local) / "Packages" if local else None
+
+
+def _url_de_acceso(ruta: Path) -> str | None:
+    """``URL=`` de un ``.url`` (como mucho 4 KiB); ``None`` si no se puede leer."""
+    try:
+        with open(ruta, "rb") as archivo:
+            crudo = archivo.read(MAX_URL_ACCESO)
+    except OSError:
+        return None
+    for linea in crudo.decode("utf-8", "replace").splitlines():
+        linea = linea.strip()
+        if linea.lower().startswith("url="):
+            return linea[4:].strip()
+    return None
+
+
+def _clave_unica(norm: str, usadas: set[str]) -> str:
+    base = (norm.replace(" ", "_")[:40].strip("_")) or "app"
+    clave = base
+    n = 2
+    while clave in usadas:
+        sufijo = f"_{n}"
+        clave = base[: 40 - len(sufijo)] + sufijo
+        n += 1
+    usadas.add(clave)
+    return clave
+
+
+def _indexar_menu_inicio(dirs: Sequence[Path], paquetes: Path | None) -> tuple[list[AppLocal], dict[str, str]]:
+    """Índice ``(apps, excluidas{norm: motivo})`` del menú Inicio. Bloqueante (disco): se llama con
+    ``asyncio.to_thread``. No sigue enlaces simbólicos ni baja más de 6 niveles. Nunca lanza."""
+    apps: list[AppLocal] = []
+    excluidas: dict[str, str] = {}
+    vistas: dict[str, int] = {}       # nombre normalizado → posición en ``apps``
+    usadas: set[str] = set()
+    try:
+        for base in dirs:
+            if not base.is_dir():
+                continue
+            raiz = str(base)
+            for actual, carpetas, archivos in os.walk(raiz, followlinks=False):
+                profundidad = os.path.relpath(actual, raiz).count(os.sep)
+                if profundidad >= MAX_PROFUNDIDAD_MENU:
+                    carpetas[:] = []
+                for nombre_archivo in sorted(archivos):
+                    if len(apps) >= MAX_APPS_INDICE:
+                        return apps, excluidas
+                    ruta = Path(actual) / nombre_archivo
+                    if ruta.suffix.lower() not in _EXTENSIONES_ACCESO:
+                        continue
+                    nombre = " ".join(ruta.stem.split())[:MAX_NOMBRE_APP]
+                    norm = normalizar_nombre_app(nombre)
+                    if not norm:
+                        continue
+                    previa = vistas.get(norm)
+                    # Se clasifica ANTES de deduplicar y con el texto entre paréntesis: "Steam
+                    # (Uninstall).lnk" (que ``sorted`` pone delante de "Steam.lnk") es un
+                    # desinstalador y no puede ocupar el sitio de la app.
+                    grado, motivo = _clasificar_acceso(nombre, norm)
+                    if grado == "normal" and ruta.suffix.lower() == ".url":
+                        url = (_url_de_acceso(ruta) or "").lower()
+                        if url.startswith(("http:", "https:")):
+                            grado, motivo = "excluida", "es un enlace a una página web"
+                    if grado == "excluida":
+                        excluidas.setdefault(_texto_clasificable(nombre) or norm, motivo)
+                        continue
+                    if previa is not None:
+                        # Dos accesos con el mismo nombre normalizado ("Foo (beta)" y "Foo"): gana
+                        # el de nombre visible más corto (sin paréntesis ni versión); la clave se queda.
+                        anterior = apps[previa]
+                        if len(nombre) < len(anterior.nombre):
+                            apps[previa] = AppLocal(anterior.clave, nombre, norm, str(ruta), "acceso",
+                                                    sensible=grado == "sensible")
+                        continue
+                    vistas[norm] = len(apps)
+                    apps.append(AppLocal(_clave_unica(norm, usadas), nombre, norm, str(ruta), "acceso",
+                                         sensible=grado == "sensible"))
+        if paquetes is not None:
+            for nombre, paquete, alias in _APPS_STORE_WIN:
+                norm = normalizar_nombre_app(nombre)
+                if norm in vistas or not (paquetes / paquete).is_dir():
+                    continue
+                vistas[norm] = len(apps)
+                apps.append(AppLocal(_clave_unica(norm, usadas), nombre, norm,
+                                     "shell:AppsFolder\\" + paquete + "!App", "appsfolder",
+                                     alias=tuple(normalizar_nombre_app(a) for a in alias)))
+    except Exception as exc:  # un menú Inicio raro nunca rompe nada: índice parcial
+        log.debug("Índice del menú Inicio incompleto (%s)", type(exc).__name__)
+    return apps, excluidas
+
+
+def _resolver_en_indice(apps: Sequence[AppLocal], excluidas: Mapping[str, str],
+                        consulta: str) -> tuple[str, list[AppLocal], str]:
+    """``(estado, apps, motivo)`` de una consulta YA normalizada. Puro.
+
+    Orden: nombre o alias exacto → excluida exacta → todas las palabras dentro del nombre (gana
+    la que menos palabras sobran, si es la única así) → prefijo único → ``difflib`` (≥ 0,75) como
+    sugerencia, que **nunca** abre nada.
+    """
+    if not consulta:
+        return "ninguna", [], ""
+    exactas = [a for a in apps if a.norm == consulta or consulta in a.alias]
+    sinonimo = SINONIMOS_APPS.get(consulta)
+    if not exactas and sinonimo:
+        consulta = sinonimo
+        exactas = [a for a in apps if a.norm == consulta or consulta in a.alias]
+    if len(exactas) == 1:
+        return "unica", exactas, ""
+    if exactas:
+        return "varias", exactas[:3], ""
+    if consulta in excluidas:
+        return "excluida", [], excluidas[consulta]
+    palabras = set(consulta.split())
+    contienen = [a for a in apps if palabras <= set(a.norm.split())]
+    if contienen:
+        contienen.sort(key=lambda a: (len(a.norm.split()), a.norm))
+        sobra = [len(a.norm.split()) for a in contienen]
+        if len(contienen) == 1 or sobra[0] < sobra[1]:
+            return "unica", contienen[:1], ""
+        return "varias", contienen[:3], ""
+    prefijo = [a for a in apps if a.norm.startswith(consulta)]
+    if len(prefijo) == 1:
+        return "unica", prefijo, ""
+    if prefijo:
+        return "varias", sorted(prefijo, key=lambda a: len(a.norm))[:3], ""
+    for norm, motivo in excluidas.items():
+        if palabras <= set(norm.split()):
+            return "excluida", [], motivo
+    nombres = {a.norm: a for a in apps}
+    for alias_app in apps:
+        for alias in alias_app.alias:
+            nombres.setdefault(alias, alias_app)
+    parecidas: list[AppLocal] = []
+    for norm in get_close_matches(consulta, list(nombres), n=3, cutoff=0.75):
+        if nombres[norm] not in parecidas:
+            parecidas.append(nombres[norm])
+    return "ninguna", parecidas, ""
+
+
+def _leer_aprobadas(ruta: Path) -> set[str]:
+    """Objetivos aprobados de ``data/apps_aprobadas.json`` (vacío si no existe o está roto)."""
+    try:
+        with open(ruta, encoding="utf-8") as archivo:
+            datos = json.load(archivo)
+    except (OSError, ValueError):
+        return set()
+    entradas = datos.get("aprobadas") if isinstance(datos, Mapping) else None
+    if not isinstance(entradas, list):
+        return set()
+    aprobadas: set[str] = set()
+    for entrada in entradas[:MAX_APROBADAS]:
+        objetivo = entrada.get("objetivo") if isinstance(entrada, Mapping) else None
+        if isinstance(objetivo, str) and 0 < len(objetivo) <= 1024:
+            aprobadas.add(objetivo)
+    return aprobadas
+
+
+def _guardar_aprobadas(ruta: Path, entradas: list[dict[str, str]]) -> None:
+    """Escritura atómica y privada (0o600) de ``data/apps_aprobadas.json``. Bloqueante (hilo)."""
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporal = tempfile.mkstemp(prefix=".apps_aprobadas_", suffix=".tmp", dir=str(ruta.parent))
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as archivo:
+            json.dump({"version": 1, "aprobadas": entradas[-MAX_APROBADAS:]}, archivo, ensure_ascii=False,
+                      indent=1)
+        with contextlib.suppress(OSError):
+            os.chmod(temporal, 0o600)
+        os.replace(temporal, ruta)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporal)
+        raise
+
+
+def _dentro_de(ruta: str, dirs: Sequence[Path]) -> bool:
+    """``ruta`` absoluta, de un acceso directo, que existe y sigue dentro de algún directorio del
+    menú Inicio (sin escapar con ``..`` ni enlaces). Bloqueante (disco)."""
+    try:
+        if not os.path.isabs(ruta) or Path(ruta).suffix.lower() not in _EXTENSIONES_ACCESO:
+            return False
+        real = os.path.realpath(ruta)
+        if not os.path.isfile(real):
+            return False
+        for base in dirs:
+            raiz = os.path.realpath(str(base))
+            with contextlib.suppress(ValueError):
+                if os.path.commonpath([os.path.normcase(real), os.path.normcase(raiz)]) == os.path.normcase(raiz):
+                    return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Win32 (ctypes)
 # ---------------------------------------------------------------------------
 
@@ -853,7 +1204,12 @@ if ctypes is not None and _wt is not None:
         log.debug("Estructuras Win32 no disponibles (%s)", type(_exc).__name__)
 
 _INPUT_KEYBOARD: Final = 1
+_KEYEVENTF_EXTENDEDKEY: Final = 0x0001
 _KEYEVENTF_KEYUP: Final = 0x0002
+# Teclas multimedia (orden de "media" → tecla virtual): siguiente, anterior y play/pausa.
+_VK_MEDIA_ORDEN: Final[Mapping[str, int]] = types.MappingProxyType(
+    {"siguiente": 0xB0, "anterior": 0xB1, "play_pause": 0xB3})
+_VK_MEDIA: Final = frozenset(_VK_MEDIA_ORDEN.values())
 _KEYEVENTF_UNICODE: Final = 0x0004
 _PROCESS_QUERY_LIMITED_INFORMATION: Final = 0x1000
 _TOKEN_QUERY: Final = 0x0008
@@ -1126,6 +1482,26 @@ class _ApiWin:
         except (OSError, ValueError, TypeError, AttributeError):
             return 0
 
+    def tecla_media(self, vk: int) -> int:
+        """``SendInput`` de una tecla multimedia (pulsar y soltar). Solo play/pausa, siguiente y
+        anterior: cualquier otra tecla virtual se rechaza (nunca Enter ni atajos)."""
+        try:
+            if int(vk) not in _VK_MEDIA:
+                return 0
+            eventos = (_INPUT * 2)()
+            for indice, arriba in enumerate((False, True)):
+                evento = eventos[indice]
+                evento.type = _INPUT_KEYBOARD
+                evento.ki.wVk = int(vk)
+                evento.ki.wScan = 0
+                evento.ki.dwFlags = _KEYEVENTF_EXTENDEDKEY | (_KEYEVENTF_KEYUP if arriba else 0)
+                evento.ki.time = 0
+                evento.ki.dwExtraInfo = 0
+            funcion = ctypes.windll.user32.SendInput  # type: ignore[attr-defined]
+            return int(funcion(len(eventos), eventos, ctypes.sizeof(_INPUT)))
+        except (OSError, ValueError, TypeError, AttributeError):
+            return 0
+
 
 def _crear_api_win() -> Any:
     """``_ApiWin`` o ``None`` (sin Windows/ctypes). Los tests lo sustituyen por un falso."""
@@ -1322,13 +1698,28 @@ class ControlPC:
     """Efector de control del PC (apps, teclado y cursor) sin decisiones propias (§C2.8).
 
     ``plataforma`` es inyectable en los tests (``"win"`` | ``"hypr"`` | ``"otro"``); ``None``
-    la detecta. ``reloj`` mide tasas, esperas y ``ts_ultima_inyeccion``.
+    la detecta. ``reloj`` mide tasas, esperas y ``ts_ultima_inyeccion``. ``dirs_menu_inicio`` y
+    ``dir_paquetes`` (v0.2.1, tests) sustituyen a los del menú Inicio y de la Store del usuario.
     """
 
     def __init__(self, settings: Settings, *, reloj: Callable[[], float] = time.monotonic,
-                 plataforma: str | None = None) -> None:
+                 plataforma: str | None = None, dirs_menu_inicio: Sequence[Path] | None = None,
+                 dir_paquetes: Path | None = None) -> None:
         self.settings = settings
         self._reloj = reloj
+        # v0.2.1: índice perezoso de las apps del menú Inicio (se arma en un hilo al primer uso).
+        self._dirs_menu: list[Path] = (list(dirs_menu_inicio) if dirs_menu_inicio is not None
+                                       else _dirs_menu_inicio())
+        self._dir_paquetes: Path | None = (dir_paquetes if dir_paquetes is not None or dirs_menu_inicio is not None
+                                           else _dir_paquetes())
+        self._apps: list[AppLocal] = []
+        self._apps_por_clave: dict[str, AppLocal] = {}
+        self._apps_excluidas: dict[str, str] = {}
+        self._apps_ts: float | None = None
+        self._apps_alias_permitidos: set[str] = set()
+        self._aprobadas: set[str] = set()
+        self._aprobadas_entradas: list[dict[str, str]] = []
+        self._lock_apps: asyncio.Lock | None = None
         # Esperas del tecleo y de las travesuras (los tests ponen una que avanza el reloj falso).
         self._dormir: Callable[[float], Any] = asyncio.sleep
         # Plazo de las travesuras (≤ 600 ms): ``perf_counter`` con el reloj de serie (en Windows
@@ -1372,6 +1763,7 @@ class ControlPC:
                                     ventana_s=VENTANA_DIA_S)
         self._cupo_travesura = _Cupo(intervalo_s=TRAVESURA_INTERVALO_S, maximo=TRAVESURA_MAX_DIA,
                                      ventana_s=VENTANA_DIA_S)
+        self._cupo_media = _Cupo(maximo=MEDIA_MAX_MINUTO, ventana_s=VENTANA_MINUTO_S)
         self._fin_ultima_travesura: float | None = None
         self._escribiendo = False
         self._ts_inyeccion: float | None = None
@@ -1420,8 +1812,10 @@ class ControlPC:
                 if self._win is None:
                     return DiagnosticoModulo(CLAVE, NOMBRE, EstadoModulo.OFF, "Win32 (ctypes) no disponible")
                 travesuras = "ON" if getattr(self.settings, "travesuras_habilitadas", False) else "OFF"
+                menu = "ON" if self.apps_locales_disponibles else "OFF"
                 return DiagnosticoModulo(CLAVE, NOMBRE, EstadoModulo.OK,
-                                         f"Windows: apps, teclado y cursor (travesuras {travesuras})")
+                                         f"Windows: apps (menú Inicio {menu}), teclado y cursor "
+                                         f"(travesuras {travesuras})")
             if self.plataforma == "hypr":
                 if not self.disponible:
                     return DiagnosticoModulo(CLAVE, NOMBRE, EstadoModulo.OFF,
@@ -1941,6 +2335,246 @@ class ControlPC:
         except Exception as exc:
             log.warning("prerrellenar falló (%s)", type(exc).__name__)
             return self._fallo("No pude preparar el borrador por un error interno.")
+
+    # ------------------------------------------------------------------
+    # v0.2.1: apps del menú Inicio (Windows)
+    # ------------------------------------------------------------------
+
+    @property
+    def apps_locales_disponibles(self) -> bool:
+        """``True`` en Windows con ``RAMS_APPS_MENU_INICIO=1`` (por defecto)."""
+        return self._so == "win" and bool(getattr(self.settings, "apps_menu_inicio", True))
+
+    def _ruta_aprobadas(self) -> Path:
+        return Path(self.settings.data_dir) / ARCHIVO_APPS_APROBADAS
+
+    async def _asegurar_indice(self, *, forzar: bool = False) -> None:
+        """Arma (o refresca cada 5 min) el índice del menú Inicio en un hilo. Nunca lanza."""
+        if not self.apps_locales_disponibles:
+            return
+        ahora = self._reloj()
+        if not forzar and self._apps_ts is not None and ahora - self._apps_ts < TTL_INDICE_APPS_S:
+            return
+        if self._lock_apps is None:
+            self._lock_apps = asyncio.Lock()
+        async with self._lock_apps:
+            ahora = self._reloj()
+            if not forzar and self._apps_ts is not None and ahora - self._apps_ts < TTL_INDICE_APPS_S:
+                return
+            try:
+                apps, excluidas = await asyncio.to_thread(_indexar_menu_inicio, list(self._dirs_menu),
+                                                          self._dir_paquetes)
+                aprobadas = await asyncio.to_thread(_leer_aprobadas, self._ruta_aprobadas())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("No se pudo leer el menú Inicio (%s)", type(exc).__name__)
+                return
+            self._apps = apps
+            self._apps_por_clave = {a.clave: a for a in apps}
+            self._apps_excluidas = excluidas
+            self._aprobadas = aprobadas
+            self._apps_alias_permitidos = self._claves_de_rams_apps()
+            self._apps_ts = ahora
+            log.info("Menú Inicio: %d apps indexadas (%d aprobadas)", len(apps),
+                     sum(1 for a in apps if a.objetivo in aprobadas))
+
+    def _alias_rams_apps(self) -> Mapping[str, str]:
+        try:
+            apps = getattr(self.settings, "apps_permitidas", None)
+            return apps if isinstance(apps, Mapping) else {}
+        except Exception:
+            return {}
+
+    def _claves_de_rams_apps(self) -> set[str]:
+        """Claves del índice a las que lleva un alias de ``RAMS_APPS`` (cuentan como permitidas)."""
+        claves: set[str] = set()
+        for alias, comando in self._alias_rams_apps().items():
+            for candidato in (comando, alias):
+                estado, apps, _ = _resolver_en_indice(self._apps, self._apps_excluidas,
+                                                      normalizar_nombre_app(str(candidato).replace("_", " ")))
+                if estado == "unica":
+                    claves.add(apps[0].clave)
+                    break
+        return claves
+
+    def _nivel(self, app: AppLocal) -> str:
+        if app.sensible:
+            return "sensible"
+        if app.objetivo in self._aprobadas or app.clave in self._apps_alias_permitidos:
+            return "permitida"
+        return "descubierta"
+
+    def nivel_app_local(self, clave: str) -> tuple[str, str] | None:
+        """``(nivel, nombre)`` de una app del índice (para la compuerta) o ``None``. Síncrono."""
+        try:
+            app = self._apps_por_clave.get(clave) if isinstance(clave, str) else None
+            return (self._nivel(app), app.nombre) if app is not None else None
+        except Exception as exc:  # pragma: no cover - defensivo
+            log.debug("nivel_app_local falló (%s)", type(exc).__name__)
+            return None
+
+    async def resolver_app_local(self, nombre: str) -> ResolucionApp:
+        """Busca ``nombre`` en el menú Inicio (alias de ``RAMS_APPS`` primero). No abre nada; nunca lanza."""
+        try:
+            if not self.apps_locales_disponibles:
+                motivo = ("desactivado (RAMS_APPS_MENU_INICIO=0)" if self._so == "win"
+                          else "solo en Windows")
+                return ResolucionApp("desactivada", motivo=motivo)
+            await self._asegurar_indice()
+            texto = str(nombre or "").strip()[:MAX_NOMBRE_APP]
+            if not texto:
+                return ResolucionApp("ninguna")
+            existente = self._apps_por_clave.get(texto) if SAFE_CLAVE_APP_RE.match(texto) else None
+            if existente is not None:
+                return ResolucionApp("unica", existente, nivel=self._nivel(existente))
+            consulta = normalizar_nombre_app(texto)
+            alias = self._alias_rams_apps().get(consulta.replace(" ", "_"))
+            if isinstance(alias, str) and alias:
+                estado, apps, _ = _resolver_en_indice(self._apps, self._apps_excluidas,
+                                                      normalizar_nombre_app(alias.replace("_", " ")))
+                if estado == "unica":
+                    return ResolucionApp("unica", apps[0], nivel=self._nivel(apps[0]))
+            estado, apps, motivo = _resolver_en_indice(self._apps, self._apps_excluidas, consulta)
+            if estado == "unica":
+                return ResolucionApp("unica", apps[0], nivel=self._nivel(apps[0]))
+            return ResolucionApp(estado, opciones=tuple(a.nombre for a in apps[:3]), motivo=motivo)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("resolver_app_local falló (%s)", type(exc).__name__)
+            return ResolucionApp("ninguna")
+
+    async def aprobar_app_local(self, clave: str) -> bool:
+        """Recuerda la aprobación de una app (por su acceso) en ``data/apps_aprobadas.json``.
+
+        Las sensibles nunca se recuerdan (se confirman cada vez). Devuelve ``True`` si quedó guardada.
+        """
+        try:
+            app = self._apps_por_clave.get(clave) if isinstance(clave, str) else None
+            if app is None or app.sensible:
+                return False
+            if app.objetivo in self._aprobadas:
+                return True
+            ruta = self._ruta_aprobadas()
+            if not self._aprobadas_entradas:
+                self._aprobadas_entradas = await asyncio.to_thread(self._entradas_aprobadas, ruta)
+            entradas = [e for e in self._aprobadas_entradas if e.get("objetivo") != app.objetivo]
+            entradas.append({"objetivo": app.objetivo, "nombre": app.nombre,
+                             "ts": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+            await asyncio.to_thread(_guardar_aprobadas, ruta, entradas)
+            self._aprobadas_entradas = entradas[-MAX_APROBADAS:]
+            self._aprobadas.add(app.objetivo)
+            log.info("App del menú Inicio aprobada (%s)", _huella(app.objetivo))
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("No se pudo guardar la aprobación de la app (%s)", type(exc).__name__)
+            return False
+
+    @staticmethod
+    def _entradas_aprobadas(ruta: Path) -> list[dict[str, str]]:
+        """Entradas válidas del archivo de aprobadas (para reescribirlo sin perder las demás)."""
+        try:
+            with open(ruta, encoding="utf-8") as archivo:
+                datos = json.load(archivo)
+        except (OSError, ValueError):
+            return []
+        entradas = datos.get("aprobadas") if isinstance(datos, Mapping) else None
+        if not isinstance(entradas, list):
+            return []
+        validas: list[dict[str, str]] = []
+        for entrada in entradas[:MAX_APROBADAS]:
+            if isinstance(entrada, Mapping) and isinstance(entrada.get("objetivo"), str):
+                validas.append({k: str(v)[:1024] for k, v in entrada.items()
+                                if k in ("objetivo", "nombre", "ts") and isinstance(v, str)})
+        return validas
+
+    async def lanzar_app_local(self, nombre: str) -> ResultadoControl:
+        """Abre una app del menú Inicio por su clave del índice (o por nombre, si es inequívoco).
+
+        Sin shell ni argumentos: ``os.startfile`` del acceso directo (que debe seguir dentro del
+        menú Inicio) o ``shell:AppsFolder\\<AUMID>`` de una app de la Store verificada. Comparte el
+        cupo de 6 aperturas por minuto con ``abrir_destino``. La autorización ya la dio la compuerta.
+        """
+        try:
+            if not self.apps_locales_disponibles:
+                return self._fallo("Abrir apps del menú Inicio no está disponible aquí.")
+            if self._cerrado:
+                return self._fallo("El control del PC está apagado.")
+            resolucion = await self.resolver_app_local(nombre)
+            app = resolucion.app
+            if resolucion.estado != "unica" or app is None:
+                return self._fallo("No encuentro esa app en el menú Inicio.")
+            datos = {"app": app.clave, "nombre": app.nombre, "sha256_12": _huella(app.objetivo)}
+            if app.via == "acceso":
+                valido = await asyncio.to_thread(_dentro_de, app.objetivo, list(self._dirs_menu))
+            else:
+                valido = _enlace_seguro(app.objetivo)
+            if not valido:
+                return ResultadoControl(False, f"El acceso de {app.nombre} ya no está en el menú Inicio.", datos)
+            ahora = self._reloj()
+            if self._cupo_abrir.motivo(ahora):
+                return ResultadoControl(False, "Vas muy rápido: ya abrí 6 cosas en el último minuto.", datos)
+            self._cupo_abrir.registrar(ahora)
+            ok, detalle = await self._lanzar("startfile", app.objetivo)
+            if ok:
+                return ResultadoControl(True, f"Abrí {app.nombre}.", datos)
+            return ResultadoControl(False, f"No pude abrir {app.nombre}: {detalle}.", datos)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("lanzar_app_local falló (%s)", type(exc).__name__)
+            return self._fallo("No pude abrir la app por un error interno.")
+
+    # ------------------------------------------------------------------
+    # v0.2.1: teclas multimedia (Windows) y título de la ventana activa
+    # ------------------------------------------------------------------
+
+    async def media(self, orden: str) -> ResultadoControl:
+        """Pausa/reanuda, siguiente o anterior con las teclas multimedia de Windows (≤ 30/min)."""
+        try:
+            vk = _VK_MEDIA_ORDEN.get(str(orden or ""))
+            if vk is None:
+                return self._fallo("Orden multimedia no válida.")
+            if self.plataforma != "win" or self._win is None:
+                return self._fallo("Las teclas multimedia solo están disponibles en Windows.")
+            if self._cerrado:
+                return self._fallo("El control del PC está apagado.")
+            ahora = self._reloj()
+            if self._cupo_media.motivo(ahora):
+                return self._fallo("Demasiadas órdenes de música seguidas; espera un momento.")
+            self._cupo_media.registrar(ahora)
+            pulsar = getattr(self._win, "tecla_media", None)
+            insertados = int(pulsar(vk) or 0) if callable(pulsar) else 0
+            self._ts_inyeccion = self._reloj()
+            if insertados < 2:
+                return self._fallo("Windows no aceptó la tecla multimedia.", orden=orden)
+            mensajes = {"play_pause": "Pausé o reanudé la música.", "siguiente": "Pasé a la siguiente canción.",
+                        "anterior": "Volví a la canción anterior."}
+            return ResultadoControl(True, mensajes.get(str(orden), "Hecho."), {"orden": orden})
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("media falló (%s)", type(exc).__name__)
+            return self._fallo("No pude controlar la música por un error interno.")
+
+    def titulo_activa(self) -> str | None:
+        """Título de la ventana en primer plano (para no capturar ventanas privadas). Nunca se
+        registra ni sale de R.A.M.S.; ``None`` si no se sabe."""
+        try:
+            if self.plataforma == "win" and self._win is not None:
+                hwnd = self._win.primer_plano()
+                info = self._win.info(hwnd) if hwnd else None
+                titulo = info.get("titulo") if isinstance(info, Mapping) else None
+                return titulo if isinstance(titulo, str) else None
+            if self.plataforma == "hypr":
+                titulo = self._hypr_activa.get("title")
+                return titulo if isinstance(titulo, str) else None
+        except Exception as exc:
+            log.debug("titulo_activa falló (%s)", type(exc).__name__)
+        return None
 
     # ------------------------------------------------------------------
     # No molestar

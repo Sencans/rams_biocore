@@ -7,15 +7,18 @@ Sin red ni hardware. Sin pytest-asyncio: las pruebas asíncronas usan ``asyncio.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
+import re
 import os
 import subprocess
 import sys
 import threading
 import time
 import types
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -29,6 +32,7 @@ from core.config import (
     Settings,
     ahora_local,
     cargar_settings,
+    carpetas_usuario,
     configurar_logging,
     en_horario_silencioso,
     leer_env_archivo,
@@ -41,24 +45,55 @@ from core.config import (
 )
 from core.contracts import (
     ACCIONES_ORDEN_ESCRITORIO,
+    BOTONES_TARJETA,
     CANALES_ENTRADA,
     CANALES_LOCALES,
     CANALES_SALIDA,
+    CARPETAS_USUARIO,
+    CATEGORIAS_RIESGO,
+    CLASES_TARJETA,
     CONDUCTAS_SOLICITUD,
     CONTROLES_ESCRITORIO,
+    CORREO_RE,
+    DECISIONES_TARJETA,
     DESTINOS_BASE,
+    DESTINOS_DESCARGA,
     DIVERGENCIA_STEINS_GATE,
+    ESTADOS_TARJETA,
     ESTADOS_VISION,
     EVENTOS_ESCRITORIO,
+    FORMATOS_DRIVE,
+    HUELLA_RE,
+    ID_TARJETA_RE,
     INICIATIVAS,
+    LENGUAJES_SCRIPT,
+    MAX_ADJUNTOS_CORREO,
+    MAX_ASUNTO_CORREO,
+    MAX_BYTES_DECISION_TARJETA,
+    MAX_BYTES_TARJETA,
+    MAX_CODIGO_SCRIPT,
+    MAX_CUERPO_CORREO,
+    MAX_HALLAZGOS_TARJETA,
+    MAX_SALIDA_TARJETA,
+    MAX_TARJETAS_VIVAS,
     MODOS_PANTALLA,
     MODOS_SALIDA,
+    NIVELES_EJECUTABLES,
+    NIVELES_RIESGO,
+    OPERACIONES_DRIVE,
     ORIGENES_ACCION,
+    PATRON_ARCHIVO_SENSIBLE,
     PATRON_TITULO_SENSIBLE,
     PATRONES_TRAVESURA,
+    RESULTADOS_TARJETA,
+    ROLES_DRIVE,
     SAFE_ALIAS_RE,
+    SERVICIOS_GOOGLE,
     TIPOS_ACCION,
     TIPOS_ACCION_V02,
+    TTL_DOBLE_CONFIRMACION_S,
+    TTL_TARJETA_S,
+    TTL_TARJETA_TELEGRAM_S,
     BrocaReply,
     ContextoBroca,
     DiagnosticoModulo,
@@ -73,7 +108,10 @@ from core.contracts import (
     Telemetria,
     Utterance,
     banda,
+    bytes_json,
     formatear_decimal,
+    huella_contenido,
+    largo_utf16,
     resumen_nexus,
 )
 
@@ -1449,3 +1487,687 @@ def test_sin_efectos_pc_un_monkeypatch_del_test_tiene_prioridad(monkeypatch: pyt
 
     monkeypatch.setattr(webbrowser, "open", lambda url, *a, **k: True)
     assert webbrowser.open("https://example.com") is True
+
+
+# ---------------------------------------------------------------------------
+# v0.2 Respaldo Puter (RAMS_PUTER, PUTER_MODEL, RAMS_PUTER_PRIMERO)
+# ---------------------------------------------------------------------------
+
+
+def test_puter_valores_por_defecto() -> None:
+    for s in (cargar_settings(entorno={}), Settings()):
+        assert s.puter_habilitado is True and s.puter_modelo == "" and s.puter_primero is False
+        assert s.puter_max_llamadas_dia == 300 and s.tiene_puter is True
+    resumen = cargar_settings(entorno={}).resumen_seguro()
+    assert resumen["puter_habilitado"] is True and resumen["puter_modelo"] == ""
+    assert resumen["puter_primero"] is False and resumen["tiene_puter"] is True
+    assert resumen["puter_max_llamadas_dia"] == 300
+    json.dumps(resumen, ensure_ascii=False)
+
+
+def test_puter_lectura_y_validacion(caplog: pytest.LogCaptureFixture) -> None:
+    s = cargar_settings(entorno={"RAMS_PUTER": "0", "PUTER_MODEL": "openrouter:proveedor/modelo-1.5_x",
+                                 "RAMS_PUTER_PRIMERO": "sí"})
+    assert s.puter_habilitado is False and s.tiene_puter is False
+    assert s.puter_modelo == "openrouter:proveedor/modelo-1.5_x" and s.puter_primero is True
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        malo = cargar_settings(entorno={"RAMS_PUTER": "quizas", "PUTER_MODEL": "modelo con espacios",
+                                        "RAMS_PUTER_PRIMERO": "talvez"})
+    assert malo.puter_habilitado is True and malo.puter_modelo == "" and malo.puter_primero is False
+    mensajes = " ".join(r.getMessage() for r in _avisos_config(caplog))
+    for var in ("RAMS_PUTER", "PUTER_MODEL", "RAMS_PUTER_PRIMERO"):
+        assert var in mensajes
+    assert "modelo con espacios" not in mensajes and "quizas" not in mensajes   # nunca el valor recibido
+    assert cargar_settings(entorno={"PUTER_MODEL": "x" * 101}).puter_modelo == ""
+    assert cargar_settings(entorno={"PUTER_MODEL": "   "}).puter_modelo == ""      # regla de ausencia
+
+
+def test_puter_capacidad_depende_de_offline_y_escritorio() -> None:
+    s = cargar_settings(entorno={})
+    assert s.tiene_puter is True
+    assert s.con(offline=True).tiene_puter is False                # Puter necesita red
+    assert cargar_settings(entorno={}, offline=True).tiene_puter is False
+    assert cargar_settings(entorno={"RAMS_OFFLINE": "1"}).tiene_puter is False
+    assert s.con(escritorio_habilitado=False).tiene_puter is False  # corre en Amadeus Desktop
+    assert s.con(puter_habilitado=False).tiene_puter is False
+    assert isinstance(hash(s.con(puter_modelo="m", puter_primero=True)), int)
+
+
+def test_env_example_documenta_puter_sin_avisos(caplog: pytest.LogCaptureFixture) -> None:
+    ruta = RAIZ_PROYECTO / ".env.example"
+    texto = ruta.read_bytes().decode("utf-8")
+    assert "\r" not in texto
+    assert "# --- Respaldo Puter (IA de respaldo del Área de Broca) ---" in texto
+    for var in ("RAMS_PUTER", "PUTER_MODEL", "RAMS_PUTER_PRIMERO", "PUTER_MAX_CALLS_DAY"):
+        assert f"\n{var}=" in texto, var
+    with caplog.at_level(logging.DEBUG, logger="rams.config"):
+        s = cargar_settings(entorno=leer_env_archivo(ruta))
+    assert _avisos_config(caplog) == []
+    assert s.puter_habilitado is True and s.puter_modelo == "" and s.puter_primero is False
+    assert s.puter_max_llamadas_dia == 300
+
+
+def test_puter_model_mismo_patron_que_el_enlace(caplog: pytest.LogCaptureFixture) -> None:
+    # Empieza por letra o dígito y tiene como mucho 100 caracteres: todo lo que acepta la
+    # configuración lo acepta también interface/escritorio_link.py (y no lo descarta en silencio).
+    from interface.escritorio_link import _MODELO_PUTER_RE
+
+    buenos = ("gpt-5-nano", "claude-sonnet-4-5", "openrouter:meta-llama/llama-3.1-8b-instruct",
+              "x-ai/grok-4", "9modelo", "a" * 100)
+    for valor in buenos:
+        assert cargar_settings(entorno={"PUTER_MODEL": valor}).puter_modelo == valor, valor
+        assert _MODELO_PUTER_RE.fullmatch(valor), valor
+    for valor in ("/modelo", "-x", ".x", ":x", "_x", "a" * 101, "a" * 110, "modelo?x", "ñandú"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="rams.config"):
+            assert cargar_settings(entorno={"PUTER_MODEL": valor}).puter_modelo == "", valor
+        mensajes = " ".join(r.getMessage() for r in _avisos_config(caplog))
+        assert "PUTER_MODEL" in mensajes and valor not in mensajes
+
+
+def test_puter_max_calls_day(caplog: pytest.LogCaptureFixture) -> None:
+    s = cargar_settings(entorno={"PUTER_MAX_CALLS_DAY": "50"})
+    assert s.puter_max_llamadas_dia == 50 and s.tiene_puter is True
+    cero = cargar_settings(entorno={"PUTER_MAX_CALLS_DAY": "0"})
+    assert cero.puter_max_llamadas_dia == 0 and cero.tiene_puter is False     # 0 = nunca usar Puter
+    assert cargar_settings(entorno={}).con(puter_max_llamadas_dia=0).tiene_puter is False
+    for malo in ("-1", "muchos", "3.5"):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="rams.config"):
+            assert cargar_settings(entorno={"PUTER_MAX_CALLS_DAY": malo}).puter_max_llamadas_dia == 300
+        mensajes = " ".join(r.getMessage() for r in _avisos_config(caplog))
+        assert "PUTER_MAX_CALLS_DAY" in mensajes and malo not in mensajes
+
+
+# ---------------------------------------------------------------------------
+# v0.2.2 "Correo, Drive y taller de scripts" (docs/V022_CORREO_DRIVE_SCRIPTS.md §2, §3 y §3.4)
+# ---------------------------------------------------------------------------
+
+# Defectos exactos de §2.1 (las rutas cuelgan de data_dir y se comprueban aparte).
+DEFECTOS_V022 = {
+    "google_habilitado": False,
+    "google_servicios": ("correo", "drive"),
+    "drive_completo": False,
+    "drive_descargas_dir": None,
+    "drive_max_descarga_mb": 200,
+    "drive_max_subida_mb": 100,
+    "correo_contactos_items": (),
+    "correo_max_destinatarios": 10,
+    "correo_max_10min": 5,
+    "correo_max_dia": 30,
+    "correo_max_adjuntos_mb": 20,
+    "telegram_correo": True,
+    "telegram_drive": False,
+    "taller_habilitado": False,
+    "taller_ofrecer": True,
+    "taller_timeout_s": 30.0,
+    "taller_max_procesos": 16,
+    "taller_max_memoria_mb": 512,
+    "taller_max_salida": 16384,
+}
+
+# Variables documentadas en .env.example (§2.3). RAMS_GOOGLE_TOKEN y RAMS_TALLER_DIR son avanzadas.
+VARIABLES_ENV_V022 = (
+    "RAMS_GOOGLE", "RAMS_GOOGLE_SERVICIOS", "RAMS_GOOGLE_CLIENTE", "RAMS_DRIVE_COMPLETO",
+    "RAMS_DRIVE_DESCARGAS", "RAMS_DRIVE_MAX_DESCARGA_MB", "RAMS_DRIVE_MAX_SUBIDA_MB",
+    "RAMS_CORREO_CONTACTOS", "RAMS_CORREO_MAX_DESTINATARIOS", "RAMS_CORREO_MAX_10MIN",
+    "RAMS_CORREO_MAX_DIA", "RAMS_CORREO_MAX_ADJUNTOS_MB", "RAMS_TELEGRAM_CORREO", "RAMS_TELEGRAM_DRIVE",
+    "RAMS_TALLER", "RAMS_TALLER_OFRECER", "RAMS_TALLER_TIMEOUT_S", "RAMS_TALLER_MAX_PROC",
+    "RAMS_TALLER_MAX_MEM_MB", "RAMS_TALLER_MAX_SALIDA",
+)
+
+
+def test_v022_valores_por_defecto(tmp_path: Path) -> None:
+    s = cargar_settings(entorno={})
+    for campo, esperado in DEFECTOS_V022.items():
+        assert getattr(s, campo) == esperado, campo
+    assert isinstance(s.taller_timeout_s, float) and isinstance(s.taller_max_salida, int)
+    assert s.google_cliente_path == s.data_dir / "google_cliente.json"
+    assert s.google_token_path == s.data_dir / "google_token.json"
+    assert s.taller_dir == s.data_dir / "scripts"
+    assert s.tiene_google is False and s.tiene_taller is False
+    assert dict(s.correo_contactos) == {}
+    directo = Settings()
+    for campo, esperado in DEFECTOS_V022.items():
+        assert getattr(directo, campo) == esperado, campo
+    assert directo.google_cliente_path == directo.data_dir / "google_cliente.json"
+    assert directo.google_token_path == directo.data_dir / "google_token.json"
+    assert directo.taller_dir == directo.data_dir / "scripts"
+    # Las rutas por defecto siguen a RAMS_DATA_DIR (y al respaldo de cargar_settings).
+    datos = tmp_path / "datos"
+    movido = cargar_settings(entorno={"RAMS_DATA_DIR": str(datos)})
+    assert movido.google_cliente_path == datos / "google_cliente.json"
+    assert movido.google_token_path == datos / "google_token.json"
+    assert movido.taller_dir == datos / "scripts"
+    respaldo = config._settings_por_defecto(tmp_path, offline=True)
+    assert respaldo.google_cliente_path == tmp_path / "data" / "google_cliente.json"
+    assert respaldo.google_token_path == tmp_path / "data" / "google_token.json"
+    assert respaldo.taller_dir == tmp_path / "data" / "scripts"
+    # asegurar_directorios NO crea taller_dir: lo crea el taller, bajo demanda, con 0o700 (§2.2).
+    movido.asegurar_directorios()
+    assert datos.is_dir() and not movido.taller_dir.exists()
+
+
+def test_v022_fixture_settings_prueba_aislada(settings_prueba: Settings, tmp_path: Path) -> None:
+    assert settings_prueba.google_habilitado is False and settings_prueba.tiene_google is False
+    assert settings_prueba.taller_habilitado is False and settings_prueba.tiene_taller is False
+    assert settings_prueba.google_cliente_path == tmp_path / "data" / "google_cliente.json"
+    assert settings_prueba.google_token_path == tmp_path / "data" / "google_token.json"
+    assert settings_prueba.taller_dir == tmp_path / "data" / "scripts"
+    activado = settings_prueba.con(google_habilitado=True, taller_habilitado=True)
+    assert activado.tiene_google is False                      # settings_prueba es offline
+    assert activado.con(offline=False).tiene_google is True
+    assert activado.tiene_taller is config._taller_soportado(sys.platform)
+
+
+def test_v022_parseo_valido(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    hogar = tmp_path / "hogar"
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        s = cargar_settings(entorno={
+            "HOME": str(hogar),
+            "RAMS_GOOGLE": "1", "RAMS_GOOGLE_SERVICIOS": " Drive, CORREO,drive,, ",
+            "RAMS_GOOGLE_CLIENTE": "secretos/cliente.json", "RAMS_GOOGLE_TOKEN": "~/tok/google.json",
+            "RAMS_DRIVE_COMPLETO": "sí", "RAMS_DRIVE_DESCARGAS": str(tmp_path / "bajadas"),
+            "RAMS_DRIVE_MAX_DESCARGA_MB": "2048", "RAMS_DRIVE_MAX_SUBIDA_MB": "1",
+            "RAMS_CORREO_MAX_DESTINATARIOS": "50", "RAMS_CORREO_MAX_10MIN": "1",
+            "RAMS_CORREO_MAX_DIA": "200", "RAMS_CORREO_MAX_ADJUNTOS_MB": "24",
+            "RAMS_TELEGRAM_CORREO": "0", "RAMS_TELEGRAM_DRIVE": "1",
+            "RAMS_TALLER": "1", "RAMS_TALLER_OFRECER": "no", "RAMS_TALLER_TIMEOUT_S": "12,5",
+            "RAMS_TALLER_MAX_PROC": "64", "RAMS_TALLER_MAX_MEM_MB": "64", "RAMS_TALLER_MAX_SALIDA": "262144",
+            "RAMS_TALLER_DIR": str(tmp_path / "taller"),
+        }, base_dir=tmp_path)
+    assert _avisos_config(caplog) == [], [r.getMessage() for r in _avisos_config(caplog)]
+    assert s.google_habilitado is True and s.google_servicios == ("correo", "drive")
+    assert s.google_cliente_path == tmp_path / "secretos" / "cliente.json"   # relativa a base_dir
+    assert s.google_token_path == hogar / "tok" / "google.json"
+    assert s.drive_completo is True and s.drive_descargas_dir == tmp_path / "bajadas"
+    assert s.drive_max_descarga_mb == 2048 and s.drive_max_subida_mb == 1
+    assert s.correo_max_destinatarios == 50 and s.correo_max_10min == 1
+    assert s.correo_max_dia == 200 and s.correo_max_adjuntos_mb == 24
+    assert s.telegram_correo is False and s.telegram_drive is True
+    assert s.taller_habilitado is True and s.taller_ofrecer is False and s.taller_timeout_s == 12.5
+    assert s.taller_max_procesos == 64 and s.taller_max_memoria_mb == 64 and s.taller_max_salida == 262144
+    assert s.taller_dir == tmp_path / "taller"
+    assert s.tiene_google is True and s.tiene_taller is config._taller_soportado(sys.platform)
+    for valor, esperado in (("drive", ("drive",)), ("correo", ("correo",)), ("DRIVE,correo", ("correo", "drive")),
+                            ("correo,correo", ("correo",))):
+        assert cargar_settings(entorno={"RAMS_GOOGLE_SERVICIOS": valor}).google_servicios == esperado, valor
+    for valor, esperado in (("5", 5.0), ("300", 300.0), ("45.5", 45.5)):
+        assert cargar_settings(entorno={"RAMS_TALLER_TIMEOUT_S": valor}).taller_timeout_s == esperado
+    minimos = cargar_settings(entorno={
+        "RAMS_DRIVE_MAX_DESCARGA_MB": "1", "RAMS_DRIVE_MAX_SUBIDA_MB": "2048", "RAMS_CORREO_MAX_DESTINATARIOS": "1",
+        "RAMS_CORREO_MAX_10MIN": "20", "RAMS_CORREO_MAX_DIA": "1", "RAMS_CORREO_MAX_ADJUNTOS_MB": "1",
+        "RAMS_TALLER_MAX_PROC": "1", "RAMS_TALLER_MAX_MEM_MB": "8192", "RAMS_TALLER_MAX_SALIDA": "1024"})
+    assert (minimos.drive_max_descarga_mb, minimos.drive_max_subida_mb, minimos.correo_max_destinatarios,
+            minimos.correo_max_10min, minimos.correo_max_dia, minimos.correo_max_adjuntos_mb,
+            minimos.taller_max_procesos, minimos.taller_max_memoria_mb, minimos.taller_max_salida) == \
+        (1, 2048, 1, 20, 1, 1, 1, 8192, 1024)
+    # Regla única de ausencia: vacías o en blanco ⇒ defecto, sin aviso; RAMS_DRIVE_DESCARGAS vacía ⇒ None.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        vacias = cargar_settings(entorno={var: "  " for var in VARIABLES_ENV_V022})
+    assert _avisos_config(caplog) == []
+    for campo, esperado in DEFECTOS_V022.items():
+        assert getattr(vacias, campo) == esperado, campo
+    assert vacias.drive_descargas_dir is None
+
+
+def test_v022_invalidos_usan_defecto_y_avisan_sin_valor(caplog: pytest.LogCaptureFixture) -> None:
+    malos = {
+        "RAMS_GOOGLE": "quizas-raro", "RAMS_GOOGLE_SERVICIOS": "correo,fotos-raras",
+        "RAMS_DRIVE_COMPLETO": "talvez-raro", "RAMS_DRIVE_MAX_DESCARGA_MB": "0",
+        "RAMS_DRIVE_MAX_SUBIDA_MB": "2049", "RAMS_CORREO_MAX_DESTINATARIOS": "51",
+        "RAMS_CORREO_MAX_10MIN": "21", "RAMS_CORREO_MAX_DIA": "201", "RAMS_CORREO_MAX_ADJUNTOS_MB": "25",
+        "RAMS_TELEGRAM_CORREO": "a-veces-raro", "RAMS_TELEGRAM_DRIVE": "x-raro", "RAMS_TALLER": "puede-raro",
+        "RAMS_TALLER_OFRECER": "nunca-jamas-raro", "RAMS_TALLER_TIMEOUT_S": "0",
+        "RAMS_TALLER_MAX_PROC": "65", "RAMS_TALLER_MAX_MEM_MB": "63", "RAMS_TALLER_MAX_SALIDA": "1023",
+    }
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        s = cargar_settings(entorno=malos)
+    for campo, esperado in DEFECTOS_V022.items():
+        assert getattr(s, campo) == esperado, campo
+    mensajes = " ".join(r.getMessage() for r in _avisos_config(caplog))
+    for var in malos:
+        assert f"para {var};" in mensajes, var
+    for valor in malos.values():
+        if "rar" in valor:
+            assert valor not in mensajes                            # nunca el valor recibido
+    assert "fotos" not in mensajes
+    for var, valor, campo in (
+        ("RAMS_GOOGLE_SERVICIOS", "fotos", "google_servicios"),
+        ("RAMS_GOOGLE_SERVICIOS", " , ,", "google_servicios"),
+        ("RAMS_GOOGLE_SERVICIOS", "correo;drive", "google_servicios"),
+        ("RAMS_TALLER_TIMEOUT_S", "301", "taller_timeout_s"),
+        ("RAMS_TALLER_TIMEOUT_S", "4.9", "taller_timeout_s"),
+        ("RAMS_TALLER_TIMEOUT_S", "nan", "taller_timeout_s"),
+        ("RAMS_TALLER_TIMEOUT_S", "inf", "taller_timeout_s"),
+        ("RAMS_TALLER_TIMEOUT_S", "treinta", "taller_timeout_s"),
+        ("RAMS_DRIVE_MAX_DESCARGA_MB", "200.5", "drive_max_descarga_mb"),
+        ("RAMS_CORREO_MAX_DIA", "-1", "correo_max_dia"),
+    ):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="rams.config"):
+            assert getattr(cargar_settings(entorno={var: valor}), campo) == DEFECTOS_V022[campo], (var, valor)
+        avisos = [r.getMessage() for r in _avisos_config(caplog)]
+        assert len(avisos) == 1 and f"para {var};" in avisos[0], (var, valor)
+
+
+def test_v022_correo_contactos(caplog: pytest.LogCaptureFixture) -> None:
+    crudo = ("Mamá=mama@gmail.com, Jefe   Grande = jefe@empresa.com,malo-sin-igual,x=no-es-correo,"
+             "=solo@correo.co,  =  ,mama=otra.mama@gmail.com,"
+             "alias_demasiado_largo_para_el_limite_31=largo@correo.co")
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        s = cargar_settings(entorno={"RAMS_CORREO_CONTACTOS": crudo})
+    # Alias normalizado (minúsculas, sin tildes, espacios colapsados); si se repite, gana el último.
+    assert s.correo_contactos_items == (("jefe grande", "jefe@empresa.com"), ("mama", "otra.mama@gmail.com"))
+    avisos = [r.getMessage() for r in _avisos_config(caplog)]
+    assert len(avisos) == 1, avisos                                  # UN solo aviso por los pares malos
+    assert "RAMS_CORREO_CONTACTOS" in avisos[0] and "5" in avisos[0]
+    for privado in ("mama", "gmail", "no-es-correo", "malo-sin-igual", "@", "solo"):
+        assert privado not in avisos[0], privado
+    contactos = s.correo_contactos
+    assert isinstance(contactos, types.MappingProxyType)
+    assert contactos is s.correo_contactos                         # cacheado
+    assert dict(contactos) == {"jefe grande": "jefe@empresa.com", "mama": "otra.mama@gmail.com"}
+    with pytest.raises(TypeError):
+        contactos["tia"] = "tia@correo.co"  # type: ignore[index]
+    # Las direcciones (datos privados, §15.11) no salen en repr ni en resumen_seguro.
+    assert "jefe@empresa.com" not in repr(s) and "otra.mama" not in repr(s)
+    resumen = s.resumen_seguro()
+    assert resumen["correo_contactos_items"] == 2
+    assert "jefe@empresa.com" not in json.dumps(resumen, ensure_ascii=False)
+    # Todos malos ⇒ () con un único aviso; vacía o ausente ⇒ () sin aviso.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        todo_malo = cargar_settings(entorno={"RAMS_CORREO_CONTACTOS": "malo,x=y,Ñ=ñ@x.co"})
+    assert todo_malo.correo_contactos_items == () and dict(todo_malo.correo_contactos) == {}
+    assert len(_avisos_config(caplog)) == 1
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        assert cargar_settings(entorno={"RAMS_CORREO_CONTACTOS": ""}).correo_contactos_items == ()
+        assert cargar_settings(entorno={}).correo_contactos_items == ()
+    assert _avisos_config(caplog) == []
+    assert cargar_settings(entorno={"RAMS_CORREO_CONTACTOS": "Ñoño_1=a@b.co"}).correo_contactos_items == \
+        (("nono_1", "a@b.co"),)
+    # Robusto ante una copia con datos raros (con()), sin lanzar.
+    raro = s.con(correo_contactos_items=[["tia", "tia@correo.co"], ("MAL", "x@y.co"), ("z",),
+                                         ("p", "no-correo"), 7])
+    assert dict(raro.correo_contactos) == {"tia": "tia@correo.co"}
+
+
+def test_v022_propiedades() -> None:
+    entorno = {"RAMS_GOOGLE": "1", "RAMS_TALLER": "1"}
+    s = cargar_settings(entorno=entorno)
+    assert s.tiene_google is True
+    assert s.con(offline=True).tiene_google is False
+    assert cargar_settings(entorno=entorno, offline=True).tiene_google is False
+    assert cargar_settings(entorno={**entorno, "RAMS_OFFLINE": "1"}).tiene_google is False
+    assert s.con(google_habilitado=False).tiene_google is False
+    for plataforma, esperado in (("win32", True), ("linux", True), ("linux2", True), ("darwin", False),
+                                 ("cygwin", False), ("freebsd14", False)):
+        assert config._taller_soportado(plataforma) is esperado, plataforma
+    assert s.tiene_taller is config._taller_soportado(sys.platform)
+    assert s.con(offline=True).tiene_taller is s.tiene_taller          # no depende de offline
+    assert s.con(taller_habilitado=False).tiene_taller is False
+    resumen = s.resumen_seguro()
+    assert resumen["tiene_google"] is True and resumen["tiene_taller"] is s.tiene_taller
+    assert resumen["google_servicios"] == ["correo", "drive"]
+    json.dumps(resumen, ensure_ascii=False)
+    assert isinstance(hash(s), int) and hash(s) == hash(cargar_settings(entorno=entorno))
+    copia = s.con(google_servicios=("drive",), taller_timeout_s=60.0, drive_descargas_dir=Path("x"))
+    assert copia.google_servicios == ("drive",) and copia.taller_timeout_s == 60.0
+    assert isinstance(hash(copia), int) and s.google_servicios == ("correo", "drive")
+    with pytest.raises(AttributeError):
+        s.google_habilitado = False  # type: ignore[misc]
+
+
+def test_env_example_v022_sin_avisos(caplog: pytest.LogCaptureFixture) -> None:
+    ruta = RAIZ_PROYECTO / ".env.example"
+    texto = ruta.read_bytes().decode("utf-8")
+    assert "\r" not in texto and not texto.startswith("\ufeff")
+    seccion = "# --- v0.2.2: Google (Gmail y Drive) y taller de scripts ---"
+    assert seccion in texto
+    assert all(texto.index(seccion) > texto.index(otra) for otra in (
+        "# --- Telegram multimedia ---", "# --- Respaldo Puter", "# --- Visión continua"))   # va al final
+    lineas = texto.split("\n")
+    for var in VARIABLES_ENV_V022:
+        indices = [i for i, linea in enumerate(lineas) if linea.startswith(f"{var}=")]
+        assert len(indices) == 1, var
+        assert lineas[indices[0] - 1].startswith("# "), var      # una línea de comentario en español
+    for var in ("RAMS_GOOGLE_TOKEN", "RAMS_TALLER_DIR"):         # avanzadas: no se listan
+        assert var not in texto, var
+    assert "# mama=mama@gmail.com,jefe=jefe@empresa.com" in texto
+    assert "data/google_cliente.json" in texto and "§17" in texto
+    leido = leer_env_archivo(ruta)
+    for var in ("RAMS_GOOGLE_CLIENTE", "RAMS_DRIVE_DESCARGAS", "RAMS_CORREO_CONTACTOS"):
+        assert leido[var] == "", var                              # vacías = defecto, sin aviso
+    with caplog.at_level(logging.DEBUG, logger="rams.config"):
+        s = cargar_settings(entorno=leido)
+    assert _avisos_config(caplog) == [], [r.getMessage() for r in _avisos_config(caplog)]
+    for campo, esperado in DEFECTOS_V022.items():
+        assert getattr(s, campo) == esperado, campo
+    base = cargar_settings(entorno={})
+    for campo in ("google_cliente_path", "google_token_path", "taller_dir", "drive_descargas_dir"):
+        assert getattr(s, campo) == getattr(base, campo), campo
+
+
+def test_v022_constantes_de_contrato() -> None:
+    assert SERVICIOS_GOOGLE == ("correo", "drive")
+    assert CARPETAS_USUARIO == ("descargas", "documentos", "escritorio", "imagenes", "musica", "videos")
+    assert DESTINOS_DESCARGA == ("descargas", "documentos", "escritorio")
+    assert set(DESTINOS_DESCARGA) <= set(CARPETAS_USUARIO)
+    assert OPERACIONES_DRIVE == ("buscar", "info", "descargar", "leer", "crear_carpeta", "subir", "papelera",
+                                 "compartir")
+    assert FORMATOS_DRIVE == ("pdf", "texto", "original")
+    assert ROLES_DRIVE == ("reader", "commenter", "writer")
+    assert CLASES_TARJETA == ("correo", "drive", "script", "salida")
+    assert ESTADOS_TARJETA == ("pendiente", "info", "cerrada")
+    assert BOTONES_TARJETA == ("aprobar", "aprobar_publico", "editar", "guardar", "copiar", "descartar")
+    assert DECISIONES_TARJETA == ("aprobar", "aprobar_publico", "editar", "guardar", "descartar")
+    assert set(DECISIONES_TARJETA) == set(BOTONES_TARJETA) - {"copiar"}      # "copiar" es local
+    assert RESULTADOS_TARJETA == ("enviado", "hecho", "ejecutado", "descartado", "caducado", "reemplazado",
+                                  "denegado", "fallo")
+    assert LENGUAJES_SCRIPT == ("powershell", "python", "bash")
+    assert NIVELES_RIESGO == ("bajo", "medio", "alto", "critico")
+    assert NIVELES_EJECUTABLES == frozenset({"bajo", "medio", "alto"})
+    assert isinstance(NIVELES_EJECUTABLES, frozenset) and "critico" not in NIVELES_EJECUTABLES
+    assert CATEGORIAS_RIESGO == ("borrado", "sobrescritura", "registro", "servicios", "red", "descarga_ejecucion",
+                                 "credenciales", "elevacion", "apagado", "seguridad", "persistencia",
+                                 "ofuscacion", "dinamico", "fuera_de_carpeta", "subproceso", "winapi",
+                                 "interactivo", "sintaxis", "tamano", "analisis_degradado")
+    assert len(set(CATEGORIAS_RIESGO)) == 20
+    assert (TTL_TARJETA_S, TTL_TARJETA_TELEGRAM_S, TTL_DOBLE_CONFIRMACION_S) == (1800.0, 43200.0, 120.0)
+    assert all(isinstance(v, float) for v in (TTL_TARJETA_S, TTL_TARJETA_TELEGRAM_S, TTL_DOBLE_CONFIRMACION_S))
+    assert MAX_TARJETAS_VIVAS == 4 == len(CLASES_TARJETA)
+    assert MAX_CODIGO_SCRIPT == 24_576                       # ya NO es 32 768 (§21.1, hallazgo 7)
+    assert MAX_SALIDA_TARJETA == 8_192 and MAX_HALLAZGOS_TARJETA == 20
+    assert MAX_BYTES_TARJETA == MAX_BYTES_DECISION_TARJETA == 61_440
+    assert MAX_BYTES_TARJETA < 65_536 and MAX_BYTES_DECISION_TARJETA < 65_536
+    assert 2 * MAX_CODIGO_SCRIPT < MAX_BYTES_TARJETA          # el código escapado (peor caso) cabe
+    assert (MAX_CUERPO_CORREO, MAX_ASUNTO_CORREO, MAX_ADJUNTOS_CORREO) == (10_000, 200, 5)
+    # Lo que NO cambia en la v0.2.2.
+    assert len(TIPOS_ACCION) == 13 and ORIGENES_ACCION == ("usuario", "iniciativa", "nexus", "telegram", "llm")
+    assert CANALES_ENTRADA == ("terminal", "telegram", "nexus", "escritorio")
+    import core.contracts as contratos
+
+    assert contratos.VERSION == "0.1.0"
+    for nombre in ("SERVICIOS_GOOGLE", "CARPETAS_USUARIO", "DESTINOS_DESCARGA", "OPERACIONES_DRIVE",
+                   "FORMATOS_DRIVE", "ROLES_DRIVE", "CLASES_TARJETA", "ESTADOS_TARJETA", "BOTONES_TARJETA",
+                   "DECISIONES_TARJETA", "RESULTADOS_TARJETA", "LENGUAJES_SCRIPT", "NIVELES_RIESGO",
+                   "NIVELES_EJECUTABLES", "CATEGORIAS_RIESGO", "TTL_TARJETA_S", "TTL_TARJETA_TELEGRAM_S",
+                   "TTL_DOBLE_CONFIRMACION_S", "MAX_TARJETAS_VIVAS", "MAX_CODIGO_SCRIPT", "MAX_SALIDA_TARJETA",
+                   "MAX_HALLAZGOS_TARJETA", "MAX_BYTES_TARJETA", "MAX_BYTES_DECISION_TARJETA",
+                   "MAX_CUERPO_CORREO", "MAX_ASUNTO_CORREO", "MAX_ADJUNTOS_CORREO", "ID_TARJETA_RE",
+                   "HUELLA_RE", "CORREO_RE", "PATRON_ARCHIVO_SENSIBLE", "huella_contenido", "largo_utf16",
+                   "bytes_json"):
+        assert nombre in contratos.__all__ and hasattr(contratos, nombre), nombre
+    assert "carpetas_usuario" in config.__all__
+    # Regex de contrato (los consumidores usan fullmatch: "$" admitiría un "\n" final).
+    assert ID_TARJETA_RE.fullmatch("0a1b2c3d") and HUELLA_RE.fullmatch("ab" * 32)
+    for malo in ("0A1B2C3D", "0a1b2c3", "0a1b2c3d9", "0a1b2c3g", ""):
+        assert ID_TARJETA_RE.fullmatch(malo) is None, malo
+    for malo in ("AB" * 32, "ab" * 31, "ab" * 33, "g" * 64):
+        assert HUELLA_RE.fullmatch(malo) is None, malo
+    for bueno in ("juan.perez+x@mail.example.co", "a@b.co", "MAMA_1@Gmail.COM", "x%y@sub-dominio.empresa.travel"):
+        assert CORREO_RE.fullmatch(bueno), bueno
+    for malo in ("a@b", "a b@c.co", "@x.co", "a@.co", "a@b.c", "a@@b.co", "a" * 65 + "@b.co", "ñ@b.co",
+                 "a@b.c0m", "a@b.co\n", "<a@b.co>"):
+        assert CORREO_RE.fullmatch(malo) is None, malo
+    sensible = re.compile(PATRON_ARCHIVO_SENSIBLE)
+    for nombre in (".env", ".env.local", "proyecto/.env", "c:/users/yo/.ssh/id_rsa", "id_ed25519.pub",
+                   "claves.kdbx", "cert.pem", "privada.key", "vpn.ovpn", "login data", "cookies", "web data",
+                   "key4.db", "logins.json", "ctl_token", "escritorio.json", "google_cliente.json",
+                   "data/google_token.json", "client_secret_123.apps.googleusercontent.com.json"):
+        assert sensible.search(nombre), nombre
+    for nombre in ("informe.pdf", "fotos/playa.jpg", "notas.env.txt", "mi.env", "keys.txt", "cookies.txt",
+                   "client_secret.txt", "escritorio.json.bak"):
+        assert sensible.search(nombre) is None, nombre
+
+
+def test_huella_contenido(caplog: pytest.LogCaptureFixture) -> None:
+    base = {"clase": "correo", "para": ["a@b.co"], "asunto": "Hola", "cuerpo": "Línea 1\nLínea 2", "n": 3,
+            "listo": True, "nada": None}
+    huella = huella_contenido(base)
+    assert HUELLA_RE.fullmatch(huella)
+    assert huella == huella_contenido(dict(base)) == huella_contenido(base)            # determinista
+    canonico = json.dumps(base, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert huella == hashlib.sha256(canonico.encode("utf-8")).hexdigest()
+    assert huella_contenido(dict(reversed(list(base.items())))) == huella              # orden de claves
+    assert huella_contenido(types.MappingProxyType(base)) == huella
+    assert huella_contenido({**base, "para": ("a@b.co",)}) == huella                   # tupla = lista
+    assert huella_contenido({**base, "cuerpo": "Línea 1\r\nLínea 2"}) == huella        # CRLF = LF
+    assert huella_contenido({**base, "cuerpo": "Línea 1\rLínea 2"}) == huella          # CR = LF
+    descompuesta = unicodedata.normalize("NFD", base["cuerpo"])
+    assert descompuesta != base["cuerpo"]
+    assert huella_contenido({**base, "cuerpo": descompuesta}) == huella                # NFC
+    assert huella_contenido({"a": {"b": [("x\r\n", {"c": "e\u0301"})]}}) == \
+        huella_contenido({"a": {"b": [["x\n", {"c": "é"}]]}})                            # recursivo
+    assert huella_contenido({}) == hashlib.sha256(b"{}").hexdigest()
+    for campo, otro in (("para", ["c@d.co"]), ("asunto", "Hola."), ("cuerpo", "Línea 1"), ("n", 4),
+                        ("listo", False), ("nada", 0), ("clase", "drive")):
+        assert huella_contenido({**base, campo: otro}) != huella, campo                 # sensible a cada campo
+    assert huella_contenido({**base, "extra": 1}) != huella
+    # No serializable ⇒ "" (fail-closed), nunca lanza.
+    circular: dict[str, object] = {}
+    circular["yo"] = circular
+    for malo in ({"x": b"bytes"}, {"x": float("nan")}, {"x": float("inf")}, {"x": object()}, {"x": {1, 2}},
+                 {"x": "\ud800"}, {"\udfff": 1}, {1: "a", "1": "b"}, {"e\u0301": 1, "é": 2}, circular,
+                 ["no", "es", "mapping"], "texto", None):
+        assert huella_contenido(malo) == "", repr(malo)[:40]  # type: ignore[arg-type]
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="rams.contracts"):
+        assert huella_contenido({"clave": b"clave-super-privada"}) == ""
+    assert caplog.records and all("clave-super-privada" not in r.getMessage() for r in caplog.records)
+
+
+def test_largo_utf16_y_bytes_json() -> None:
+    assert largo_utf16("hola") == 4 == len("hola")                 # ASCII = len
+    assert largo_utf16("é") == 1 and largo_utf16("e\u0301") == 2
+    assert largo_utf16("😀") == 2 and largo_utf16("a😀b") == 4     # fuera del BMP cuenta 2
+    assert largo_utf16("") == 0 and largo_utf16("\ud800") == 1     # sustituto suelto: 1 unidad, sin lanzar
+    assert largo_utf16("x" * 10_000 + "😀") == 10_002
+    for no_str in (None, 5, b"abc", ["a"], 3.5):
+        assert largo_utf16(no_str) == 0, no_str  # type: ignore[arg-type]
+    for valor in ({"tipo": "tarjeta", "datos": {"titulo": "Café ☕", "n": [1, 2.5, None, True]}}, "ñandú😀",
+                  [], {}, 0, ("a", "b"), "línea\ncon\ttab \"comillas\" y \\"):
+        assert bytes_json(valor) == len(json.dumps(valor, ensure_ascii=False, separators=(",", ":")).encode()), \
+            valor
+    assert bytes_json("a\nb") - bytes_json("ab") == 2              # "\n" escapado ocupa 2 bytes
+    assert bytes_json("\n") == 4 and bytes_json("\t") == 4 and bytes_json('"') == 4 and bytes_json("\\") == 4
+    assert bytes_json("é") == 4 and bytes_json("😀") == 6          # 2 comillas + bytes UTF-8
+    assert bytes_json((1, 2)) == bytes_json([1, 2])
+    for malo in ("\ud800", {"x": "\udfff"}, float("nan"), float("inf"), {"x": float("-inf")}, b"x", object(),
+                 {1, 2}):
+        assert bytes_json(malo) == sys.maxsize, repr(malo)
+
+
+@pytest.mark.parametrize(("texto", "prohibido", "esperado"), [
+    ("token de acceso ya29." + "a0AfB_x" * 4 + " fin", "ya29.a0AfB", "«token-google»"),             # 3b
+    ("Authorization: Bearer ya29." + "a0AfB_x" * 4, "ya29.a0AfB", "Authorization: «secreto»"),     # 3b + 5
+    ('{"refresh_token": "1//0g' + "Ab-_9" * 6 + '"}', "1//0gAb", '"«token-google»"'),               # 3b
+    ("secreto GOCSPX-" + "AbCdEf_-123" + " fin", "GOCSPX-AbCd", "«secreto-cliente»"),               # 3b
+    ("client_secret=mi-valor-del-cliente y más", "mi-valor-del-cliente", "client_secret=«secreto»"),  # 5
+    ("client_secret: GOCSPX-" + "AbCdEf_-123", "GOCSPX-", "client_secret: «secreto»"),              # 3b + 5
+    ("refresh_token: r3fr3sc0-valor", "r3fr3sc0", "refresh_token: «secreto»"),                       # 5
+    ("access_token=tok-acceso-1", "tok-acceso-1", "access_token=«secreto»"),                         # 5
+    ("id_token: eyJhbGciOi.x.y", "eyJhbGciOi", "id_token: «secreto»"),                               # 5
+    ("code_verifier=verif-123-abc", "verif-123-abc", "code_verifier=«secreto»"),                     # 5
+    ("http://127.0.0.1:5555/?code=4/0AbcDEF&state=xyz789", "4/0AbcDEF", "?code=«secreto»&state=«secreto»"),
+    ("GET /?state=st4t3XYZ&code=4/0Ab-c&scope=gmail.send HTTP/1.1", "st4t3XYZ",
+     "?state=«secreto»&code=«secreto»&scope=gmail.send"),                                            # 7
+    ("https://oauth2.googleapis.com/revoke?x=1&refresh_token=r3fr3sc0", "r3fr3sc0", "&refresh_token=«secreto»"),
+    # La regla 5 (asignación) se come el resto hasta el espacio: también los parámetros siguientes.
+    ("https://h/cb?access_token=abc&code_verifier=v3r1f", "v3r1f", "?access_token=«secreto»"),
+    ("https://h/cb?x=1&code_verifier=v3r1f&state=st", "v3r1f", "&code_verifier=«secreto»"),
+])
+def test_redactar_google_oauth(texto: str, prohibido: str, esperado: str) -> None:
+    redactado = redactar(texto)
+    assert prohibido not in redactado
+    assert esperado in redactado
+    assert redactar(redactado) == redactado                         # idempotente
+
+
+def test_redactar_oauth_solo_en_parametros_de_url() -> None:
+    # code y state solo se tapan como parámetro de URL ([?&]x=), nunca en texto suelto.
+    for frase in ("el code=1234 del ejemplo", "state=ok en una frase", "el código de estado", "1//corto",
+                  "ya29.corto", "GOCSPX-corto", "client secret faltante", "refresh token caducado",
+                  "consulta de la API: código 200, estado ok"):
+        assert redactar(frase) == frase, frase
+    assert parece_secreto("el estado del correo es enviado") is False
+    registro = logging.LogRecord("rams.google", logging.INFO, __file__, 1, "token %s y %s",
+                                 ("ya29." + "x" * 30, "GOCSPX-" + "y" * 20), None)
+    FiltroSecretos().filter(registro)
+    assert "ya29" not in registro.getMessage() and "GOCSPX" not in registro.getMessage()
+
+
+class _EntornoVigilado(dict):
+    """Entorno falso que anota qué variables se leen (carpetas_usuario solo puede leer tres)."""
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self.leidas: set[str] = set()
+
+    def get(self, clave: str, defecto: object = None) -> object:  # type: ignore[override]
+        self.leidas.add(clave)
+        return super().get(clave, defecto)
+
+    def __getitem__(self, clave: str) -> object:
+        self.leidas.add(clave)
+        return super().__getitem__(clave)
+
+
+_VARIABLES_CARPETAS = {"USERPROFILE", "HOME", "XDG_CONFIG_HOME"}
+
+
+def test_carpetas_usuario_linux(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(config, "_carpetas_windows_api",
+                        lambda: pytest.fail("en Linux nunca se llama a la API de Windows"))
+    hogar = tmp_path / "hogar"
+    musica = tmp_path / "otra" / "Musica"
+    for ruta in (hogar / "Descargas", hogar / "Downloads", hogar / "Documentos", hogar / "Desktop",
+                 hogar / "Pictures", musica):
+        ruta.mkdir(parents=True)
+    (hogar / ".config").mkdir()
+    (hogar / ".config" / "user-dirs.dirs").write_text(
+        "# Generado por xdg-user-dirs-update\n"
+        'XDG_DOWNLOAD_DIR="$HOME/Descargas"\n'
+        'XDG_DOCUMENTS_DIR="${HOME}/Documentos"\n'
+        'XDG_DESKTOP_DIR="$HOME/"\n'                 # desactivada: nunca el propio $HOME (→ ~/Desktop)
+        'XDG_PICTURES_DIR="relativa/Imagenes"\n'     # relativa: se ignora (→ ~/Pictures)
+        f'XDG_MUSIC_DIR="{musica}"\n'                # absoluta
+        'XDG_VIDEOS_DIR="$HOME/NoExiste"\n'          # no existe (y ~/Videos tampoco): no aparece
+        'XDG_TEMPLATES_DIR="$HOME/Plantillas"\n'
+        "línea que no se entiende\n", encoding="utf-8")
+    entorno = _EntornoVigilado({"HOME": str(hogar), "USERPROFILE": "C:\\no\\se\\usa", "PATH": "x",
+                                "GEMINI_API_KEY": "nunca-se-lee", "XDG_DOWNLOAD_DIR": "/tampoco"})
+    carpetas = carpetas_usuario(entorno=entorno, plataforma="linux", usar_api=True)
+    assert carpetas == {"descargas": hogar / "Descargas", "documentos": hogar / "Documentos",
+                        "escritorio": hogar / "Desktop", "imagenes": hogar / "Pictures", "musica": musica}
+    assert list(carpetas) == [c for c in CARPETAS_USUARIO if c in carpetas]     # orden del catálogo
+    assert entorno.leidas <= _VARIABLES_CARPETAS, entorno.leidas
+    # XDG_CONFIG_HOME absoluto manda; nunca una carpeta que contenga al $HOME.
+    config_xdg = tmp_path / "cfg"
+    config_xdg.mkdir()
+    (hogar / "Bajadas").mkdir()
+    (config_xdg / "user-dirs.dirs").write_text(
+        f'XDG_DOWNLOAD_DIR="$HOME/Bajadas"\nXDG_MUSIC_DIR="{tmp_path}"\nXDG_VIDEOS_DIR="$OTRA/Videos"\n',
+        encoding="utf-8")
+    otro = carpetas_usuario(entorno={"HOME": str(hogar), "XDG_CONFIG_HOME": str(config_xdg)},
+                            plataforma="linux", usar_api=False)
+    assert otro == {"descargas": hogar / "Bajadas", "escritorio": hogar / "Desktop",
+                    "imagenes": hogar / "Pictures"}
+    # Un XDG_CONFIG_HOME relativo se ignora (se usa ~/.config).
+    assert carpetas_usuario(entorno={"HOME": str(hogar), "XDG_CONFIG_HOME": "relativa/cfg"},
+                            plataforma="linux", usar_api=False) == carpetas
+    # Sin user-dirs.dirs: los nombres por defecto bajo $HOME (también en otros sistemas).
+    sin_archivo = tmp_path / "otro_hogar"
+    for nombre in ("Downloads", "Videos"):
+        (sin_archivo / nombre).mkdir(parents=True)
+    (sin_archivo / "Music").write_text("no soy una carpeta", encoding="utf-8")
+    esperado = {"descargas": sin_archivo / "Downloads", "videos": sin_archivo / "Videos"}
+    assert carpetas_usuario(entorno={"HOME": str(sin_archivo)}, plataforma="linux", usar_api=False) == esperado
+    assert carpetas_usuario(entorno={"HOME": str(sin_archivo)}, plataforma="darwin") == esperado
+    # Un user-dirs.dirs basura o enorme se ignora sin lanzar.
+    raro = tmp_path / "hogar_raro"
+    (raro / ".config").mkdir(parents=True)
+    (raro / "Downloads").mkdir()
+    (raro / ".config" / "user-dirs.dirs").write_bytes(b"\xff\xfe\x00basura\n" + b"x" * 70_000)
+    assert carpetas_usuario(entorno={"HOME": str(raro)}, plataforma="linux", usar_api=False) == \
+        {"descargas": raro / "Downloads"}
+
+
+def test_carpetas_usuario_windows(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    perfil = tmp_path / "perfil"
+    for nombre in ("Downloads", "Documents", "Videos"):
+        (perfil / nombre).mkdir(parents=True)
+    (perfil / "Music").write_text("no soy una carpeta", encoding="utf-8")
+    monkeypatch.setattr(config, "_carpetas_windows_api",
+                        lambda: pytest.fail("usar_api=False no llama a SHGetKnownFolderPath"))
+    entorno = _EntornoVigilado({"USERPROFILE": str(perfil), "HOME": str(tmp_path / "otro"),
+                                "APPDATA": "nunca", "LOCALAPPDATA": "nunca", "GEMINI_API_KEY": "nunca-se-lee"})
+    esperado = {"descargas": perfil / "Downloads", "documentos": perfil / "Documents", "videos": perfil / "Videos"}
+    assert carpetas_usuario(entorno=entorno, plataforma="win32", usar_api=False) == esperado
+    assert entorno.leidas <= _VARIABLES_CARPETAS, entorno.leidas
+    assert carpetas_usuario(entorno={"HOME": str(perfil)}, plataforma="win32", usar_api=False) == esperado
+    # Con un entorno explícito sin perfil (o con uno relativo) nunca se mira el perfil real.
+    assert carpetas_usuario(entorno={}, plataforma="win32", usar_api=False) == {}
+    assert carpetas_usuario(entorno={}, plataforma="linux", usar_api=False) == {}
+    assert carpetas_usuario(entorno={"USERPROFILE": "relativa"}, plataforma="win32", usar_api=False) == {}
+    # Con la API (doble): manda la carpeta conocida (OneDrive, carpetas movidas); si no existe, o es
+    # el propio perfil, se usa el nombre bajo %USERPROFILE%.
+    onedrive = tmp_path / "OneDrive" / "Escritorio"
+    onedrive.mkdir(parents=True)
+    (perfil / "Desktop").mkdir()
+    llamadas: list[int] = []
+
+    def api_falsa() -> dict[str, Path]:
+        llamadas.append(1)
+        return {"escritorio": onedrive, "documentos": tmp_path / "no_existe", "imagenes": perfil}
+
+    monkeypatch.setattr(config, "_carpetas_windows_api", api_falsa)
+    assert carpetas_usuario(entorno={"USERPROFILE": str(perfil)}, plataforma="win32") == {
+        "descargas": perfil / "Downloads", "documentos": perfil / "Documents", "escritorio": onedrive,
+        "videos": perfil / "Videos"}
+    assert llamadas == [1]
+    carpetas_usuario(entorno={"HOME": str(perfil)}, plataforma="linux")
+    assert llamadas == [1]                                       # en Linux nunca
+
+
+def test_carpetas_usuario_nunca_lanza(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    class EntornoRoto(dict):
+        def get(self, *args: object, **kwargs: object) -> object:  # type: ignore[override]
+            raise RuntimeError("entorno roto")
+
+    assert carpetas_usuario(entorno=EntornoRoto(), plataforma="linux", usar_api=False) == {}
+    assert carpetas_usuario(entorno=object(), plataforma="win32", usar_api=False) == {}  # type: ignore[arg-type]
+    assert carpetas_usuario(entorno={"HOME": "a\x00b"}, plataforma="linux", usar_api=False) == {}
+
+    def api_rota() -> dict[str, Path]:
+        raise RuntimeError("API rota")
+
+    api_original = config._carpetas_windows_api
+    monkeypatch.setattr(config, "_carpetas_windows_api", api_rota)
+    (tmp_path / "Downloads").mkdir()
+    assert carpetas_usuario(entorno={"USERPROFILE": str(tmp_path)}, plataforma="win32") == \
+        {"descargas": tmp_path / "Downloads"}
+    if sys.platform != "win32":   # fuera de Windows la API no existe: {} sin lanzar (nunca las carpetas reales)
+        assert api_original() == {}
+
+
+def test_sin_efectos_pc_v022_shells_y_limites(correr) -> None:
+    # §3.5: ningún test lanza una shell real ni crea unidades o límites reales; sys.executable sí.
+    for argumentos in (["bash", "-c", "echo hola"], ["C:\\Program Files\\Git\\bin\\bash.exe", "-lc", "x"],
+                       ["/bin/sh", "-c", "x"], ["zsh"], ["dash", "-c", "x"], ["pwsh", "-NoProfile"],
+                       ["pwsh.exe", "-c", "x"], ["systemd-run", "--user", "--scope", "x"],
+                       ["/usr/bin/systemctl", "--user", "show"], ["prlimit", "--as=1", "x"]):
+        with pytest.raises(pytest.fail.Exception):
+            subprocess.Popen(argumentos)
+
+    async def principal() -> None:
+        await asyncio.create_subprocess_exec("systemd-run", "--user", "--scope", "true")
+
+    with pytest.raises(pytest.fail.Exception, match="systemd-run"):
+        correr(principal())
+    resultado = subprocess.run([sys.executable, "-c", "print('ok')"], capture_output=True, text=True,
+                               timeout=60, check=False)
+    assert resultado.returncode == 0 and resultado.stdout.strip() == "ok"

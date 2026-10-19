@@ -1,0 +1,18 @@
+{
+  "name": "Amadeus Móvil · R.A.M.S. BIO-CORE",
+  "short_name": "Amadeus",
+  "description": "Videollamada Amadeus, Chat RINE y Visor 3D VRM (vtuber-ai) para Android",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#070b14",
+  "theme_color": "#070b14",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 96 96'><rect width='96' height='96' rx='20' fill='%23070b14' stroke='%235fa8ff' stroke-width='4'/><path d='M48 14 18 82h13l6.5-16h21L65 82h13L48 14Zm-6.5 44 6.5-17 6.5 17h-13Z' fill='%23ff8a1f'/></svg>",
+      "sizes": "192x192",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

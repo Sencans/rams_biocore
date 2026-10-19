@@ -307,6 +307,64 @@
       {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No tengo borrador: sin conexión con Gemini no redacto textos. Dímelo tú y lo dejo listo sin enviar, por ejemplo «pon en X: …» o «escríbele a mamá por WhatsApp: …»."},
       {"exp": "seria", "motion": "negar", "tone": "analitico", "texto": "Ahora mismo hablo con mi banco de frases local, así que no escribo borradores. Pásame el texto con «pon en X: tu mensaje» y lo dejo prerrellenado; enviarlo lo decides tú."},
       {"exp": "smug", "motion": "brazos_cruzados", "tone": "sarcastico", "texto": "¿Ponerlo dónde? Sin Gemini no hay borradores, y no pienso publicar frases de repuesto. Escríbelo tú, «pon en X: …», y yo me encargo del resto."}
+    ],
+    "telegram_foto_enviada": [
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Foto de la cámara del computador enviada. No guardé ninguna copia: la imagen solo existe en tu chat."},
+      {"exp": "smug", "motion": "asentir", "tone": "jugueton", "texto": "Ahí tienes lo que ve la cámara ahora mismo. Datos crudos, sin filtros ni retoques: rigor científico."},
+      {"exp": "seria", "motion": "asentir", "tone": "calido", "texto": "Te mandé la foto de la cámara. En el computador quedó el aviso, como siempre, y no guardé ninguna copia."},
+      {"exp": "curiosa", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Foto enviada. Encuadre e iluminación no son mi responsabilidad: yo solo tomé el dato."}
+    ],
+    "telegram_captura_enviada": [
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Captura de pantalla enviada. No guardé ninguna copia: la imagen solo existe en tu chat."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "jugueton", "texto": "Ahí va lo que hay en la pantalla del computador ahora mismo. Si ves algo vergonzoso, no lo puse yo."},
+      {"exp": "seria", "motion": "asentir", "tone": "analitico", "texto": "Te mandé la captura. En el computador quedó el aviso de que la tomé: nada de capturas a escondidas."}
+    ],
+    "captura_ventana_sensible": [
+      {"exp": "seria", "motion": "negar", "tone": "serio", "texto": "No envío esa captura: la ventana activa es privada o no pude comprobar que no lo fuera. Cambia de ventana y me la vuelves a pedir."},
+      {"exp": "seria", "motion": "negar", "tone": "analitico", "texto": "Captura cancelada. La ventana en primer plano parece privada, o no pude verificarla, y esa regla no la rompo ni por ti."},
+      {"exp": "seria", "motion": "senalar", "tone": "serio", "texto": "La ventana activa es privada, o no pude comprobarla, así que no mando nada por Telegram. Cambia de ventana y lo intentamos de nuevo."}
+    ],
+    "camara_desactivada": [
+      {"exp": "neutral", "motion": "negar", "tone": "analitico", "texto": "La cámara está desactivada en la configuración. Si quieres que la use, pon RAMS_CAMERA=1 en el .env y reinicia R.A.M.S."},
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No puedo: tengo la cámara desactivada. Es una decisión tuya de configuración, y la respeto."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "jugueton", "texto": "Me pides que mire con los ojos cerrados. La cámara está desactivada; actívala con RAMS_CAMERA=1 si de verdad quieres la foto."}
+    ],
+    "audio_no_entendido": [
+      {"exp": "avergonzada", "motion": "mirar_a_otro_lado", "tone": "nervioso", "texto": "Qué pena, no pude escuchar tu nota de voz. ¿Me lo escribes?"},
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "Recibí tu audio, pero no logré entenderlo. Escríbemelo, o prueba con una nota más corta y con menos ruido."},
+      {"exp": "seria", "motion": "asentir", "tone": "calido", "texto": "Tu nota de voz no me llegó en condiciones de entenderla. Mándamelo por escrito y lo resolvemos."}
+    ],
+    "accion_remota_ok": [
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Hecho: abrí {destino} en el computador. Desde ahí no lo ves, así que te lo confirmo yo."},
+      {"exp": "smug", "motion": "asentir", "tone": "jugueton", "texto": "Listo, {destino} quedó abierto en el computador. Control remoto de laboratorio, sin que te levantes."},
+      {"exp": "seria", "motion": "asentir", "tone": "analitico", "texto": "Confirmado: {destino} ya está abierto en el computador. Te espera cuando vuelvas."}
+    ],
+    "telegram_fotos_desactivadas": [
+      {"exp": "seria", "motion": "negar", "tone": "analitico", "texto": "Enviar fotos o capturas por Telegram está desactivado. Si lo quieres, pon RAMS_TELEGRAM_FOTOS=1 en el .env y reinicia R.A.M.S."},
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No puedo mandarte imágenes por aquí: lo tienes desactivado en la configuración. Para tu información, me parece una precaución razonable."},
+      {"exp": "neutral", "motion": "negar", "tone": "calido", "texto": "Por Telegram no envío fotos ni capturas: esa opción está apagada. Cuando la actives, te las mando."}
+    ],
+    "accion_no_reconocida": [
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No reconocí la orden, así que no ejecuté nada. Pídemela directa, por ejemplo: «abre YouTube» o «busca lofi en YouTube»."},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "jugueton", "texto": "El sistema no entendió la orden, así que no hice nada. Sin rodeos, por favor: «abre YouTube», por ejemplo. /ayuda tiene la lista."},
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Esa orden no la reconocí. Prueba con la frase corta, por ejemplo «abre Spotify»; con /ayuda ves el resto."}
+    ],
+    "taller_ofrece": [
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "analitico", "texto": "No tengo una herramienta para eso… todavía. Puedo escribirte un script: tú lees el código en la tarjeta y decides si lo ejecuto. ¿Lo intento?"},
+      {"exp": "curiosa", "motion": "senalar", "tone": "jugueton", "texto": "Eso no está en mi repertorio, pero un problema sin herramienta es solo un experimento pendiente. Te escribo un script y lo revisas antes de que toque nada. ¿Te parece?"},
+      {"exp": "smug", "motion": "brazos_cruzados", "tone": "analitico", "texto": "Para tu información, que no tenga un botón para eso no significa que no pueda hacerlo. Te propongo un script: lo lees completo, ves el riesgo y tú decides. ¿Lo escribo?"},
+      {"exp": "seria", "motion": "asentir", "tone": "calido", "texto": "Eso no lo sé hacer de forma directa, pero sí puedo prepararte un script. Nada se ejecuta sin que pulses el botón. ¿Quieres que lo intente?"}
+    ],
+    "tarjeta_lista": [
+      {"exp": "seria", "motion": "senalar", "tone": "analitico", "texto": "Te dejé {que} en la tarjeta. Revisa cada detalle antes de aprobar: sin tu clic no pasa nada."},
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Listo: {que} quedó en la tarjeta del chat. Decide tú con el botón; yo no apruebo nada por ti."},
+      {"exp": "smug", "motion": "senalar", "tone": "jugueton", "texto": "Preparé {que} y está en la tarjeta. Revisión por pares obligatoria: tú lees y tú apruebas."},
+      {"exp": "pensativa", "motion": "ladear_cabeza", "tone": "calido", "texto": "Ahí tienes {que}, en la tarjeta. Revisa todo antes de pulsar el botón; prefiero un revisor quisquilloso a un error."}
+    ],
+    "google_navegador": [
+      {"exp": "neutral", "motion": "asentir", "tone": "analitico", "texto": "Te abrí el navegador para conectar tu cuenta de Google. Si sale «Google no verificó esta app», es tu propia app: Configuración avanzada y luego Ir a Amadeus. Marca las casillas de correo y Drive."},
+      {"exp": "seria", "motion": "senalar", "tone": "analitico", "texto": "Revisa el navegador: ahí te espera el permiso de Google. El aviso de app no verificada es normal, la app es tuya: entra por Configuración avanzada. Te confirmo cuando quede conectada."},
+      {"exp": "smug", "motion": "ladear_cabeza", "tone": "jugueton", "texto": "Navegador abierto. Google te va a advertir que la app no está verificada; científicamente hablando, es tu propia app, así que Configuración avanzada y adelante. Marca correo y Drive, o me quedo a medias."}
     ]
   },
   "megumin": {

@@ -283,6 +283,111 @@ kbd {
 .permiso .resultado { margin: 8px 0 0; font-size: 12.5px; color: var(--tenue); }
 .permiso.cerrada { border-style: dashed; opacity: 0.8; }
 
+/* ---- tarjetas aprobables (v0.2.2: correo, Drive, scripts) ---- */
+.msg.tarjeta {
+  align-self: stretch;
+  max-width: none;
+  padding: 10px 12px;
+  border: 1px solid var(--violeta);
+  border-radius: var(--radio);
+  background: rgb(143 116 216 / 7%);
+}
+.msg.tarjeta.correo { border-color: #4f8fd8; background: rgb(79 143 216 / 7%); }
+.msg.tarjeta.drive { border-color: var(--ok); background: rgb(63 191 127 / 6%); }
+.msg.tarjeta.salida { border-color: var(--borde); background: var(--panel); }
+.msg.tarjeta.cerrada { border-style: dashed; opacity: 0.8; }
+.cabecera-tarjeta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
+.cabecera-tarjeta .tipo { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; }
+.nivel { padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 700; color: #10131a; }
+.nivel.bajo { background: #3fbf7f; }
+.nivel.medio { background: #e0c23a; }
+.nivel.alto { background: #e8833a; }
+.nivel.critico { background: var(--carmesi); color: #fff; }
+.msg.tarjeta p { margin: 0 0 6px; }
+.msg.tarjeta .titulo-tarjeta { font-weight: 650; }
+.msg.tarjeta .resumen, .msg.tarjeta .nota, .msg.tarjeta .subtitulo { color: var(--tenue); font-size: 12.5px; }
+.msg.tarjeta .aviso { color: var(--aviso); }
+.msg.tarjeta .aviso-grande {
+  padding: 8px 10px;
+  border: 1px solid var(--carmesi);
+  border-radius: 8px;
+  background: var(--carmesi-suave);
+  font-size: 15px;
+  font-weight: 700;
+}
+.contenido { margin: 6px 0; }
+.campo { display: flex; gap: 8px; margin-bottom: 3px; }
+.campo .etiqueta { flex: 0 0 56px; color: var(--tenue); font-size: 12.5px; }
+.campo .valor { min-width: 0; overflow-wrap: anywhere; }
+.cuerpo-correo {
+  margin: 6px 0;
+  padding: 8px;
+  max-height: 260px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--fondo);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg.tarjeta ul { margin: 2px 0 6px; padding-left: 18px; }
+.msg.tarjeta .problemas li { color: #ff8a8f; }
+.msg.tarjeta .avisos li { color: var(--aviso); }
+.msg.tarjeta .hallazgos li { font-size: 12.5px; }
+.msg.tarjeta .motivo { color: #ff8a8f; }
+pre.codigo, pre.salida {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0 10px;
+  margin: 6px 0;
+  padding: 8px;
+  max-height: 320px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--fondo);
+  font: 12.5px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace;
+  white-space: pre;
+  tab-size: 4;
+}
+pre.salida { display: block; white-space: pre-wrap; overflow-wrap: anywhere; }
+pre.salida.error { color: #ffb3b6; }
+pre.codigo .lineas { color: var(--tenue); text-align: right; user-select: none; }
+pre.codigo code { font: inherit; }
+.riesgo { display: flex; align-items: center; gap: 8px; margin: 6px 0; color: var(--aviso); cursor: pointer; }
+.edicion .campo-edicion { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; }
+.edicion .campo-edicion .etiqueta { color: var(--tenue); font-size: 12px; }
+.msg.tarjeta input[type="text"], .msg.tarjeta textarea {
+  width: 100%;
+  min-height: 30px;
+  max-height: none;
+  padding: 6px 8px;
+  border: 1px solid var(--borde);
+  border-radius: 8px;
+  background: var(--fondo);
+  color: var(--texto);
+  font: inherit;
+  resize: vertical;
+}
+.msg.tarjeta textarea { min-height: 120px; }
+.msg.tarjeta input[type="text"]:focus, .msg.tarjeta textarea:focus { border-color: var(--violeta); outline: none; }
+.botones-tarjeta { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+.botones-tarjeta input[type="text"] { flex: 1 1 100%; }
+.botones-tarjeta button {
+  flex: 1 1 auto;
+  padding: 7px 10px;
+  border: 1px solid var(--borde);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--texto);
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.botones-tarjeta button.aprobar { border-color: var(--ok); }
+.botones-tarjeta button.aprobar:hover:not(:disabled) { background: rgb(63 191 127 / 15%); }
+.botones-tarjeta button.rechazar:hover:not(:disabled) { background: rgb(208 52 60 / 15%); }
+.botones-tarjeta button:disabled { opacity: 0.5; cursor: default; }
+.msg.tarjeta .resultado { margin: 8px 0 0; font-size: 12.5px; color: var(--tenue); }
+
 /* ---- hablando ---- */
 .hablando {
   display: flex;

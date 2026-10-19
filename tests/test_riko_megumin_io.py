@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import array
 import asyncio
+import html
 import io
 import json
 import logging
 import math
+import re
 import subprocess
 import sys
 import threading
@@ -46,6 +48,8 @@ RAIZ = Path(__file__).resolve().parents[1]
 TOKEN = "123456789:TEST_token_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 CHAT = "42"
 MP3_FALSO = b"ID3\x04\x00\x00\x00\x00\x00\x00fake-mp3-amadeus"
+OGG_FALSO = b"OggS\x00\x02" + b"\x00" * 20 + b"fake-opus-nota-de-voz"
+JPEG_FALSO = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00" + b"\x00" * 64 + b"\xff\xd9"
 
 
 # ---------------------------------------------------------------------------
@@ -192,9 +196,17 @@ class Transporte:
         self.respuesta_mp3: httpx.Response = httpx.Response(200, content=MP3_FALSO,
                                                            headers={"content-type": "audio/mpeg"})
         self.respuesta_voces = httpx.Response(200, json={"voice_id": "p7sm2zw5Us66lZr2brDW"})
+        # Notas de voz entrantes: getFile y descarga de /file/bot<token>/<file_path>.
+        self.archivo: bytes = OGG_FALSO
+        self.respuesta_getfile: httpx.Response | None = None
+        self.ruta_archivo = "voice/file_7.oga"
 
     def __call__(self, peticion: httpx.Request) -> httpx.Response:
         self.peticiones.append(peticion)
+        if peticion.url.host == "api.telegram.org" and peticion.url.path.startswith("/file/"):
+            assert peticion.method == "GET"
+            assert peticion.url.path == f"/file/bot{TOKEN}/{self.ruta_archivo}"
+            return httpx.Response(200, content=self.archivo)
         if peticion.url.host == "api.telegram.org":
             return self._telegram(peticion)
         if peticion.url.host == "api.elevenlabs.io":
@@ -214,8 +226,14 @@ class Transporte:
             return httpx.Response(200, json={"ok": True, "result": []})
         if metodo == "getMe":
             return httpx.Response(200, json={"ok": True, "result": {"id": 1, "username": "rams_amadeus_bot"}})
-        if metodo in ("sendMessage", "sendVoice"):
+        if metodo in ("sendMessage", "sendVoice", "sendPhoto"):
             return httpx.Response(200, json={"ok": True, "result": {"message_id": len(self.peticiones)}})
+        if metodo == "getFile":
+            if self.respuesta_getfile is not None:
+                return self.respuesta_getfile
+            return httpx.Response(200, json={"ok": True, "result": {
+                "file_id": _json(peticion)["file_id"], "file_unique_id": "u1",
+                "file_size": len(self.archivo), "file_path": self.ruta_archivo}})
         return httpx.Response(200, json={"ok": True, "result": True})
 
     def _eleven(self, peticion: httpx.Request) -> httpx.Response:
@@ -2050,3 +2068,416 @@ def test_soundfile_valido_reinicia_los_fallos(tmp_path: Path, monkeypatch: pytes
 
     asyncio.run(escenario())
     assert reproductor.datos
+
+
+# ---------------------------------------------------------------------------
+# Multimedia de Telegram (grupo telegram, v0.2.1): fotos, notas de voz de ida y vuelta
+# ---------------------------------------------------------------------------
+
+
+def test_enviar_foto_telegram_multipart_y_evento(tmp_path: Path) -> None:
+    transporte = Transporte()
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte, bus=bus)
+
+    async def escenario() -> tuple[bool, bool, bool]:
+        enviada = await riko.enviar_foto_telegram(JPEG_FALSO, leyenda="Tu escritorio <ahora> & así")
+        vacia = await riko.enviar_foto_telegram(b"")
+        enorme = await riko.enviar_foto_telegram(b"\xff\xd8" + b"\x00" * (riko_mod.LIMITE_FOTO_BYTES + 1))
+        await riko.cerrar()
+        return enviada, vacia, enorme
+
+    assert asyncio.run(escenario()) == (True, False, False)
+    fotos = transporte.telegram("sendPhoto")
+    assert len(fotos) == 1
+    foto = fotos[0]
+    assert foto.headers["content-type"].startswith("multipart/form-data")
+    assert b'name="photo"; filename="amadeus.jpg"' in foto.content
+    assert b"image/jpeg" in foto.content and JPEG_FALSO in foto.content
+    assert b'name="chat_id"\r\n\r\n42' in foto.content
+    assert "Tu escritorio &lt;ahora&gt; &amp; así".encode("utf-8") in foto.content
+    assert b'name="parse_mode"\r\n\r\nHTML' in foto.content
+    acciones = [_json(p)["action"] for p in transporte.telegram("sendChatAction")]
+    assert acciones == ["upload_photo"]
+    assert [e.datos for e in eventos if e.nombre == "telegram.enviado"] == [
+        {"tipo": "foto", "nivel": 0, "texto": "Tu escritorio <ahora> & así"}]
+    assert "sendPhoto" in riko_mod.METODOS_ENVIO          # mismo ritmo mínimo que sendMessage
+
+
+def test_enviar_foto_sin_telegram_no_sale_nada(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_offline(tmp_path), transporte)
+    assert asyncio.run(riko.enviar_foto_telegram(JPEG_FALSO)) is False
+    assert transporte.peticiones == []
+
+
+def test_enviar_foto_token_rechazado_desactiva_telegram(tmp_path: Path) -> None:
+    class Rechazo(Transporte):
+        def _telegram(self, peticion: httpx.Request) -> httpx.Response:
+            if peticion.url.path.endswith("/sendPhoto"):
+                return httpx.Response(401, json={"ok": False, "error_code": 401, "description": "Unauthorized"})
+            return super()._telegram(peticion)
+
+    transporte = Rechazo()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+
+    async def escenario() -> tuple[bool, bool]:
+        primera = await riko.enviar_foto_telegram(JPEG_FALSO)
+        segunda = await riko.enviar_foto_telegram(JPEG_FALSO)
+        return primera, segunda
+
+    assert asyncio.run(escenario()) == (False, False)
+    assert len(transporte.telegram("sendPhoto")) == 1      # tras el 401 Telegram queda desactivado
+
+
+def test_enviar_voz_telegram_elevenlabs_con_transcripcion(tmp_path: Path) -> None:
+    transporte = Transporte()
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte, bus=bus)
+    texto = "[EXP:feliz][MOTION:asentir][TONE:calido] Claro, ya abrí YouTube en el PC. ¿Algo más?"
+
+    async def escenario() -> tuple[bool, bool]:
+        con = await riko.enviar_voz_telegram(texto, tone="calido")
+        sin = await riko.enviar_voz_telegram("Solo la voz, sin leyenda.", transcripcion=False)
+        await riko.cerrar()
+        return con, sin
+
+    assert asyncio.run(escenario()) == (True, True)
+    sintesis = transporte.eleven()
+    assert sintesis and all(p.url.params["output_format"] == "mp3_44100_64" for p in sintesis)
+    assert "[EXP" not in _json(sintesis[0])["text"] and "YouTube" in _json(sintesis[0])["text"]
+    voces = transporte.telegram("sendVoice")
+    assert len(voces) == 2
+    assert b'name="voice"; filename="amadeus.mp3"' in voces[0].content and MP3_FALSO in voces[0].content
+    assert "Claro, ya abrí YouTube en el PC. ¿Algo más?".encode("utf-8") in voces[0].content
+    assert b'name="caption"' not in voces[1].content
+    enviados = [e.datos for e in eventos if e.nombre == "telegram.enviado"]
+    assert [d["tipo"] for d in enviados] == ["audio", "audio"]
+    assert enviados[0]["texto"] == "Claro, ya abrí YouTube en el PC. ¿Algo más?"
+
+
+def test_enviar_voz_telegram_sin_motor_devuelve_false(tmp_path: Path) -> None:
+    transporte = Transporte()
+    transporte.respuesta_mp3 = httpx.Response(500, json={"detail": {"code": "internal_error"}})
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)        # edge-tts anulado por la fixture
+
+    async def escenario() -> tuple[bool, bool]:
+        return await riko.enviar_voz_telegram("Hola."), await riko.enviar_voz_telegram("   ")
+
+    assert asyncio.run(escenario()) == (False, False)
+    assert transporte.telegram("sendVoice") == []
+
+
+def _leyenda_voz(peticion: httpx.Request) -> str | None:
+    """``caption`` del multipart de un ``sendVoice`` (``None`` si no lleva)."""
+    cuerpo = peticion.content.decode("utf-8", "replace")
+    encontrada = re.search(r'name="caption"\r\n\r\n(.*?)\r\n--', cuerpo, re.S)
+    return encontrada.group(1) if encontrada else None
+
+
+def test_enviar_voz_telegram_acota_el_texto_largo_sin_perder_la_respuesta(tmp_path: Path) -> None:
+    transporte = Transporte()
+    bus, eventos = _bus_con_eventos()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte, bus=bus)
+    largo = " ".join(f"Esta es la oración número {i} de una respuesta muy larga." for i in range(80))
+    assert len(largo) > riko_mod.LIMITE_TEXTO_VOZ
+
+    async def escenario() -> bool:
+        ok = await riko.enviar_voz_telegram(largo)
+        await riko.cerrar()
+        return ok
+
+    assert asyncio.run(escenario()) is True
+    enviado = _json(transporte.eleven()[0])["text"]
+    assert len(enviado) <= riko_mod.LIMITE_TEXTO_VOZ + 20      # + el tag de audio del tono
+    assert enviado.rstrip().endswith(".")                       # cortado en un fin de oración
+    voces = transporte.telegram("sendVoice")
+    assert len(voces) == 1 and _leyenda_voz(voces[0]) is None   # la nota va sin leyenda recortada…
+    textos = [html.unescape(_json(p)["text"]) for p in transporte.telegram("sendMessage")]
+    assert len(textos) == 2 and "".join(textos) == largo        # …y la respuesta completa llega aparte
+    orden = [p.url.path.rsplit("/", 1)[-1] for p in transporte.peticiones if p.url.host == "api.telegram.org"]
+    assert orden.index("sendVoice") < orden.index("sendMessage")
+    assert [e.datos["tipo"] for e in eventos if e.nombre == "telegram.enviado"] == ["audio", "respuesta"]
+
+
+def test_enviar_voz_telegram_leyenda_larga_va_como_mensaje(tmp_path: Path) -> None:
+    """Texto que cabe en la voz (≤ 1500) pero no en la leyenda (> 1000): nota sin leyenda + texto."""
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    medio = " ".join(f"Frase {i} de la respuesta." for i in range(48))
+    assert riko_mod.LIMITE_LEYENDA < len(medio) <= riko_mod.LIMITE_TEXTO_VOZ
+    assert asyncio.run(riko.enviar_voz_telegram(medio)) is True
+    assert _leyenda_voz(transporte.telegram("sendVoice")[0]) is None
+    assert [html.unescape(_json(p)["text"]) for p in transporte.telegram("sendMessage")] == [medio]
+    # Con transcripcion=False quien llama ya manda el texto: aquí solo va la voz.
+    transporte_sin = Transporte()
+    riko_sin, _ = _crear(_settings_claves(tmp_path), transporte_sin)
+    assert asyncio.run(riko_sin.enviar_voz_telegram(medio, transcripcion=False)) is True
+    assert transporte_sin.telegram("sendMessage") == []
+
+
+class TransporteSinMensajes(Transporte):
+    """Telegram acepta notas de voz pero rechaza los ``sendMessage`` (400)."""
+
+    def _telegram(self, peticion: httpx.Request) -> httpx.Response:
+        if peticion.url.path.endswith("/sendMessage"):
+            return httpx.Response(400, json={"ok": False, "error_code": 400, "description": "Bad Request"})
+        return super()._telegram(peticion)
+
+
+def test_enviar_voz_telegram_larga_sin_texto_devuelve_false(tmp_path: Path) -> None:
+    """Si la nota sale pero el texto completo no, devuelve False: main reintenta con el texto."""
+    transporte = TransporteSinMensajes()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    largo = " ".join(f"Esta es la oración número {i} de una respuesta muy larga." for i in range(80))
+    assert asyncio.run(riko.enviar_voz_telegram(largo)) is False
+    assert len(transporte.telegram("sendVoice")) == 1 and transporte.telegram("sendMessage")
+
+
+def _voz(uid: int, *, chat_id: int = 42, from_id: int = 42, duracion: int = 4, tam: int | None = 900,
+         tipo: str = "voice", mime: str | None = "audio/ogg") -> dict[str, Any]:
+    datos: dict[str, Any] = {"file_id": f"AwACAg{uid}", "file_unique_id": f"u{uid}", "duration": duracion}
+    if tam is not None:
+        datos["file_size"] = tam
+    if mime is not None:
+        datos["mime_type"] = mime
+    return {"update_id": uid, "message": {"message_id": uid, "chat": {"id": chat_id, "type": "private"},
+                                          "from": {"id": from_id, "is_bot": False}, tipo: datos}}
+
+
+def _escuchar(riko: RikoMeguminIO, transporte: Transporte, lote: list[dict[str, Any]],
+              manejador: Callable[..., Any]) -> None:
+    async def escenario() -> None:
+        parar = asyncio.Event()
+        transporte.lotes_updates = [[], lote]
+        transporte.al_agotar_updates = parar.set
+        await asyncio.wait_for(riko.bucle_telegram_entrada(parar, manejador), 5.0)
+        await riko.cerrar()
+
+    asyncio.run(escenario())
+
+
+def _textos_enviados(transporte: Transporte) -> list[str]:
+    return [_json(p)["text"] for p in transporte.telegram("sendMessage")]
+
+
+def test_nota_de_voz_se_transcribe_y_llega_con_voz_true(tmp_path: Path,
+                                                         caplog: pytest.LogCaptureFixture) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    transcritos: list[tuple[bytes, str]] = []
+    recibidos: list[tuple[str, bool]] = []
+
+    async def transcriptor(audio: bytes, mime: str) -> str | None:
+        transcritos.append((audio, mime))
+        return "  abre youtube en el pc porfa  " if mime == "audio/ogg" else "¿qué hora es?"
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        recibidos.append((texto, voz))
+
+    riko.set_transcriptor(transcriptor)
+    caplog.set_level(logging.DEBUG)
+    _escuchar(riko, transporte, [
+        _voz(201),
+        _voz(202, tipo="audio", mime="audio/mpeg; codecs=mp3"),
+        {"update_id": 203, "message": {"message_id": 203, "chat": {"id": 42, "type": "private"},
+                                       "from": {"id": 42}, "text": "y esto es texto"}},
+    ], manejar)
+    assert recibidos == [("abre youtube en el pc porfa", True), ("¿qué hora es?", True),
+                         ("y esto es texto", False)]
+    assert transcritos == [(OGG_FALSO, "audio/ogg"), (OGG_FALSO, "audio/mpeg")]
+    getfile = [_json(p) for p in transporte.telegram("getFile")]
+    assert getfile == [{"file_id": "AwACAg201"}, {"file_id": "AwACAg202"}]
+    assert _textos_enviados(transporte) == []
+    # httpx registra su URL, pero main lo silencia (_LOGGERS_SILENCIADOS) y filtra secretos: aquí
+    # se comprueba lo que escribe este módulo, que nunca lleva el token ni lo transcrito.
+    propios = [r for r in caplog.records if r.name.startswith("rams")]
+    assert propios
+    assert all(TOKEN not in r.getMessage() for r in propios)
+    assert all("youtube" not in r.getMessage().lower() for r in propios)   # el contenido no va al log
+
+
+def test_nota_de_voz_con_manejador_antiguo_recibe_solo_el_texto(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    recibidos: list[str] = []
+
+    async def transcriptor(audio: bytes, mime: str) -> str:
+        return "hola desde una nota de voz"
+
+    async def manejador_antiguo(texto: str) -> None:
+        recibidos.append(texto)
+
+    riko.set_transcriptor(transcriptor)
+    _escuchar(riko, transporte, [_voz(301)], manejador_antiguo)
+    assert recibidos == ["hola desde una nota de voz"]
+
+
+def test_nota_de_voz_sin_transcriptor_responde_por_texto(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    riko.set_transcriptor(None)
+    riko.set_transcriptor("no es una función")   # type: ignore[arg-type]  # se ignora
+    _escuchar(riko, transporte, [_voz(401)], manejar)
+    assert transporte.telegram("getFile") == []
+    assert _textos_enviados(transporte) == [riko_mod.MENSAJE_AUDIO_SIN_TRANSCRIPTOR]
+
+
+def test_nota_de_voz_larga_o_pesada_no_se_descarga(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    llamadas: list[int] = []
+
+    async def transcriptor(audio: bytes, mime: str) -> str:
+        llamadas.append(len(audio))
+        return "no debería llegar"
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    riko.set_transcriptor(transcriptor)
+    _escuchar(riko, transporte, [_voz(501, duracion=181), _voz(502, tam=3 * 1024 * 1024)], manejar)
+    assert transporte.telegram("getFile") == [] and llamadas == []
+    assert _textos_enviados(transporte) == [riko_mod.MENSAJE_AUDIO_LARGO] * 2
+
+
+def test_descarga_que_supera_el_limite_se_corta(tmp_path: Path) -> None:
+    transporte = Transporte()
+    transporte.archivo = b"OggS" + b"\x01" * (riko_mod.LIMITE_AUDIO_ENTRANTE_BYTES + 10)
+    transporte.respuesta_getfile = httpx.Response(200, json={"ok": True, "result": {
+        "file_id": "x", "file_unique_id": "u", "file_path": transporte.ruta_archivo}})   # sin file_size
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    llamadas: list[int] = []
+
+    async def transcriptor(audio: bytes, mime: str) -> str:
+        llamadas.append(len(audio))
+        return "nunca"
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    riko.set_transcriptor(transcriptor)
+    _escuchar(riko, transporte, [_voz(601, tam=None)], manejar)
+    assert llamadas == []
+    assert _textos_enviados(transporte) == [riko_mod.MENSAJE_AUDIO_LARGO]
+
+
+def test_nota_de_voz_que_no_se_entiende_o_ruta_rara(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    respuestas: list[Any] = [None, "   ", RuntimeError("Gemini caído")]
+
+    async def transcriptor(audio: bytes, mime: str) -> str | None:
+        valor = respuestas.pop(0)
+        if isinstance(valor, Exception):
+            raise valor
+        return valor
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    riko.set_transcriptor(transcriptor)
+    _escuchar(riko, transporte, [_voz(701), _voz(702), _voz(703)], manejar)
+    assert _textos_enviados(transporte) == [riko_mod.MENSAJE_AUDIO_FALLIDO] * 3
+
+    transporte2 = Transporte()
+    transporte2.respuesta_getfile = httpx.Response(200, json={"ok": True, "result": {
+        "file_id": "x", "file_unique_id": "u", "file_size": 10, "file_path": "../../etc/passwd"}})
+    riko2, _ = _crear(_settings_claves(tmp_path), transporte2)
+    riko2.set_transcriptor(transcriptor)
+    _escuchar(riko2, transporte2, [_voz(704)], manejar)
+    assert not any(p.url.path.startswith("/file/") for p in transporte2.peticiones)
+    assert _textos_enviados(transporte2) == [riko_mod.MENSAJE_AUDIO_FALLIDO]
+
+
+def test_nota_de_voz_de_otro_remitente_se_ignora(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+
+    async def transcriptor(audio: bytes, mime: str) -> str:
+        raise AssertionError("no debe transcribirse")
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    riko.set_transcriptor(transcriptor)
+    _escuchar(riko, transporte, [_voz(801, chat_id=999, from_id=999), _voz(802, from_id=7)], manejar)
+    assert transporte.telegram("getFile") == [] and _textos_enviados(transporte) == []
+
+
+def test_transcripcion_lenta_no_retrasa_el_apagado(tmp_path: Path) -> None:
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+    cancelada: list[bool] = []
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    async def escenario() -> float:
+        empezo = asyncio.Event()
+
+        async def transcriptor(audio: bytes, mime: str) -> str:
+            empezo.set()
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelada.append(True)
+                raise
+            return "tarde"
+
+        riko.set_transcriptor(transcriptor)
+        parar = asyncio.Event()
+        transporte.lotes_updates = [[], [_voz(901)]]
+        tarea = asyncio.create_task(riko.bucle_telegram_entrada(parar, manejar))
+        await asyncio.wait_for(empezo.wait(), 3.0)
+        inicio = time.monotonic()
+        parar.set()
+        await asyncio.wait_for(tarea, 3.0)
+        return time.monotonic() - inicio
+
+    assert asyncio.run(escenario()) < 2.5
+    assert cancelada == [True]
+
+
+def test_transcripcion_que_no_termina_responde_por_texto(tmp_path: Path,
+                                                         monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(riko_mod, "TIMEOUT_TRANSCRIPCION_S", 0.05)
+    transporte = Transporte()
+    riko, _ = _crear(_settings_claves(tmp_path), transporte)
+
+    async def transcriptor(audio: bytes, mime: str) -> str:
+        await asyncio.sleep(5)
+        return "tarde"
+
+    async def manejar(texto: str, *, voz: bool = False) -> None:
+        raise AssertionError("no debe llamarse")
+
+    riko.set_transcriptor(transcriptor)
+    _escuchar(riko, transporte, [_voz(951)], manejar)
+    assert _textos_enviados(transporte) == [riko_mod.MENSAJE_AUDIO_FALLIDO]
+
+
+def test_utilidades_de_audio() -> None:
+    assert riko_mod._mime_audio("AUDIO/OGG; codecs=opus", "voice") == "audio/ogg"
+    assert riko_mod._mime_audio("text/html", "voice") == "audio/ogg"
+    assert riko_mod._mime_audio(None, "audio") == "audio/mpeg"
+    assert riko_mod._entero_no_negativo(True) is None and riko_mod._entero_no_negativo(-1) is None
+    assert riko_mod._entero_no_negativo(12) == 12
+    assert riko_mod._texto_para_voz("corto.") == "corto."
+
+    async def nuevo(texto: str, *, voz: bool = False) -> None:
+        return None
+
+    async def viejo(texto: str) -> None:
+        return None
+
+    async def libre(texto: str, **kw: Any) -> None:
+        return None
+
+    assert riko_mod._acepta_voz(nuevo) is True
+    assert riko_mod._acepta_voz(viejo) is False
+    assert riko_mod._acepta_voz(libre) is True

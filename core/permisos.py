@@ -23,6 +23,32 @@ Reglas de seguridad que aplica:
 - La ``descripcion`` de una solicitud **nunca** lleva el texto que se va a escribir: el texto
   viaja aparte como ``vista_previa`` en ``permiso.solicitado`` (lo muestra el chat de escritorio
   y la consola local; ningún ``log`` lo registra).
+- v0.2.1 (órdenes desde Telegram, apps del menú Inicio y fotos):
+  * El origen ``telegram`` sigue denegado siempre. Lo que el USUARIO pide por Telegram llega
+    con ``origen="usuario"`` y ``args["canal"] = "telegram"``; desde ese canal solo valen, y solo
+    con ``RAMS_TELEGRAM_ACCIONES=1``, ``abrir_destino``, ``buscar_en``, ``media``, ``lanzar_app``
+    de apps YA permitidas y ``enviar_foto``. Por Telegram nada pide confirmación: lo que la
+    necesitaría se deniega (nadie en el PC debe aprobar lo que pidió otro).
+  * ``lanzar_app`` con ``args["local"] is True`` (app del menú Inicio): el nivel lo da el índice
+    de ``ControlPC`` (callback ``nivel_app``): ``permitida`` → sin preguntar; ``descubierta`` →
+    confirmar (main recuerda la aprobación); ``sensible`` (consolas y herramientas del sistema) →
+    confirmar cada vez; desconocida → denegada.
+  * ``enviar_foto`` (``fuente`` cámara o pantalla, a Telegram del usuario): solo ``origen``
+    usuario (nunca iniciativa ni LLM), por terminal, escritorio o Telegram (este último con
+    ``RAMS_TELEGRAM_FOTOS=1``), como mucho 10 por hora.
+- v0.2.2 (``docs/V022_CORREO_DRIVE_SCRIPTS.md`` §5): tipos extra de Google, correo, Drive y taller.
+  * ``conectar_google``, ``drive_descargar`` y ``drive_crear_carpeta``: solo el usuario en un canal
+    local y con ``tiene_google``. ``desconectar_google``: confirmación clásica (60 s).
+  * **Tarjetas aprobables** (``TIPOS_ACCION_TARJETA``: ``enviar_correo``, ``drive_subir``,
+    ``drive_papelera``, ``drive_compartir``, ``ejecutar_script``): solo con el botón de SU tarjeta en el
+    canal ``escritorio`` (``args.aprobacion == "tarjeta"``), con la tarjeta vigente, del mismo tipo y con
+    la MISMA huella (``hmac.compare_digest``). La compuerta guarda el registro de tarjetas (una por
+    clase, en memoria) y ``autorizar`` consume la tarjeta dentro del lock: un doble clic no ejecuta dos
+    veces. ``enviar_correo`` además reserva su envío en las ventanas de tasa (10 min y 24 h); main
+    devuelve la reserva con :meth:`liberar_envio_correo` si nada pudo salir.
+  * Compartir en público exige doble confirmación (≤ 120 s entre clics) y nunca con edición; un
+    script de riesgo crítico nunca se ejecuta. La ``descripcion`` de estas acciones nunca lleva
+    contenido (cuerpo, direcciones, nombres de archivo ni código).
 
 Dependencias opcionales: ``psutil`` (para calcular los procesos propios: el propio PID y sus
 ancestros). Degradación: sin psutil, solo ``os.getpid()``; sin bus no publica eventos; sin
@@ -35,6 +61,7 @@ sin sarcasmo, pero eso lo verbalizan main y Broca.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hmac
 import logging
 import math
@@ -45,6 +72,7 @@ import threading
 import time
 import unicodedata
 import uuid
+from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Final
@@ -77,6 +105,25 @@ except ImportError:  # sin la función compartida: lo prudente es tratar todo te
     def parece_secreto(texto: Any, secretos: Any = ()) -> bool:  # type: ignore[misc]
         return True
 
+try:  # v0.2.2 (grupo base): catálogos de Drive, tarjetas y taller
+    from core.contracts import (
+        DESTINOS_DESCARGA,
+        FORMATOS_DRIVE,
+        HUELLA_RE,
+        ID_TARJETA_RE,
+        NIVELES_EJECUTABLES,
+        ROLES_DRIVE,
+        TTL_DOBLE_CONFIRMACION_S,
+    )
+except ImportError:  # contratos v0.2.1: los valores de la spec (§3.1)
+    DESTINOS_DESCARGA = ("descargas", "documentos", "escritorio")  # type: ignore[misc]
+    FORMATOS_DRIVE = ("pdf", "texto", "original")  # type: ignore[misc]
+    ROLES_DRIVE = ("reader", "commenter", "writer")  # type: ignore[misc]
+    NIVELES_EJECUTABLES = frozenset({"bajo", "medio", "alto"})  # type: ignore[misc]
+    TTL_DOBLE_CONFIRMACION_S = 120.0  # type: ignore[misc]
+    ID_TARJETA_RE = re.compile(r"^[0-9a-f]{8}$")  # type: ignore[misc]
+    HUELLA_RE = re.compile(r"^[0-9a-f]{64}$")  # type: ignore[misc]
+
 __all__ = [
     "CLASE_SEGURA_RE",
     "DIRECCION_RE",
@@ -89,7 +136,19 @@ __all__ = [
     "MAX_TEXTO_ACCION",
     "MAX_CONSULTA_ACCION",
     "MAX_SEGUNDOS_TRAVESURA",
+    "TIPOS_ACCION_EXTRA",
+    "ACCIONES_POR_TELEGRAM",
+    "FUENTES_FOTO",
+    "MAX_FOTOS_HORA",
+    "NIVELES_APP",
+    "SAFE_CLAVE_APP_RE",
+    "TIPOS_ACCION_TARJETA",
+    "CLASE_DE_ACCION",
+    "VENTANA_CORREO_CORTA_S",
+    "VENTANA_CORREO_DIA_S",
+    "CANALES_ACCION",
     "SolicitudPermiso",
+    "TarjetaAprobable",
     "calcular_pids_propios",
     "nombre_destino",
     "sanear_texto_accion",
@@ -119,6 +178,42 @@ MAX_TEXTO_ACCION: Final = 500           # prerrellenar / escribir_texto (§C2.12
 MAX_CONSULTA_ACCION: Final = 120        # buscar_en
 MAX_SEGUNDOS_TRAVESURA: Final = 0.6
 ORIGENES_TRAVESURA: Final = frozenset({"usuario", "iniciativa"})
+
+# v0.2.1: tipos que aún no están en contracts.TIPOS_ACCION (los evalúa solo esta compuerta).
+# v0.2.2 (§5.1): Google, correo, Drive y taller. TIPOS_ACCION (13) no cambia.
+TIPOS_ACCION_EXTRA: Final = frozenset({
+    "enviar_foto",
+    "conectar_google", "desconectar_google",
+    "enviar_correo",
+    "drive_descargar", "drive_crear_carpeta", "drive_subir", "drive_papelera", "drive_compartir",
+    "ejecutar_script",
+})
+# Acciones que solo se aprueban con el botón de su tarjeta (§5.3) y la clase de tarjeta de cada una.
+TIPOS_ACCION_TARJETA: Final = frozenset({"enviar_correo", "drive_subir", "drive_papelera", "drive_compartir",
+                                         "ejecutar_script"})
+CLASE_DE_ACCION: Final[Mapping[str, str]] = {"enviar_correo": "correo", "drive_subir": "drive",
+                                             "drive_papelera": "drive", "drive_compartir": "drive",
+                                             "ejecutar_script": "script"}
+VENTANA_CORREO_CORTA_S: Final = 600.0
+VENTANA_CORREO_DIA_S: Final = 86400.0
+MAX_TTL_TARJETA_S: Final = 86400.0
+MAX_IDS_RETIRADAS: Final = 32
+CANALES_ORIGEN_TARJETA: Final = frozenset({"terminal", "escritorio", "telegram"})
+_CANALES_LOCALES_ACCION: Final = frozenset({"terminal", "escritorio"})
+_TIPOS_GOOGLE_LOCALES: Final = frozenset({"conectar_google", "desconectar_google", "drive_descargar",
+                                          "drive_crear_carpeta"})
+_RE_NOMBRE_CARPETA_PROHIBIDO: Final = re.compile(r"[/\\\x00-\x1f\x7f]")
+DESCRIPCION_DESCONECTAR_GOOGLE: Final = "Desconectar tu cuenta de Google (revoca el permiso de Gmail y Drive)"
+# Lo único que se puede pedir por Telegram (con RAMS_TELEGRAM_ACCIONES=1; las fotos además con
+# RAMS_TELEGRAM_FOTOS=1). Mismo conjunto que core.intenciones.ACCIONES_TELEGRAM + enviar_foto.
+ACCIONES_POR_TELEGRAM: Final = frozenset({"abrir_destino", "buscar_en", "lanzar_app", "media", "enviar_foto"})
+CANALES_ACCION: Final = frozenset({"terminal", "escritorio", "telegram"})
+FUENTES_FOTO: Final = frozenset({"camara", "pantalla"})
+MAX_FOTOS_HORA: Final = 10
+VENTANA_FOTOS_S: Final = 3600.0
+# Apps del menú Inicio (clave del índice de ControlPC) y sus niveles.
+SAFE_CLAVE_APP_RE: Final = re.compile(r"^[a-z0-9_]{1,40}$")
+NIVELES_APP: Final = ("permitida", "descubierta", "sensible")
 
 # Nombre legible de cada clave de DESTINOS_BASE (para descripciones y frases; nunca para abrir).
 NOMBRES_DESTINO: Final[Mapping[str, str]] = {
@@ -255,6 +350,22 @@ class SolicitudPermiso:
     creada_ts: float
 
 
+@dataclass(frozen=True)
+class TarjetaAprobable:
+    """Tarjeta aprobable registrada en la compuerta (v0.2.2, §5.4). Solo metadatos: nunca el contenido."""
+
+    id: str                  # ^[0-9a-f]{8}$ (lo genera el módulo dueño del contenido)
+    clase: str               # CLASE_DE_ACCION[tipo_accion]
+    tipo_accion: str         # ∈ TIPOS_ACCION_TARJETA
+    huella: str              # ^[0-9a-f]{64}$
+    version: int             # 1, 2, … (sube con cada edición o reapertura)
+    creada: float            # reloj() (monotónico inyectable)
+    caduca: float            # reloj() + ttl_s
+    canal_origen: str        # "terminal" | "escritorio" | "telegram"
+    doble: bool = False      # compartir en público: exige dos clics
+    doble_ok_hasta: float | None = None   # 1.er clic dado: vale hasta este reloj()
+
+
 class CompuertaPermisos:
     """Compuerta única de permisos para el control del PC (§9.1 y §C2.11).
 
@@ -265,15 +376,23 @@ class CompuertaPermisos:
     v0.2: ``pids_extra`` devuelve los PIDs de Amadeus Desktop (y descendientes) que tampoco
     son un objetivo válido de ``escribir_texto``; ``travesuras_activas`` es el estado efectivo
     de las travesuras que lleva main (§C2.14.4). Por defecto: ``frozenset()`` y ``False``.
+
+    v0.2.1: ``nivel_app(clave) -> (nivel, nombre) | None`` es el índice de apps del menú Inicio
+    de ``ControlPC`` (sin él, toda app local se deniega); ``reloj`` mide el tope de fotos por hora.
     """
 
     def __init__(self, settings: Settings, bus: BusEventos | None = None, *,
                  preguntar: Callable[[str], None] | None = None, timeout_s: float = 60.0,
                  pids_propios: frozenset[int] | None = None,
                  pids_extra: Callable[[], frozenset[int]] | None = None,
-                 travesuras_activas: Callable[[], bool] | None = None) -> None:
+                 travesuras_activas: Callable[[], bool] | None = None,
+                 nivel_app: Callable[[str], tuple[str, str] | None] | None = None,
+                 reloj: Callable[[], float] = time.monotonic) -> None:
         self.settings = settings
         self.bus = bus
+        self._nivel_app: Callable[[str], tuple[str, str] | None] | None = nivel_app
+        self._reloj: Callable[[], float] = reloj
+        self._fotos: deque[float] = deque()
         self._preguntar: Callable[[str], None] | None = preguntar
         try:
             self.timeout_s = max(0.0, float(timeout_s))
@@ -286,9 +405,15 @@ class CompuertaPermisos:
             self.pids_propios = frozenset(int(p) for p in pids_propios)
         self._pids_extra: Callable[[], frozenset[int]] | None = pids_extra
         self._travesuras_activas: Callable[[], bool] | None = travesuras_activas
-        self._lock = threading.Lock()
+        # Reentrante (v0.2.2): ``autorizar`` evalúa y consume una tarjeta dentro del MISMO lock, y la
+        # evaluación vuelve a leer el registro (y las ventanas de tasa) con él.
+        self._lock = threading.RLock()
         self._pendiente: SolicitudPermiso | None = None
         self._futuro: asyncio.Future[tuple[bool, str]] | None = None
+        # v0.2.2 (§5.4): registro de tarjetas aprobables (solo en memoria) y reservas de envío de correo.
+        self._tarjetas: dict[str, TarjetaAprobable] = {}
+        self._versiones_retiradas: dict[str, int] = {}      # id → última version (≤ 32, orden de inserción)
+        self._correos: deque[tuple[float, str]] = deque()   # (reloj(), id de la tarjeta)
 
     # ------------------------------------------------------------------
     # Estado inyectado (v0.2)
@@ -316,6 +441,196 @@ class CompuertaPermisos:
         except Exception as exc:  # ante la duda, sin travesuras
             log.debug("travesuras_activas no disponible (%s)", type(exc).__name__)
             return False
+
+    def nivel_app(self, clave: str) -> tuple[str, str] | None:
+        """``(nivel, nombre)`` de una app del menú Inicio según ControlPC, o ``None``.
+
+        Un callback ausente, roto o que devuelve algo mal formado cuenta como "no la conozco"
+        (se deniega): nunca abre la compuerta.
+        """
+        fuente = self._nivel_app
+        if fuente is None:
+            return None
+        try:
+            valor = fuente(clave)
+        except Exception as exc:
+            log.debug("nivel_app no disponible (%s)", type(exc).__name__)
+            return None
+        if (isinstance(valor, tuple) and len(valor) == 2 and valor[0] in NIVELES_APP
+                and isinstance(valor[1], str)):
+            return str(valor[0]), _texto_corto(valor[1], 60) or clave
+        return None
+
+    def set_nivel_app(self, nivel_app: Callable[[str], tuple[str, str] | None] | None) -> None:
+        """Cambia el índice de apps locales (``ControlPC.nivel_app_local``)."""
+        self._nivel_app = nivel_app
+
+    def fotos_ultima_hora(self) -> int:
+        """Fotos autorizadas en la última hora (ventana deslizante con ``reloj``)."""
+        ahora = self._reloj()
+        with self._lock:
+            while self._fotos and ahora - self._fotos[0] >= VENTANA_FOTOS_S:
+                self._fotos.popleft()
+            return len(self._fotos)
+
+    def _anotar_foto(self) -> None:
+        with self._lock:
+            self._fotos.append(self._reloj())
+
+    # ------------------------------------------------------------------
+    # v0.2.2: registro de tarjetas aprobables (§5.4)
+    # ------------------------------------------------------------------
+
+    def reloj(self) -> float:
+        """El reloj de la compuerta (monotónico, inyectable): main lo usa para traducir ``caduca`` a
+        ``time.time()`` en la tarjeta (``caduca_ts``)."""
+        return self._reloj()
+
+    def registrar_tarjeta(self, id: str, *, tipo_accion: str, huella: str, ttl_s: float,  # noqa: A002
+                          canal_origen: str, doble: bool = False
+                          ) -> tuple[TarjetaAprobable | None, TarjetaAprobable | None]:
+        """``(nueva, reemplazada)``. Valida los formatos (``(None, None)`` si algo no cumple).
+
+        Hay una tarjeta por clase: una nueva reemplaza a la de su clase (que se devuelve para que main
+        la cierre como ``reemplazado``). Con una id ya vista (vigente o retirada: reapertura tras un
+        fallo o tras ejecutar) sigue la numeración (``version`` = última + 1) y, como no reemplaza a
+        otra, ``reemplazada`` es ``None``. Recuerda la última versión de como mucho 32 ids retiradas.
+        ``ttl_s`` ∈ (0, 86400]. Thread-safe.
+        """
+        if not (isinstance(id, str) and ID_TARJETA_RE.fullmatch(id)):
+            return None, None
+        if tipo_accion not in TIPOS_ACCION_TARJETA:
+            return None, None
+        if not (isinstance(huella, str) and HUELLA_RE.fullmatch(huella)):
+            return None, None
+        ttl = _real(ttl_s)
+        if ttl is None or not 0.0 < ttl <= MAX_TTL_TARJETA_S:
+            return None, None
+        if canal_origen not in CANALES_ORIGEN_TARJETA or not isinstance(doble, bool):
+            return None, None
+        clase = CLASE_DE_ACCION[tipo_accion]
+        ahora = self._reloj()
+        with self._lock:
+            previa = self._tarjetas.get(id)
+            if previa is not None:
+                version = previa.version + 1
+            else:
+                version = self._versiones_retiradas.pop(id, 0) + 1
+            reemplazada: TarjetaAprobable | None = None
+            for otra in list(self._tarjetas.values()):
+                if otra.clase == clase and otra.id != id:
+                    reemplazada = self._retirar_sin_lock(otra.id)
+            nueva = TarjetaAprobable(id=id, clase=clase, tipo_accion=tipo_accion, huella=huella, version=version,
+                                     creada=ahora, caduca=ahora + ttl, canal_origen=canal_origen, doble=doble)
+            self._tarjetas[id] = nueva
+        log.debug("Tarjeta %s registrada (versión %d)", clase, version)
+        return nueva, reemplazada
+
+    def actualizar_tarjeta(self, id: str, huella: str) -> TarjetaAprobable | None:  # noqa: A002
+        """Edición: nueva huella y ``version+1``; renueva la caducidad (misma ttl) y borra el 1.er clic."""
+        if not (isinstance(huella, str) and HUELLA_RE.fullmatch(huella)):
+            return None
+        ahora = self._reloj()
+        with self._lock:
+            t = self._vigente_sin_lock(id, ahora)
+            if t is None:
+                return None
+            ttl = max(0.0, t.caduca - t.creada)
+            nueva = dataclasses.replace(t, huella=huella, version=t.version + 1, creada=ahora, caduca=ahora + ttl,
+                                        doble_ok_hasta=None)
+            self._tarjetas[t.id] = nueva
+            return nueva
+
+    def marcar_primera_confirmacion(self, id: str, huella: str) -> TarjetaAprobable | None:  # noqa: A002
+        """Paso 1 de "compartir en público": solo si ``t.doble`` y la huella coincide; el 2.º clic vale
+        ``TTL_DOBLE_CONFIRMACION_S`` (120 s) y la tarjeta sube de versión."""
+        if not isinstance(huella, str):
+            return None
+        ahora = self._reloj()
+        with self._lock:
+            t = self._vigente_sin_lock(id, ahora)
+            if t is None or not t.doble:
+                return None
+            if not hmac.compare_digest(t.huella.encode("ascii"), huella.encode("ascii", "replace")):
+                return None
+            nueva = dataclasses.replace(t, version=t.version + 1,
+                                        doble_ok_hasta=ahora + float(TTL_DOBLE_CONFIRMACION_S))
+            self._tarjetas[t.id] = nueva
+            return nueva
+
+    def tarjeta(self, id: str) -> TarjetaAprobable | None:  # noqa: A002
+        """La tarjeta ``id`` si está registrada y vigente; si no, ``None``."""
+        with self._lock:
+            return self._vigente_sin_lock(id, self._reloj())
+
+    def tarjetas(self) -> tuple[TarjetaAprobable, ...]:
+        """Las tarjetas vigentes, de la más vieja a la más nueva."""
+        ahora = self._reloj()
+        with self._lock:
+            vigentes = [t for t in self._tarjetas.values() if ahora < t.caduca]
+        return tuple(sorted(vigentes, key=lambda t: t.creada))
+
+    def retirar_tarjeta(self, id: str) -> TarjetaAprobable | None:  # noqa: A002
+        """Quita la tarjeta ``id`` (vigente o caducada) y la devuelve; recuerda su versión."""
+        if not isinstance(id, str):
+            return None
+        with self._lock:
+            return self._retirar_sin_lock(id)
+
+    def purgar_caducadas(self) -> tuple[TarjetaAprobable, ...]:
+        """Quita y devuelve las tarjetas vencidas (main las cierra como ``caducado``)."""
+        ahora = self._reloj()
+        with self._lock:
+            vencidas = [t for t in self._tarjetas.values() if ahora >= t.caduca]
+            for t in vencidas:
+                self._retirar_sin_lock(t.id)
+        return tuple(vencidas)
+
+    def correos_recientes(self) -> tuple[int, int]:
+        """Envíos de correo reservados en los últimos 600 s y en las últimas 86 400 s."""
+        ahora = self._reloj()
+        with self._lock:
+            while self._correos and ahora - self._correos[0][0] >= VENTANA_CORREO_DIA_S:
+                self._correos.popleft()
+            return self._conteo_correos_sin_lock(ahora)
+
+    def liberar_envio_correo(self, id: str) -> bool:  # noqa: A002
+        """Quita la reserva de tasa que ``autorizar()`` hizo para la tarjeta ``id`` (la más reciente con
+        esa id dentro de la ventana de 86 400 s). ``True`` si había una. Idempotente y thread-safe: main
+        la llama solo cuando el envío falló sin que nada pudiera salir (``ResultadoEnvio.pudo_salir``)."""
+        if not isinstance(id, str):
+            return False
+        ahora = self._reloj()
+        with self._lock:
+            for indice in range(len(self._correos) - 1, -1, -1):
+                ts, ident = self._correos[indice]
+                if ahora - ts >= VENTANA_CORREO_DIA_S:
+                    break
+                if ident == id:
+                    del self._correos[indice]
+                    log.debug("Reserva de envío de correo liberada")
+                    return True
+        return False
+
+    def _vigente_sin_lock(self, id: Any, ahora: float) -> TarjetaAprobable | None:  # noqa: A002
+        if not isinstance(id, str):
+            return None
+        t = self._tarjetas.get(id)
+        return t if t is not None and ahora < t.caduca else None
+
+    def _retirar_sin_lock(self, id: str) -> TarjetaAprobable | None:  # noqa: A002
+        t = self._tarjetas.pop(id, None)
+        if t is not None:
+            self._versiones_retiradas.pop(id, None)
+            self._versiones_retiradas[id] = t.version
+            while len(self._versiones_retiradas) > MAX_IDS_RETIRADAS:
+                self._versiones_retiradas.pop(next(iter(self._versiones_retiradas)))
+        return t
+
+    def _conteo_correos_sin_lock(self, ahora: float) -> tuple[int, int]:
+        corta = sum(1 for ts, _id in self._correos if ahora - ts < VENTANA_CORREO_CORTA_S)
+        dia = sum(1 for ts, _id in self._correos if ahora - ts < VENTANA_CORREO_DIA_S)
+        return corta, dia
 
     # ------------------------------------------------------------------
     # Configuración
@@ -357,8 +672,8 @@ class CompuertaPermisos:
         if origen not in ORIGENES_ACCION or origen in _ORIGENES_PROHIBIDOS:
             return self._denegada("origen de la acción desconocido")
 
-        # 2. Tipo soportado.
-        if tipo not in TIPOS_ACCION:
+        # 2. Tipo soportado (v0.2.1: más los de TIPOS_ACCION_EXTRA).
+        if tipo not in TIPOS_ACCION and tipo not in TIPOS_ACCION_EXTRA:
             return self._denegada("tipo de acción no soportado")
 
         # 3-4. Restricciones por origen (v0.2: por iniciativa, solo vistazo y travesura_cursor).
@@ -367,6 +682,30 @@ class CompuertaPermisos:
                                   "o hacer una travesura con el cursor")
         if origen == "nexus" and tipo != "enfocar_nexus":
             return self._denegada("desde Nexus IDE solo se permite traer su ventana al frente")
+
+        # 4b. v0.2.1: canal desde el que el usuario lo pidió (Telegram solo lo de bajo riesgo).
+        canal = args.get("canal")
+        if canal is not None and canal not in CANALES_ACCION:
+            return self._denegada("canal de la acción desconocido")
+        remota = canal == "telegram"
+        if remota:
+            if tipo not in ACCIONES_POR_TELEGRAM:
+                return self._denegada("desde Telegram solo puedo abrir apps y webs, buscar, pausar o pasar la "
+                                      "música y mandarte fotos; lo demás pídemelo en el computador")
+            if tipo != "enviar_foto" and not getattr(self.settings, "telegram_acciones", False):
+                return self._denegada("las acciones desde Telegram están desactivadas (RAMS_TELEGRAM_ACCIONES=1 "
+                                      "para activarlas)")
+
+        # 4c. v0.2.1: fotos de la cámara o de la pantalla a Telegram.
+        if tipo == "enviar_foto":
+            return self._evaluar_foto(origen, args, remota)
+
+        # 4d. v0.2.2 (§5.2-§5.3): cuenta de Google, Drive local y acciones con tarjeta. Ninguna pasa
+        # por Telegram, iniciativa, Nexus ni el LLM (las filas 1-4b ya las denegaron).
+        if tipo in TIPOS_ACCION_TARJETA:
+            return self._evaluar_tarjeta(tipo, origen, args)
+        if tipo in _TIPOS_GOOGLE_LOCALES:
+            return self._evaluar_google(tipo, origen, args)
 
         # 5. Filas nuevas de la v0.2 (§C2.11), en orden.
         if tipo in ("abrir_destino", "buscar_en", "prerrellenar", "escribir_texto", "travesura_cursor"):
@@ -380,6 +719,9 @@ class CompuertaPermisos:
             if origen not in ORIGENES_VISTAZO:
                 return self._denegada("ese origen no puede pedir un vistazo de cámara")
             return self._permitida("vistazo de cámara permitido")
+
+        if tipo == "lanzar_app" and args.get("local") is True:
+            return self._evaluar_app_local(origen, args, remota)
 
         if tipo == "lanzar_app":
             alias = args.get("alias")
@@ -427,6 +769,138 @@ class CompuertaPermisos:
 
         # Inalcanzable mientras TIPOS_ACCION y esta tabla estén alineados.
         return self._denegada("tipo de acción no soportado")
+
+    def _evaluar_foto(self, origen: str, args: Mapping[str, Any], remota: bool) -> DecisionPermiso:
+        """Fila ``enviar_foto`` (v0.2.1): el usuario, una fuente válida, opt-in por Telegram y ≤ 10/h."""
+        if origen != "usuario":
+            return self._denegada("solo tú puedes pedirme una foto (nunca por mi cuenta)")
+        fuente = args.get("fuente")
+        if fuente not in FUENTES_FOTO:
+            return self._denegada("solo puedo mandar una foto de la cámara o de la pantalla")
+        if remota and not getattr(self.settings, "telegram_fotos", False):
+            return self._denegada("las fotos por Telegram están desactivadas (RAMS_TELEGRAM_FOTOS=1 para "
+                                  "activarlas)")
+        if self.fotos_ultima_hora() >= MAX_FOTOS_HORA:
+            return self._denegada(f"ya te mandé {MAX_FOTOS_HORA} fotos en la última hora; espera un poco")
+        que = "de la cámara" if fuente == "camara" else "de la pantalla"
+        return self._permitida(f"foto {que} pedida por el usuario")
+
+    def _tiene_google(self) -> bool:
+        return bool(getattr(self.settings, "tiene_google", False))
+
+    def _evaluar_google(self, tipo: str, origen: str, args: Mapping[str, Any]) -> DecisionPermiso:
+        """Filas ``conectar_google``, ``desconectar_google``, ``drive_descargar`` y ``drive_crear_carpeta``."""
+        if origen != "usuario":
+            return self._denegada("solo tú puedes pedirme eso")
+        if args.get("canal") not in _CANALES_LOCALES_ACCION:
+            return self._denegada("eso solo se pide desde el computador")
+        if tipo == "desconectar_google":
+            return DecisionPermiso("confirmar", "desconectar tu cuenta de Google requiere confirmación",
+                                   destructiva=True, aprobada=False)
+        if not self._tiene_google():
+            return self._denegada("la conexión con Google está apagada (RAMS_GOOGLE=1 para activarla) o estoy "
+                                  "en modo sin red")
+        if tipo == "conectar_google":
+            return self._permitida("conectar tu cuenta de Google: la pantalla de consentimiento de Google es la "
+                                   "confirmación")
+        if tipo == "drive_descargar":
+            if args.get("destino") not in DESTINOS_DESCARGA:
+                return self._denegada("solo descargo en Descargas, Documentos o el Escritorio")
+            formato = args.get("formato")
+            if formato is not None and formato not in FORMATOS_DRIVE:
+                return self._denegada("formato de descarga no válido (pdf, texto u original)")
+            return self._permitida("descargar de tu Drive está permitido")
+        nombre = args.get("nombre")
+        if (not isinstance(nombre, str) or not nombre.strip() or len(nombre) > 120
+                or _RE_NOMBRE_CARPETA_PROHIBIDO.search(nombre)):
+            return self._denegada("el nombre de la carpeta debe tener entre 1 y 120 caracteres, sin / ni \\")
+        return self._permitida("crear una carpeta en tu Drive está permitido")
+
+    def _evaluar_tarjeta(self, tipo: str, origen: str, args: Mapping[str, Any]) -> DecisionPermiso:
+        """Fila común de tarjeta (§5.3) y los requisitos propios de cada tipo (§5.2). Pura."""
+        if origen != "usuario":
+            return self._denegada("solo tú puedes aprobar eso, con el botón de su tarjeta")
+        if args.get("canal") != "escritorio":
+            return self._denegada("eso solo se aprueba con el botón de la tarjeta en el computador")
+        if args.get("aprobacion") != "tarjeta":
+            return self._denegada("eso solo se aprueba con el botón de su tarjeta")
+        ident, sha = args.get("tarjeta"), args.get("sha256")
+        if not (isinstance(ident, str) and ID_TARJETA_RE.fullmatch(ident)
+                and isinstance(sha, str) and HUELLA_RE.fullmatch(sha)):
+            return self._denegada("la aprobación no trae una tarjeta válida")
+        t = self.tarjeta(ident)
+        if t is None:
+            return self._denegada("esa tarjeta ya no está vigente")
+        if t.tipo_accion != tipo:
+            return self._denegada("esa tarjeta es de otra acción")
+        if not hmac.compare_digest(t.huella.encode("ascii"), sha.encode("ascii")):
+            return self._denegada("el contenido cambió desde que lo viste")
+        if tipo == "ejecutar_script":
+            if not getattr(self.settings, "tiene_taller", False):
+                return self._denegada("el taller de scripts está apagado (RAMS_TALLER=1 para activarlo)")
+            if args.get("nivel") not in NIVELES_EJECUTABLES:
+                return self._denegada("riesgo crítico: no lo ejecuto desde la app")
+            return self._permitida("script aprobado con la tarjeta")
+        if not self._tiene_google():
+            return self._denegada("la conexión con Google está apagada (RAMS_GOOGLE=1 para activarla) o estoy "
+                                  "en modo sin red")
+        if tipo == "enviar_correo":
+            n = args.get("n_destinatarios")
+            maximo = int(getattr(self.settings, "correo_max_destinatarios", 10) or 0)
+            if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= maximo:
+                return self._denegada(f"un correo va a entre 1 y {maximo} destinatarios")
+            with self._lock:
+                corta, dia = self._conteo_correos_sin_lock(self._reloj())
+            max_corta = int(getattr(self.settings, "correo_max_10min", 5) or 0)
+            max_dia = int(getattr(self.settings, "correo_max_dia", 30) or 0)
+            if corta >= max_corta:
+                return self._denegada(f"ya salieron {max_corta} correos en 10 minutos: espera un poco")
+            if dia >= max_dia:
+                return self._denegada(f"ya salieron {max_dia} correos hoy: es el tope diario")
+            return self._permitida("correo aprobado con la tarjeta")
+        if tipo in ("drive_subir", "drive_papelera"):
+            return self._permitida("operación de Drive aprobada con la tarjeta")
+        # drive_compartir
+        rol, publico = args.get("rol"), args.get("publico")
+        if rol not in ROLES_DRIVE:
+            return self._denegada("permiso de Drive no válido")
+        if not isinstance(publico, bool):
+            return self._denegada("no sé si es para compartir en público o con una persona")
+        if publico and rol != "reader":
+            return self._denegada("público y editable nunca: un enlace público solo puede ser de lectura")
+        if publico != t.doble:
+            return self._denegada("lo que se aprueba no coincide con la tarjeta")
+        if publico:
+            if args.get("doble_confirmacion") is not True:
+                return self._denegada("compartir en público necesita la segunda confirmación")
+            if t.doble_ok_hasta is None or self._reloj() >= t.doble_ok_hasta:
+                return self._denegada("la primera confirmación venció: vuelve a pulsar Compartir")
+        return self._permitida("compartir aprobado con la tarjeta")
+
+    def _evaluar_app_local(self, origen: str, args: Mapping[str, Any], remota: bool) -> DecisionPermiso:
+        """Fila ``lanzar_app`` local (app del menú Inicio, v0.2.1), según el nivel del índice."""
+        if origen != "usuario":
+            return self._denegada("solo el usuario puede pedirme que abra una app")
+        clave = args.get("alias")
+        if not (isinstance(clave, str) and SAFE_CLAVE_APP_RE.fullmatch(clave)):
+            return self._denegada("no sé qué app abrir")
+        nivel = self.nivel_app(clave)
+        if nivel is None:
+            return self._denegada("no encuentro esa app en el menú Inicio")
+        grado, nombre = nivel
+        if grado == "permitida":
+            return self._permitida(f"«{nombre}» ya está aprobada")
+        if remota:
+            if grado == "sensible":
+                return self._denegada(f"«{nombre}» es una consola o una herramienta del sistema: solo la abro "
+                                      "desde el computador y con tu confirmación")
+            return self._denegada(f"«{nombre}» aún no está aprobada: ábrela una vez desde el computador (te "
+                                  "pediré confirmación) y luego podrás pedírmela desde aquí")
+        if grado == "sensible":
+            return DecisionPermiso("confirmar", f"«{nombre}» es una herramienta del sistema: requiere confirmación",
+                                   destructiva=False, aprobada=False)
+        return DecisionPermiso("confirmar", f"abrir «{nombre}» por primera vez requiere confirmación",
+                               destructiva=False, aprobada=False)
 
     def _evaluar_v02(self, tipo: str, origen: str, args: Mapping[str, Any]) -> DecisionPermiso:
         """Filas de la v0.2 (§C2.11): destinos, prerrelleno, tecleo y travesuras."""
@@ -536,15 +1010,30 @@ class CompuertaPermisos:
         v0.2: para ``prerrellenar``/``escribir_texto`` la descripción la escribe la compuerta
         (nunca lleva el texto) y ``permiso.solicitado`` añade ``vista_previa`` (el texto, ≤ 500);
         la consola local la muestra en pantalla, pero ningún ``log`` la registra.
+
+        v0.2.2: las acciones con tarjeta (``TIPOS_ACCION_TARJETA``) se evalúan y, si se permiten, su
+        tarjeta se RETIRA dentro del lock (un solo uso: un doble clic no ejecuta dos veces); con
+        ``enviar_correo`` se reserva además el envío en las ventanas de tasa. Nunca publican
+        ``permiso.solicitado``: la tarjeta ya fue la confirmación.
         """
-        decision = self.evaluar(accion)
         tipo = getattr(accion, "tipo", "?")
+        if tipo in TIPOS_ACCION_TARJETA:
+            return self._autorizar_tarjeta(accion)
+        decision = self.evaluar(accion)
         if decision.veredicto == "permitida":
             log.debug("Acción %s permitida: %s", tipo, decision.motivo)
+            if tipo == "enviar_foto":
+                self._anotar_foto()
             return decision
         if decision.veredicto != "confirmar":
             log.info("Acción %s denegada: %s", tipo, decision.motivo)
             return decision
+        args_accion = accion.args if isinstance(accion.args, Mapping) else {}
+        if args_accion.get("canal") == "telegram":
+            # Defensa en profundidad: lo pedido por Telegram nunca se confirma en el PC.
+            log.info("Acción %s denegada: pedida por Telegram y requiere confirmación", tipo)
+            return DecisionPermiso("denegada", "eso necesita tu confirmación en el computador",
+                                   destructiva=decision.destructiva, aprobada=False)
 
         loop = asyncio.get_running_loop()
         futuro: asyncio.Future[tuple[bool, str]] = loop.create_future()
@@ -564,6 +1053,10 @@ class CompuertaPermisos:
         if vista_previa is not None:
             # Con texto del usuario la descripción la fija la compuerta: nunca contiene el texto.
             descripcion = self._descripcion_v02(accion, len(vista_previa))
+        elif accion.tipo == "lanzar_app" and args_accion.get("local") is True:
+            descripcion = self._descripcion_app(str(args_accion.get("alias") or ""))
+        elif accion.tipo == "desconectar_google":
+            descripcion = DESCRIPCION_DESCONECTAR_GOOGLE   # v0.2.2: fija, nunca con datos de la cuenta
         else:
             descripcion = accion.descripcion or self._descripcion_por_defecto(accion)
         destructiva = bool(decision.destructiva)
@@ -605,12 +1098,36 @@ class CompuertaPermisos:
 
         return DecisionPermiso("confirmar", motivo, destructiva=destructiva, aprobada=bool(aprobada))
 
+    def _autorizar_tarjeta(self, accion: AccionPC) -> DecisionPermiso:
+        """Evalúa una acción con tarjeta y, si se permite, consume la tarjeta (y reserva el correo)."""
+        tipo = accion.tipo
+        with self._lock:
+            decision = self.evaluar(accion)
+            if decision.veredicto == "permitida":
+                ident = str(accion.args.get("tarjeta"))
+                self._retirar_sin_lock(ident)
+                if tipo == "enviar_correo":
+                    self._correos.append((self._reloj(), ident))
+        if decision.veredicto == "permitida":
+            log.debug("Acción %s permitida con su tarjeta", tipo)
+        else:
+            log.info("Acción %s denegada: %s", tipo, decision.motivo)
+        return decision
+
     @staticmethod
     def _descripcion_por_defecto(accion: AccionPC) -> str:
         """Descripción mínima si la intención no trajo una."""
         if accion.tipo == "cerrar_ventana":
             return f"cerrar la ventana {accion.args.get('direccion', '?')}"
         return accion.tipo.replace("_", " ")
+
+    def _descripcion_app(self, clave: str) -> str:
+        """Descripción de abrir una app del menú Inicio (nombre del índice, nunca del texto del usuario)."""
+        nivel = self.nivel_app(clave)
+        nombre = nivel[1] if nivel is not None else clave
+        if nivel is not None and nivel[0] == "sensible":
+            return f"Abrir «{nombre}» (herramienta del sistema: te lo preguntaré cada vez)"
+        return f"Abrir «{nombre}» (app del menú Inicio; si dices que sí, no te lo vuelvo a preguntar)"
 
     @staticmethod
     def _vista_previa(accion: AccionPC) -> str | None:

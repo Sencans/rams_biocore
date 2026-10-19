@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>VTuber AI Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><circle cx='32' cy='28' r='18' fill='%23a594ff'/><circle cx='25' cy='27' r='3' fill='%23161427'/><circle cx='39' cy='27' r='3' fill='%23161427'/><path d='M24 36q8 6 16 0' stroke='%23161427' stroke-width='3' fill='none' stroke-linecap='round'/></svg>">
+  <link rel="stylesheet" href="/style.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@3.4.4/lib/three-vrm.module.min.js"
+    }
+  }
+  </script>
+</head>
+<body data-bg="gradient">
+  <main class="stage" id="stage">
+    <canvas id="scene" aria-label="Avatar VTuber 3D"></canvas>
+    <div class="bubble" id="bubble" hidden></div>
+
+    <div class="overlay" id="overlay">
+      <div class="overlay-card">
+        <div class="spinner" aria-hidden="true"></div>
+        <p id="overlay-text">Cargando modelo…</p>
+      </div>
+    </div>
+
+    <div class="drop-hint" id="drop-hint">Suelta tu archivo <b>.vrm</b> para cargarlo</div>
+
+    <div class="hud">
+      <span class="pill" id="conn"><i></i><span>Conectando…</span></span>
+      <span class="pill subtle" id="model-name">Sin modelo</span>
+      <button class="pill btn-pill" id="toggle-panel" title="Mostrar/ocultar panel (tecla H)">Panel</button>
+    </div>
+
+    <div class="audio-hint" id="audio-hint" hidden>Haz clic en cualquier parte para activar la voz</div>
+  </main>
+
+  <aside class="panel" id="panel" aria-label="Panel de control">
+    <header class="panel-head">
+      <div class="brand">
+        <span class="logo" aria-hidden="true"></span>
+        <div>
+          <h1>VTuber AI Studio</h1>
+          <p>Avatar 3D controlable por IA</p>
+        </div>
+      </div>
+      <nav class="tabs" role="tablist">
+        <button role="tab" class="tab active" data-tab="control">Control</button>
+        <button role="tab" class="tab" data-tab="body">Cuerpo</button>
+        <button role="tab" class="tab" data-tab="ai">IA</button>
+        <button role="tab" class="tab" data-tab="scene">Escena</button>
+      </nav>
+    </header>
+
+    <div class="panel-body">
+      <!-- CONTROL -->
+      <section class="tab-page active" data-page="control">
+        <div class="group">
+          <h2>Hablar</h2>
+          <textarea id="say-text" rows="2" placeholder="Escribe algo para que lo diga…">¡Hola! Soy un avatar controlado por inteligencia artificial.</textarea>
+          <div class="row">
+            <select id="say-emotion" aria-label="Emoción al hablar"></select>
+            <select id="say-gesture" aria-label="Gesto al hablar"></select>
+            <button class="primary" id="say-btn">Hablar</button>
+          </div>
+        </div>
+
+        <div class="group">
+          <h2>Expresión <output id="expr-int-out">100%</output></h2>
+          <div class="chips" id="emotion-chips"></div>
+          <input type="range" id="expr-int" min="0" max="100" value="100" aria-label="Intensidad">
+        </div>
+
+        <div class="group">
+          <h2>Gestos</h2>
+          <div class="chips" id="gesture-chips"></div>
+        </div>
+
+        <div class="group">
+          <h2>Poses</h2>
+          <div class="chips" id="pose-chips"></div>
+        </div>
+
+        <div class="group">
+          <h2>Mirada</h2>
+          <div class="chips" id="look-chips"></div>
+        </div>
+      </section>
+
+      <!-- CUERPO -->
+      <section class="tab-page" data-page="body">
+        <div class="group">
+          <h2>Hueso</h2>
+          <select id="bone-select" aria-label="Hueso"></select>
+          <div class="slider-row"><label for="bx">X</label><input type="range" id="bx" min="-180" max="180" value="0"><output id="bx-out">0°</output></div>
+          <div class="slider-row"><label for="by">Y</label><input type="range" id="by" min="-180" max="180" value="0"><output id="by-out">0°</output></div>
+          <div class="slider-row"><label for="bz">Z</label><input type="range" id="bz" min="-180" max="180" value="0"><output id="bz-out">0°</output></div>
+          <p class="hint">X: inclinar adelante · Y: girar a <em>su</em> izquierda · Z: ladear a <em>su</em> derecha</p>
+          <button id="bone-zero">Poner a 0</button>
+        </div>
+
+        <div class="group">
+          <h2>Manos</h2>
+          <div class="row">
+            <select id="hand-side" aria-label="Mano">
+              <option value="both">Ambas</option>
+              <option value="left">Izquierda</option>
+              <option value="right">Derecha</option>
+            </select>
+          </div>
+          <div class="chips" id="hand-chips"></div>
+        </div>
+
+        <div class="group">
+          <h2>Mover</h2>
+          <div class="dpad">
+            <button data-move="0,-0.4">↑</button>
+            <button data-move="-0.4,0">←</button>
+            <button data-move="center">●</button>
+            <button data-move="0.4,0">→</button>
+            <button data-move="0,0.4">↓</button>
+          </div>
+          <div class="row">
+            <button data-turn="45">Girar ⟲</button>
+            <button data-turn="-45">Girar ⟳</button>
+            <button data-turn="0">De frente</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- IA -->
+      <section class="tab-page" data-page="ai">
+        <div class="group">
+          <h2>Conexión para IAs</h2>
+          <p class="hint">Cualquier IA puede mover el avatar enviando JSON a:</p>
+          <code class="endpoint" id="endpoint">POST /api/command</code>
+          <div class="row">
+            <button id="copy-curl">Copiar ejemplo curl</button>
+            <a class="btn" href="/api/help" target="_blank" rel="noopener">Ver protocolo</a>
+          </div>
+          <p class="hint">Claude puede controlarlo con el servidor MCP (ver README).</p>
+        </div>
+
+        <div class="group">
+          <h2>Consola</h2>
+          <select id="example-select" aria-label="Ejemplos"></select>
+          <textarea id="console-input" rows="6" spellcheck="false" class="mono"></textarea>
+          <div class="row">
+            <button class="primary" id="console-run">Ejecutar</button>
+            <button id="console-format">Formatear</button>
+          </div>
+        </div>
+
+        <div class="group grow">
+          <h2>Actividad <button class="link" id="log-clear">limpiar</button></h2>
+          <ol class="log" id="log"></ol>
+        </div>
+      </section>
+
+      <!-- ESCENA -->
+      <section class="tab-page" data-page="scene">
+        <div class="group">
+          <h2>Modelo</h2>
+          <label class="file-btn">
+            <input type="file" id="file-input" accept=".vrm" hidden>
+            <span>Cargar .vrm…</span>
+          </label>
+          <select id="model-select" aria-label="Modelos disponibles"></select>
+          <p class="hint">También puedes arrastrar un .vrm a la ventana, o copiarlo a la carpeta <code>models/</code>. Crea el tuyo gratis con VRoid Studio.</p>
+        </div>
+
+        <div class="group">
+          <h2>Cámara</h2>
+          <div class="chips" id="camera-chips"></div>
+        </div>
+
+        <div class="group">
+          <h2>Fondo</h2>
+          <div class="chips" id="bg-chips"></div>
+        </div>
+
+        <div class="group">
+          <h2>Voz</h2>
+          <label class="check"><input type="checkbox" id="tts-on" checked> Voz del navegador (TTS)</label>
+          <select id="voice-select" aria-label="Voz"></select>
+          <div class="slider-row"><label for="pitch">Tono</label><input type="range" id="pitch" min="50" max="200" value="110"><output id="pitch-out">1.1</output></div>
+        </div>
+
+        <div class="group">
+          <h2>Reposo</h2>
+          <label class="check"><input type="checkbox" id="idle-on" checked> Respiración y balanceo</label>
+          <label class="check"><input type="checkbox" id="blink-on" checked> Parpadeo automático</label>
+          <div class="row"><button id="reset-btn">Restablecer todo</button></div>
+        </div>
+      </section>
+    </div>
+  </aside>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

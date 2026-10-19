@@ -11,13 +11,18 @@ import pytest
 
 from core.contracts import DESTINOS_BASE, AccionPC
 from core.intenciones import (
+    ACCIONES_TELEGRAM,
     COMANDOS,
     COMANDOS_POR_CANAL,
+    FUENTES_FOTO,
     INTENCIONES_POR_CANAL,
     MENSAJE_BUSCAR_DEFECTO,
     MENSAJE_SOLO_LOCAL,
+    OPS_INTENCION,
+    OPS_POR_CANAL,
     TIPOS_INTENCION,
     Intencion,
+    acepta_oferta,
     completar_programar,
     detectar_evento_social,
     enrutar,
@@ -25,6 +30,8 @@ from core.intenciones import (
     parsear_comando,
     parsear_cuando,
     permitida_en_canal,
+    pide_tarea_pc,
+    quiere_audio,
     quiere_cancelar,
 )
 
@@ -660,3 +667,608 @@ def test_alias_siempre_es_la_clave_y_origen_usuario() -> None:
                   "abre twitter y escríbele: hola"):
         accion = _accion_de(_v02(texto))
         assert accion.args["alias"] in DESTINOS_BASE, texto
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: órdenes naturales (vocativos, cortesías y peticiones)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("texto", [
+    "asistente abre youtube porfavor", "Kurisu, ábreme YouTube pls", "¿Puedes abrir YouTube?",
+    "Puedes abrir YouTube en el PC pls", "¿me abres youtube?", "quiero que abras youtube", "abre youtube en el pc",
+    "oye amadeus, abre youtube por favor", "abre YouTube, Christina", "¿podrías abrirme YouTube?",
+    "me puedes abrir youtube xfa", "Por favor abre YouTube.", "abre youtube en mi computador gracias",
+])
+def test_ordenes_naturales_abren_el_destino(texto: str) -> None:
+    accion = _accion_de(_v02(texto, canal="terminal"))
+    assert accion.tipo == "abrir_destino" and accion.args == {"alias": "youtube"}, texto
+
+
+def test_ordenes_naturales_buscar_y_musica() -> None:
+    busca = _accion_de(_v02("oye amadeus busca gatos en youtube por favor", canal="terminal"))
+    assert busca.tipo == "buscar_en" and busca.args == {"alias": "youtube", "consulta": "gatos"}
+    pedido = _accion_de(_v02("¿me puedes buscar lofi en youtube?", canal="terminal"))
+    assert pedido.tipo == "buscar_en" and pedido.args["consulta"] == "lofi"
+    musica = _accion_de(_v02("porfa pausa la música, kurisu", canal="terminal"))
+    assert musica.tipo == "media" and musica.args == {"orden": "play_pause"}
+    web = _v02("asistente, busca el precio del dólar por favor", canal="terminal")
+    assert web.tipo == "buscar_web" and web.args["consulta"] == "el precio del dólar"
+    assert _v02("¿puedes buscar el clima de hoy?", canal="terminal").tipo == "buscar_web"
+    assert _v02("Amadeus, ven", canal="terminal").tipo == "escritorio_venir"
+    assert _v02("ven pls", canal="terminal").tipo == "escritorio_venir"
+    assert _v02("para ya", canal="terminal").tipo == "basta_travesuras"
+
+
+@pytest.mark.parametrize("texto", [
+    "¿puedes abrir archivos?", "¿podrías abrir apps?", "¿puedes abrir programas en mi pc?", "abre tu mente",
+    "abre tu mente a otras ideas", "abre los ojos", "abre la ventana", "¿puedes abrir cualquier cosa?",
+    "hola amadeus", "¿puedes abrir algo?", "abre el chat",
+])
+def test_ordenes_naturales_sin_falsos_positivos(texto: str) -> None:
+    intencion = _v02(texto, canal="terminal", apps_locales=True, plataforma="win32")
+    assert intencion.tipo == "ninguna", (texto, intencion)
+
+
+def test_el_texto_dictado_no_se_recorta_por_el_final() -> None:
+    borrador = _accion_de(_v02("amadeus, escríbele a mamá por whatsapp: ven por favor, kurisu", canal="terminal"))
+    assert borrador.tipo == "prerrellenar" and borrador.args["texto"] == "ven por favor, kurisu"
+    aqui = _accion_de(_v02("escribe ahí: gracias, amadeus", canal="terminal"))
+    assert aqui.args["texto"] == "gracias, amadeus"
+    recordatorio = _v02("amadeus, recuérdame en 10 minutos llamar a mamá por favor", canal="terminal")
+    assert recordatorio.tipo == "programar"
+    assert recordatorio.args["mensaje"] == "llamar a mamá por favor"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: apps del menú Inicio (Windows)
+# ---------------------------------------------------------------------------
+
+
+def _app_local(texto: str, **kwargs: object) -> AccionPC:
+    accion = _accion_de(_v02(texto, canal="terminal", apps_locales=True, plataforma="win32", **kwargs))
+    assert accion.tipo == "lanzar_app" and accion.args["local"] is True, texto
+    return accion
+
+
+def test_apps_locales_por_nombre() -> None:
+    steam = _app_local("asistente abre steam porfavor")
+    assert steam.args == {"nombre": "steam", "local": True, "explicito": True}
+    assert _app_local("Kurisu, ábreme el Bloc de notas").args["nombre"] == "Bloc de notas"
+    assert _app_local("¿puedes abrir Visual Studio Code?").args["nombre"] == "Visual Studio Code"
+    assert _app_local("abre steam en el pc pls").args["nombre"] == "steam"
+    assert _app_local("quiero que abras la calculadora").args["nombre"] == "calculadora"
+    pon = _app_local("pon visual studio code")
+    assert pon.args["explicito"] is False
+    assert _app_local("abre la app de Steam").args["nombre"] == "Steam"
+    assert _app_local("abre steam ya").args["nombre"] == "steam"
+    assert _app_local("¿Puedes abrir Steam en el PC por favor?").args["nombre"] == "Steam"
+    # RAMS_APPS en Windows: el alias también se busca en el menú Inicio (solo Linux usa hyprctl).
+    assert _app_local("abre terminal").args["nombre"] == "terminal"
+
+
+def test_apps_locales_respetan_catalogo_y_linux() -> None:
+    explorador = _accion_de(_v02("abre el explorador de archivos", canal="terminal", apps_locales=True,
+                                 plataforma="win32"))
+    assert explorador.tipo == "abrir_destino" and explorador.args == {"alias": "archivos"}
+    assert _accion_de(_v02("abre whatsapp", canal="terminal", apps_locales=True, plataforma="win32")).tipo \
+        == "abrir_destino"
+    # Sin apps_locales (por defecto, o RAMS_APPS_MENU_INICIO=0) "abre steam" no es una orden.
+    assert _v02("abre steam", canal="terminal", plataforma="win32").tipo == "ninguna"
+    linux = _accion_de(_v02("abre terminal", canal="terminal", plataforma="linux"))
+    assert linux.tipo == "lanzar_app" and linux.args == {"alias": "terminal"}
+    # "pon pausa" y el volumen ganan a la regla de apps.
+    assert _accion_de(_v02("pon pausa", canal="terminal", apps_locales=True, plataforma="win32")).tipo == "media"
+    assert _accion_de(_v02("pon el volumen al 30", canal="terminal", apps_locales=True,
+                           plataforma="win32")).tipo == "volumen"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: fotos, capturas y audio
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("texto, fuente", [
+    ("mándame una foto", "camara"), ("Envíame una foto pls", "camara"), ("tómame una foto", "camara"),
+    ("foto de la cámara", "camara"), ("mándame una foto de la cámara del pc", "camara"),
+    ("¿me mandas una foto?", "camara"), ("kurisu, sácame una foto con la webcam", "camara"),
+    ("mándame una captura", "pantalla"), ("mándame una captura de pantalla", "pantalla"),
+    ("hazme un pantallazo", "pantalla"), ("captura de pantalla", "pantalla"), ("mándame la pantalla", "pantalla"),
+    ("envíame una foto de la pantalla", "pantalla"), ("screenshot", "pantalla"),
+])
+def test_fotos_en_telegram_y_en_local(texto: str, fuente: str) -> None:
+    for canal in ("telegram", "terminal", "escritorio"):
+        intencion = _v02(texto, canal=canal)
+        assert intencion.tipo == "enviar_foto" and intencion.args == {"fuente": fuente}, (texto, canal)
+
+
+def test_pantalla_y_como_me_veo_dependen_del_canal() -> None:
+    assert _v02("¿Qué hay en mi pantalla?", canal="telegram").args == {"fuente": "pantalla"}
+    assert _v02("¿Qué hay en mi pantalla?", canal="terminal").tipo == "mirar_pantalla"
+    assert _v02("¿cómo me veo?", canal="telegram").args == {"fuente": "camara"}
+    assert _v02("¿cómo me veo?", canal="terminal").tipo == "vistazo"
+    # "mira mi pantalla" y "me ves" siguen siendo solo locales.
+    assert _v02("mira mi pantalla", canal="telegram").tipo == "bloqueada_canal"
+    assert _v02("me ves", canal="telegram").tipo == "bloqueada_canal"
+
+
+@pytest.mark.parametrize("texto", ["mándame una imagen de un gato", "toma una foto de la luna y descríbela",
+                                   "hazme una captura de la ventana del juego mañana", "la foto de ayer",
+                                   "busca fotos de gatos"])
+def test_fotos_sin_falsos_positivos(texto: str) -> None:
+    assert _v02(texto, canal="telegram").tipo != "enviar_foto", texto
+
+
+@pytest.mark.parametrize("texto", ["mándame un audio", "envíame una nota de voz", "háblame", "respóndeme por audio",
+                                   "dímelo en audio", "contéstame con tu voz", "quiero escucharte",
+                                   "Kurisu, mándame un audio porfa"])
+def test_pedir_audio(texto: str) -> None:
+    for canal in ("telegram", "terminal"):
+        intencion = _v02(texto, canal=canal)
+        assert intencion.tipo == "pedir_audio" and intencion.args == {}, (texto, canal)
+    assert quiere_audio(texto), texto
+
+
+def test_pedir_audio_al_telegram_y_quiere_audio() -> None:
+    assert _v02("mándame un audio al telegram", canal="terminal").args == {"destino": "telegram"}
+    assert _v02("háblame de los agujeros negros", canal="terminal").tipo != "pedir_audio"
+    assert quiere_audio("cuéntame un chiste por audio") is True
+    assert quiere_audio("explícame la teoría de cuerdas con tu voz") is True
+    assert quiere_audio("hola, ¿cómo estás?") is False
+    assert quiere_audio("") is False
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: Telegram con RAMS_TELEGRAM_ACCIONES
+# ---------------------------------------------------------------------------
+
+
+def _remota(texto: str, **kwargs: object) -> Intencion:
+    return _v02(texto, canal="telegram", telegram_acciones=True, **kwargs)
+
+
+@pytest.mark.parametrize("texto, tipo", [
+    ("Puedes abrir YouTube en el PC pls", "abrir_destino"), ("abre spotify", "abrir_destino"),
+    ("busca lofi en youtube", "buscar_en"), ("pausa la música", "media"), ("siguiente canción", "media"),
+])
+def test_telegram_acciones_de_bajo_riesgo(texto: str, tipo: str) -> None:
+    accion = _accion_de(_remota(texto))
+    assert accion.tipo == tipo and accion.args["canal"] == "telegram", texto
+    # Sin RAMS_TELEGRAM_ACCIONES (por defecto) sigue bloqueado, como en la v0.2.
+    assert _v02(texto, canal="telegram").tipo == "bloqueada_canal", texto
+
+
+def test_telegram_acciones_apps_locales_llevan_el_canal() -> None:
+    accion = _accion_de(_remota("abre steam", apps_locales=True, plataforma="win32"))
+    assert accion.tipo == "lanzar_app" and accion.args["canal"] == "telegram" and accion.args["local"] is True
+    linux = _accion_de(_remota("abre terminal", plataforma="linux"))
+    assert linux.args == {"alias": "terminal", "canal": "telegram"}
+
+
+@pytest.mark.parametrize("texto", [
+    "escribe ahí: hola", "escríbele a mamá por whatsapp: hola", "pon en x: hola", "cierra la ventana",
+    "abre whatsapp y escríbele a mamá: hola", "ponlo en whatsapp", "volumen al 50", "ve al espacio 2",
+    "me ves", "mira mi pantalla", "ven", "basta", "deja de mirarme", "trae nexus", "/camara on",
+])
+def test_telegram_acciones_lo_demas_sigue_siendo_local(texto: str) -> None:
+    intencion = _remota(texto)
+    assert intencion.tipo == "bloqueada_canal", texto
+
+
+def test_capacidades_v021_por_canal() -> None:
+    assert {"enviar_foto", "pedir_audio"} <= set(TIPOS_INTENCION)
+    assert {"enviar_foto", "pedir_audio"} <= INTENCIONES_POR_CANAL["telegram"]
+    assert "accion_pc" not in INTENCIONES_POR_CANAL["telegram"]
+    assert ACCIONES_TELEGRAM == frozenset({"abrir_destino", "buscar_en", "lanzar_app", "media"})
+    assert FUENTES_FOTO == ("camara", "pantalla")
+    abrir = Intencion("accion_pc", {"accion": AccionPC("abrir_destino", {"alias": "youtube"}, "abrir")})
+    assert permitida_en_canal(abrir, "telegram") is False
+    assert permitida_en_canal(abrir, "telegram", telegram_acciones=True) is True
+    assert permitida_en_canal(abrir, "nexus", telegram_acciones=True) is False
+    teclear = Intencion("accion_pc", {"accion": AccionPC("escribir_texto", {"texto": "x"}, "escribir")})
+    assert permitida_en_canal(teclear, "telegram", telegram_acciones=True) is False
+    con_nota = Intencion("accion_pc", {"accion": AccionPC("abrir_destino", {"alias": "whatsapp"}, "abrir"),
+                                       "nota": "escribir_despues"})
+    assert permitida_en_canal(con_nota, "telegram", telegram_acciones=True) is False
+    del_llm = Intencion("accion_pc", {"accion": AccionPC("abrir_destino", {"alias": "x"}, "abrir", origen="llm")})
+    assert permitida_en_canal(del_llm, "telegram", telegram_acciones=True) is False
+    assert _v02("mándame una foto", canal="nexus").tipo == "bloqueada_canal"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1 (revisión): citas, cortesías, fotos sin cámara explícita y audio como tema
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("texto, consulta", [
+    ("busca información sobre makise kurisu", "información sobre makise kurisu"),
+    ("busca videos de amadeus", "videos de amadeus"),
+    ("busca amadeus", "amadeus"),
+    ("busca el significado de christina", "el significado de christina"),
+    ("busca qué es un asistente", "qué es un asistente"),
+    ("busca la letra de please", "la letra de please"),
+    ("busca en youtube kurisu", "en youtube kurisu"),
+    ("busca la canción hacking to the gate gracias", "la canción hacking to the gate gracias"),
+    # Las cortesías sí sobran; un vocativo o un "gracias" tras una coma, también.
+    ("busca recetas de pasta por favor", "recetas de pasta"),
+    ("busca recetas de pasta porfa", "recetas de pasta"),
+    ("busca recetas de pasta pliss", "recetas de pasta"),
+    ("busca el clima de mañana, amadeus", "el clima de mañana"),
+    ("busca recetas de arepa, gracias", "recetas de arepa"),
+    ("Kurisu, busca el precio del dólar por fa", "el precio del dólar"),
+    ("¿podrías buscar la verdad sobre el experimento?", "la verdad sobre el experimento"),
+])
+def test_la_consulta_web_conserva_los_nombres_del_personaje(texto: str, consulta: str) -> None:
+    for canal in ("escritorio", "telegram"):
+        intencion = _v02(texto, canal=canal, apps_locales=True, plataforma="win32")
+        assert intencion.tipo == "buscar_web" and intencion.args["consulta"] == consulta, (texto, canal, intencion)
+
+
+def test_buscar_en_un_destino_tampoco_pierde_nombres() -> None:
+    accion = _accion_de(_v02("busca videos de makise kurisu en youtube, amadeus", canal="terminal"))
+    assert accion.tipo == "buscar_en" and accion.args == {"alias": "youtube", "consulta": "videos de makise kurisu"}
+
+
+@pytest.mark.parametrize("texto", ["¿quieres buscar problemas?", "¿quieres buscar pareja?",
+                                   "¿quisieras buscar otro trabajo?"])
+def test_quieres_buscar_es_una_pregunta(texto: str) -> None:
+    assert _v02(texto, canal="terminal").tipo == "ninguna", texto
+
+
+def test_quieres_buscarme_si_es_una_peticion() -> None:
+    intencion = _v02("¿quieres buscarme el clima de hoy?", canal="terminal")
+    assert intencion.tipo == "buscar_web" and intencion.args["consulta"] == "el clima de hoy"
+
+
+@pytest.mark.parametrize("texto", [
+    "abre steam pliss", "abre steam por fa", "abre steam porfavorr", "abre steam pofavor", "abre steam plis kurisu",
+    "abre steam porfaaa", "por fa abre steam", "pliss abre steam", "abre steam x favor", "abre steam please",
+])
+def test_cortesias_estiradas_no_entran_en_el_nombre(texto: str) -> None:
+    accion = _app_local(texto)
+    assert accion.args == {"nombre": "steam", "local": True, "explicito": True}, texto
+
+
+@pytest.mark.parametrize("texto", ["abre youtube en el navegador", "abre youtube en chrome",
+                                   "Kurisu, ábreme YouTube en Firefox porfa", "abre youtube en mi navegador"])
+def test_destino_en_el_navegador(texto: str) -> None:
+    accion = _accion_de(_v02(texto, canal="terminal", apps_locales=True, plataforma="win32"))
+    assert accion.tipo == "abrir_destino" and accion.args == {"alias": "youtube"}, texto
+
+
+def test_app_en_el_navegador_no_es_una_orden_de_app() -> None:
+    assert _v02("abre steam en chrome", canal="terminal", apps_locales=True, plataforma="win32").tipo == "ninguna"
+
+
+@pytest.mark.parametrize("texto, nombre", [
+    ("lanza una moneda", "moneda"), ("¿podrías lanzar una moneda?", "moneda"), ("arranca el carro", "carro"),
+    ("ejecuta el plan", "plan"), ("abre un archivo", "archivo"), ("inicia la fiesta", "fiesta"),
+])
+def test_ordenes_de_app_tentativas(texto: str, nombre: str) -> None:
+    accion = _app_local(texto)
+    assert accion.args["nombre"] == nombre and accion.args["tentativa"] is True, texto
+
+
+def test_abre_con_nombre_no_es_tentativa() -> None:
+    for texto in ("abre steam", "ábreme el bloc de notas", "¿puedes abrir Visual Studio Code?"):
+        assert "tentativa" not in _app_local(texto).args, texto
+
+
+@pytest.mark.parametrize("texto", [
+    "hazme una imagen", "haz una imagen", "muéstrame una imagen", "dame una imagen", "quiero una imagen",
+    "¿me puedes mandar una imagen?", "mándame una imagen", "quiero una foto", "enséñame una foto", "dame una foto",
+])
+def test_imagen_sin_camara_explicita_no_usa_la_webcam(texto: str) -> None:
+    for canal in ("telegram", "escritorio"):
+        intencion = _v02(texto, canal=canal, telegram_acciones=True)
+        assert not (intencion.tipo == "enviar_foto" and intencion.args.get("fuente") == "camara"), (texto, canal)
+
+
+@pytest.mark.parametrize("texto", [
+    "muéstrame una imagen de la webcam", "quiero una foto de la cámara", "dame una foto de la cámara del pc",
+    "hazme una foto", "toma una foto", "mándame una imagen de la cámara", "¿me puedes mandar una foto?",
+])
+def test_foto_con_peticion_clara_usa_la_camara(texto: str) -> None:
+    intencion = _v02(texto, canal="telegram")
+    assert intencion.tipo == "enviar_foto" and intencion.args == {"fuente": "camara"}, texto
+
+
+@pytest.mark.parametrize("texto", [
+    "videos con audio", "tengo un problema con audio", "cómo grabo la pantalla con audio",
+    "el audio en mi pc está fallando, en audio no hay sonido", "¿cómo exporto el video como audio?",
+    "¿qué pasa con tu voz?", "cambia la salida de audio", "audio", "busca un mensaje de voz que perdí",
+])
+def test_quiere_audio_ignora_el_audio_como_tema(texto: str) -> None:
+    assert quiere_audio(texto) is False, texto
+
+
+@pytest.mark.parametrize("texto", [
+    "cuéntame un chiste por audio", "cuéntame un chiste por audio porfa", "resúmeme las noticias en audio, amadeus",
+    "dime por voz qué hora es", "mándamelo como nota de voz", "explícame la relatividad vía nota de voz",
+    "cuéntame un cuento con tu voz", "mándame un audio contándome tu día",
+])
+def test_quiere_audio_cuando_pide_la_forma(texto: str) -> None:
+    assert quiere_audio(texto) is True, texto
+
+
+# ---------------------------------------------------------------------------
+# v0.2.2: Google, correo, Drive y taller (docs/V022_CORREO_DRIVE_SCRIPTS.md §4.6)
+# ---------------------------------------------------------------------------
+
+
+def test_v022_tipos_ops_y_canales() -> None:
+    for tipo in ("google", "correo", "drive", "taller"):
+        assert tipo in TIPOS_INTENCION
+        assert OPS_INTENCION[tipo]
+    assert OPS_INTENCION["drive"] == ("buscar", "info", "descargar", "leer", "crear_carpeta", "subir", "papelera",
+                                      "compartir")
+    assert {"google", "correo", "drive"} <= INTENCIONES_POR_CANAL["telegram"]
+    assert "taller" not in INTENCIONES_POR_CANAL["telegram"]
+    assert OPS_POR_CANAL["telegram"] == {"google": frozenset({"estado"}), "correo": frozenset({"preparar"}),
+                                         "drive": frozenset({"buscar", "info"})}
+    assert {"/google", "/script", "/habilidades"} <= set(COMANDOS)
+    assert "/google" in COMANDOS_POR_CANAL["telegram"]
+    assert not {"/script", "/habilidades"} & COMANDOS_POR_CANAL["telegram"]
+    # ACCIONES_TELEGRAM no cambia en la v0.2.2.
+    assert ACCIONES_TELEGRAM == frozenset({"abrir_destino", "buscar_en", "lanzar_app", "media"})
+
+
+def test_v022_google() -> None:
+    conectar = _ruta("conecta mi cuenta de Google")
+    assert conectar.tipo == "google" and conectar.args == {"op": "conectar"}
+    assert _ruta("vincula mi gmail").args == {"op": "conectar"}
+    assert _ruta("conecta google y drive").args == {"op": "conectar"}
+    assert _ruta("desconecta google", "escritorio").args == {"op": "desconectar"}
+    assert _ruta("desvincula mi cuenta de Google").args == {"op": "desconectar"}
+    assert _ruta("¿está conectado google?").args == {"op": "estado"}
+    bloqueada = _ruta("conecta google", "telegram")
+    assert bloqueada.tipo == "bloqueada_canal" and bloqueada.args["tipo_original"] == "google"
+    assert _ruta("desconecta google", "telegram").tipo == "bloqueada_canal"
+    estado = _ruta("¿está conectado google?", "telegram")
+    assert estado.tipo == "google" and estado.args == {"op": "estado"}
+    comando = _ruta("/google", "telegram")
+    assert comando.tipo == "comando" and comando.args["comando"] == "/google"
+
+
+def test_v022_correo_casos_de_la_spec() -> None:
+    a = _ruta("mándale un correo a mamá diciendo que llegué bien")
+    assert a.tipo == "correo"
+    assert a.args["op"] == "preparar" and a.args["para"] == ["mamá"] and a.args["cuerpo"] == "Llegué bien"
+    assert a.args["redactar"] is False and a.args["tema"] is None and a.args["asunto"] is None
+    b = _ruta("envía un email a juan@x.com con asunto Reunión: mañana no puedo")
+    assert b.args["para"] == ["juan@x.com"] and b.args["asunto"] == "Reunión"
+    assert b.args["cuerpo"] == "Mañana no puedo"
+    c = _ruta("redacta un correo a mi jefe pidiendo vacaciones")
+    assert c.args["para"] == ["mi jefe"] and c.args["redactar"] is True and c.args["tema"] == "Pidiendo vacaciones"
+    assert c.args["cuerpo"] is None
+    d = _ruta("manda un correo a ana@x.com y a pedro@y.com con copia a mamá, adjunta informe.pdf: aquí va el informe")
+    assert d.args["para"] == ["ana@x.com", "pedro@y.com"] and d.args["cc"] == ["mamá"] and d.args["cco"] == []
+    assert d.args["adjuntos"] == ["informe.pdf"] and d.args["cuerpo"] == "Aquí va el informe"
+    assert set(d.args) == {"op", "para", "cc", "cco", "asunto", "cuerpo", "tema", "redactar", "adjuntos"}
+
+
+def test_v022_correo_no_roba_otras_reglas() -> None:
+    prerrelleno = _ruta("escríbele a juan por gmail: hola")
+    assert prerrelleno.tipo == "accion_pc" and prerrelleno.args["accion"].tipo == "prerrellenar"
+    assert prerrelleno.args["accion"].args["alias"] == "gmail"
+    # Con un alias de destino, también «… un correo a juan por gmail: …» sigue siendo prerrelleno.
+    assert _ruta("mándale un correo a juan por gmail: hola").args["accion"].tipo == "prerrellenar"
+    assert _ruta("recuérdame enviar un correo a juan mañana a las 8").tipo == "programar"
+    telegram = _ruta("mándale un correo a mamá diciendo hola", "telegram")
+    assert telegram.tipo == "correo" and telegram.args["op"] == "preparar"
+
+
+def test_v022_correo_texto_crudo_y_saltos_de_linea() -> None:
+    # El cuerpo sale del texto ORIGINAL: tildes, saltos de línea y palabras largas intactos.
+    intencion = _ruta("escríbele un correo a ana: hola\nel archivo es informe_final_ventas_2026_q3.xlsx")
+    assert intencion.args["cuerpo"] == "Hola\nel archivo es informe_final_ventas_2026_q3.xlsx"
+    # Varias listas, CCO y adjuntos por ruta relativa (sin "..").
+    otro = _ruta("envía un correo a ana, juan y mamá con copia oculta a papá adjuntando docs/a.pdf y ../b.pdf "
+                 "diciendo que ya está")
+    assert otro.args["para"] == ["ana", "juan", "mamá"] and otro.args["cco"] == ["papá"]
+    assert otro.args["adjuntos"] == ["docs/a.pdf"] and otro.args["cuerpo"] == "Ya está"
+    assert otro.args["descartados"] == {"destinatarios": 0, "adjuntos": 1}      # «../b.pdf», nunca en silencio
+
+
+@pytest.mark.parametrize("texto, cuerpo", [
+    # «qué», «¿qué» y «¡qué» son contenido (interrogativo o exclamativo), no la conjunción que separa.
+    ("mándale un correo a mamá diciendo ¿qué hora es allá?", "¿Qué hora es allá?"),
+    ("mándale un correo a mamá diciendo qué rico estuvo el almuerzo", "Qué rico estuvo el almuerzo"),
+    ("mándale un correo a mamá diciendo ¡qué rico estuvo!", "¡Qué rico estuvo!"),
+    ("manda un correo a juan@x.com qué tal todo", "Qué tal todo"),
+    ("manda un correo a juan@x.com ¿qué dice el informe?", "¿Qué dice el informe?"),
+    ("manda un correo a juan@x.com que dice qué bonito día", "Qué bonito día"),
+    ("manda un correo a juan@x.com asunto Hola diciendo qué tal", "Qué tal"),
+    ("manda un correo a mamá diciendo que qué pena lo de ayer", "Qué pena lo de ayer"),
+    # La conjunción sí se quita (también con mayúscula o coma).
+    ("mándale un correo a mamá diciendo que llegué bien", "Llegué bien"),
+    ("mándale un correo a mamá diciendo Que llegué bien", "Llegué bien"),
+    ("manda un correo a juan@x.com que, la verdad, no puedo", "La verdad, no puedo"),
+])
+def test_v022_correo_que_interrogativo_es_contenido(texto: str, cuerpo: str) -> None:
+    intencion = _ruta(texto)
+    assert intencion.tipo == "correo", texto
+    assert intencion.args["cuerpo"] == cuerpo, texto
+
+
+@pytest.mark.parametrize("texto, cuerpo", [
+    # Solo se quitan las comillas que envuelven el texto ENTERO; una suelta en un extremo es contenido.
+    ("manda un correo a mamá diciendo que le diga a papá “te quiero”", "Le diga a papá “te quiero”"),
+    ("manda un correo a juan@x.com: la contraseña del wifi es 'casa123'", "La contraseña del wifi es 'casa123'"),
+    ("manda un correo a juan@x.com: \"Hola\", dijo él", "\"Hola\", dijo él"),
+    ("manda un correo a mamá diciendo: «hola»\n\n— Juan", "«Hola»\n\n— Juan"),
+    ("manda un correo a mamá diciendo \"hola\" y \"adiós\"", "\"Hola\" y \"adiós\""),
+    ("manda un correo a mamá diciendo «hola»", "Hola"),
+    ("manda un correo a mamá diciendo: “nos vemos mañana”", "Nos vemos mañana"),
+    ("manda un correo a mamá diciendo 'hola'", "Hola"),
+])
+def test_v022_correo_comillas_sueltas_se_conservan(texto: str, cuerpo: str) -> None:
+    assert _ruta(texto).args["cuerpo"] == cuerpo, texto
+
+
+def test_v022_correo_asunto_con_comillas() -> None:
+    assert _ruta("manda un correo a juan@x.com con asunto Informe \"final\": hola").args["asunto"] == \
+        "Informe \"final\""
+    assert _ruta("manda un correo a juan@x.com con asunto «Reunión»: mañana no puedo").args["asunto"] == "Reunión"
+
+
+@pytest.mark.parametrize("texto, para, cuerpo, tema", [
+    ("¿puedes mandarle un correo a mamá diciendo hola?", ["mamá"], "Hola", None),
+    ("me puedes mandar un correo a mamá diciendo hola", ["mamá"], "Hola", None),
+    ("quiero que le mandes un correo a mamá diciendo hola", ["mamá"], "Hola", None),
+    ("¿le envías un correo a mamá diciendo hola?", ["mamá"], "Hola", None),
+    ("¿podrías escribirle un email a juan@x.com: nos vemos el lunes?", ["juan@x.com"], "Nos vemos el lunes", None),
+    ("necesito que le envíes un correo a ana@x.com diciendo ¿vienes?", ["ana@x.com"], "¿Vienes?", None),
+    ("¿podrías redactarle un correo a mi jefe pidiendo vacaciones?", ["mi jefe"], None, "Pidiendo vacaciones"),
+])
+def test_v022_correo_en_forma_de_peticion(texto: str, para: list[str], cuerpo: str | None,
+                                         tema: str | None) -> None:
+    intencion = _ruta(texto)
+    assert intencion.tipo == "correo", texto
+    assert intencion.args["para"] == para and intencion.args["cuerpo"] == cuerpo, texto
+    assert intencion.args["tema"] == tema and intencion.args["redactar"] is (tema is not None), texto
+    assert _ruta(texto, "telegram").tipo == "correo", texto                  # preparar sí va por Telegram
+
+
+@pytest.mark.parametrize("texto, tarea", [
+    ("¿me puedes hacer un script que liste mis fotos?", "liste mis fotos"),
+    ("¿podrías escribirme un script para ordenar mis descargas?", "ordenar mis descargas"),
+    ("quiero que me hagas un script que renombre mis fotos", "renombre mis fotos"),
+    ("¿me haces un script que comprima mis videos?", "comprima mis videos"),
+])
+def test_v022_taller_en_forma_de_peticion(texto: str, tarea: str) -> None:
+    intencion = _ruta(texto)
+    assert intencion.tipo == "taller" and intencion.args == {"op": "crear", "tarea": tarea}, texto
+    assert _ruta(texto, "telegram").tipo == "bloqueada_canal", texto         # el taller nunca por Telegram
+
+
+@pytest.mark.parametrize("texto", ["¿me puedes recordar enviar un correo a juan mañana a las 8?",
+                                   "¿puedes mandarme la foto?", "¿le escribes cartas a tu mamá?",
+                                   "quiero que me hagas un favor", "¿me haces un café?"])
+def test_v022_peticiones_que_no_son_correo_ni_taller(texto: str) -> None:
+    assert _ruta(texto).tipo not in ("correo", "taller"), texto
+
+
+def test_v022_correo_lo_que_no_cabe_se_cuenta() -> None:
+    lista = ", ".join(f"p{n}@x.com" for n in range(1, 13))
+    muchos = _ruta(f"manda un correo a {lista} diciendo hola")
+    assert len(muchos.args["para"]) == 10 and muchos.args["para"][-1] == "p10@x.com"
+    assert muchos.args["descartados"] == {"destinatarios": 2, "adjuntos": 0}
+    for ruta in ("C:/Users/x/secreto.txt", "../../.env", "~/notas.txt", "/etc/passwd"):
+        intencion = _ruta(f"manda un correo a juan@x.com adjunta {ruta}: hola")
+        assert intencion.args["adjuntos"] == [] and intencion.args["cuerpo"] == "Hola", ruta
+        assert intencion.args["descartados"] == {"destinatarios": 0, "adjuntos": 1}, ruta
+    seis = _ruta("manda un correo a juan@x.com adjunta a.pdf, b.pdf, c.pdf, d.pdf, e.pdf y f.pdf: hola")
+    assert len(seis.args["adjuntos"]) == 5 and seis.args["descartados"] == {"destinatarios": 0, "adjuntos": 1}
+    # Sin nada fuera, la clave no aparece (el contrato de §4.1 sigue intacto).
+    assert "descartados" not in _ruta("manda un correo a juan@x.com adjunta docs/a.pdf: hola").args
+
+
+def test_v022_drive_casos_de_la_spec() -> None:
+    buscar = _ruta("busca en mi drive el informe de ventas")
+    assert buscar.tipo == "drive" and buscar.args == {"op": "buscar", "consulta": "informe de ventas"}
+    youtube = _ruta("busca lofi en youtube")
+    assert youtube.tipo == "accion_pc" and youtube.args["accion"].tipo == "buscar_en"
+    descargar = _ruta("descarga el 2 de drive como pdf en documentos")
+    assert descargar.args == {"op": "descargar", "ref": "2", "formato": "pdf", "destino": "documentos"}
+    assert _ruta("borra el 3 de drive").args == {"op": "papelera", "ref": "3"}
+    assert _ruta("borra el archivo").tipo != "drive"
+    publico = _ruta("haz público el 2")
+    assert publico.tipo == "drive"
+    assert {k: publico.args[k] for k in ("op", "ref", "publico", "rol")} == {"op": "compartir", "ref": "2",
+                                                                          "publico": True, "rol": "reader"}
+    bloqueada = _ruta("sube informe.pdf a drive", "telegram")
+    assert bloqueada.tipo == "bloqueada_canal" and bloqueada.args["tipo_original"] == "drive"
+    remota = _ruta("busca en mi drive impuestos", "telegram")
+    assert remota.tipo == "drive" and remota.args["op"] == "buscar"
+
+
+@pytest.mark.parametrize("texto, esperado", [
+    ("¿qué tengo en drive sobre impuestos?", {"op": "buscar", "consulta": "impuestos"}),
+    ("lista mi drive", {"op": "buscar", "consulta": None}),
+    ("archivos recientes de drive", {"op": "buscar", "consulta": None}),
+    ("busca informe en drive", {"op": "buscar", "consulta": "informe"}),
+    ("detalles del 2", {"op": "info", "ref": "2"}),
+    ("info del archivo informe ventas de drive", {"op": "info", "ref": "informe ventas"}),
+    ("descarga el primero", {"op": "descargar", "ref": "1"}),
+    ("resume el documento 1 de drive", {"op": "leer", "ref": "1"}),
+    ("léeme el doc de presupuesto", {"op": "leer", "ref": "presupuesto"}),
+    ("crea una carpeta Facturas 2026 en drive", {"op": "crear_carpeta", "nombre": "Facturas 2026"}),
+    ("crea una carpeta Facturas en drive dentro de Trabajo",
+     {"op": "crear_carpeta", "nombre": "Facturas", "carpeta": "Trabajo"}),
+    ("sube informe.pdf a drive", {"op": "subir", "nombre": "informe.pdf"}),
+    ("sube documentos/trabajo/plan.xlsx a la carpeta Trabajo de drive",
+     {"op": "subir", "nombre": "documentos/trabajo/plan.xlsx", "carpeta": "Trabajo"}),
+    ("manda a la papelera el 3", {"op": "papelera", "ref": "3"}),
+    ("comparte el 2 con ana@x.com como editora",
+     {"op": "compartir", "ref": "2", "correo": "ana@x.com", "rol": "writer", "publico": False}),
+    ("comparte el enlace del 2 con cualquiera",
+     {"op": "compartir", "ref": "2", "correo": None, "rol": "reader", "publico": True}),
+])
+def test_v022_drive_operaciones(texto: str, esperado: dict[str, object]) -> None:
+    intencion = _ruta(texto)
+    assert intencion.tipo == "drive", texto
+    assert intencion.args == esperado, texto
+
+
+@pytest.mark.parametrize("texto", ["detalles de la reunión", "descarga el juego", "lee esto", "borra el archivo",
+                                   "manda la carta a la papelera", "busca la receta del ajiaco"])
+def test_v022_drive_no_roba_conversacion(texto: str) -> None:
+    assert _ruta(texto).tipo != "drive", texto
+
+
+def test_v022_drive_publico_editable_pasa_como_writer() -> None:
+    # El enrutador lo deja pasar con rol writer: el módulo y la compuerta lo bloquean siempre.
+    intencion = _ruta("haz público el 2 como editora")
+    assert intencion.args["publico"] is True and intencion.args["rol"] == "writer"
+
+
+def test_v022_taller() -> None:
+    crear = _ruta("hazme un script que renombre mis fotos")
+    assert crear.tipo == "taller" and crear.args == {"op": "crear", "tarea": "renombre mis fotos"}
+    assert _ruta("Escribe un script para Ordenar mis Descargas").args["tarea"] == "Ordenar mis Descargas"
+    assert _ruta("hazme un script que renombre mis fotos", "telegram").tipo == "bloqueada_canal"
+    habilidad = _ruta("ejecuta la habilidad renombrar fotos")
+    assert habilidad.args == {"op": "ejecutar_habilidad", "nombre": "renombrar fotos"}
+    assert _ruta("olvida la habilidad renombrar fotos").args == {"op": "olvidar_habilidad",
+                                                                 "nombre": "renombrar fotos"}
+    assert _ruta("¿qué habilidades tienes?").args == {"op": "habilidades"}
+    assert _ruta("¿qué habilidades tienes?", "telegram").tipo == "bloqueada_canal"
+    script = _ruta("/script ordena mis fotos")
+    assert script.tipo == "comando" and script.args == {"comando": "/script", "resto": "ordena mis fotos"}
+    assert _ruta("/script x", "telegram").tipo == "bloqueada_canal"
+    assert _ruta("/habilidades", "telegram").tipo == "bloqueada_canal"
+
+
+def test_v022_nexus_no_admite_nada_nuevo() -> None:
+    for texto in ("conecta mi cuenta de Google", "busca en mi drive impuestos", "hazme un script que x",
+                  "mándale un correo a mamá diciendo hola"):
+        assert _ruta(texto, "nexus").tipo == "bloqueada_canal", texto
+
+
+def test_v022_permitida_en_canal_mira_las_ops() -> None:
+    assert permitida_en_canal(Intencion("drive", {"op": "info", "ref": "2"}), "telegram") is True
+    assert permitida_en_canal(Intencion("drive", {"op": "compartir", "ref": "2"}), "telegram") is False
+    assert permitida_en_canal(Intencion("google", {"op": "conectar"}), "telegram") is False
+    assert permitida_en_canal(Intencion("google", {}), "telegram") is False
+    assert permitida_en_canal(Intencion("taller", {"op": "crear"}), "telegram") is False
+    assert permitida_en_canal(Intencion("taller", {"op": "crear"}), "escritorio") is True
+
+
+def test_v022_pide_tarea_pc() -> None:
+    assert pide_tarea_pc("organiza mis descargas por tipo") is True
+    assert pide_tarea_pc("¿a qué hora abre el banco?") is False
+    assert pide_tarea_pc("organiza tus ideas") is False
+    assert pide_tarea_pc("¿puedes renombrar todas las fotos de Descargas con la fecha?") is True
+    assert pide_tarea_pc("oye amadeus, apaga el wifi") is True
+    assert pide_tarea_pc("quiero que conviertas estos videos a mp3") is True
+    assert pide_tarea_pc("el ordenador de mi casa tiene fotos") is False
+    assert pide_tarea_pc("descarga los videos mañana") is False      # habla de horarios
+    assert pide_tarea_pc("") is False
+
+
+def test_v022_acepta_oferta() -> None:
+    for texto in ("sí, hazlo con un script", "dale", "Sí.", "ok, de una", "inténtalo", "sí por favor", "hágale"):
+        assert acepta_oferta(texto) is True, texto
+    for texto in ("sí, pero mañana", "no", "si puedes", "sí 2", "", "dale con todo el script y algo más"):
+        assert acepta_oferta(texto) is False, texto

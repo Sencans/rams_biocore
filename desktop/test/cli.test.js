@@ -8,7 +8,7 @@ const {
 const base = ['C:\\electron\\electron.exe', 'C:\\proyectos\\rams_biocore\\desktop'];
 
 test('cli: lista cerrada de comandos de §C2.7.5', () => {
-  assert.deepEqual([...COMANDOS], ['toggle', 'show', 'hide', 'chat', 'quit', 'basta', 'vision_pausa', 'clics']);
+  assert.deepEqual([...COMANDOS], ['toggle', 'show', 'hide', 'chat', 'quit', 'basta', 'vision_pausa', 'clics', 'puter']);
 });
 
 test('cli: --amadeus=<cmd> reconoce cada comando (sin distinguir mayúsculas)', () => {

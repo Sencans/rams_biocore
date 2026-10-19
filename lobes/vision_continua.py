@@ -7,8 +7,11 @@ salen **escalares** (nunca cuadros, miniaturas ni bytes).
   daemon ``rams-vision-cam`` abre la webcam una vez, pide 10–15 fps al driver y analiza a
   ``vision_fps`` (1–5) con YuNet (``cv2.FaceDetectorYN``) o, de respaldo, Haar. De cada cuadro
   saca rostro, posición normalizada (u, v), distancia aproximada, orientación (yaw/pitch),
-  movimiento y brillo; el cuadro se descarta dentro de la misma función. Pausar = el hilo sale
-  de su bucle y hace ``release()`` en su ``finally`` (el LED se apaga de verdad).
+  movimiento y brillo; el cuadro no sale del hilo salvo una referencia al **último** (solo en
+  memoria, sobrescrita en cada lectura y soltada al pausar o cerrar) que únicamente usa
+  ``instantanea_jpeg``: la foto que el usuario pide ("mándame una foto"), codificada en el executor
+  por ``lobes.capturas`` y nunca escrita en disco. Pausar = el hilo sale de su bucle y hace
+  ``release()`` en su ``finally`` (el LED se apaga de verdad).
 - **Pantalla** (``RAMS_PANTALLA_MODO``): ``metadatos`` (app, título corto, pantalla completa) o
   ``pixeles`` (además, una miniatura de 64×36 que vive solo en memoria para medir cambio, cortes,
   vídeo por región, brillo y tono). Windows: ctypes + ``mss`` en un hilo daemon; Hyprland: socket
@@ -42,6 +45,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import math
@@ -151,6 +155,8 @@ REINTENTOS_APERTURA_S: Final = (30.0, 60.0, 120.0, 300.0)   # cámara ocupada o 
 REINTENTO_ERROR_S: Final = 60.0
 REINTENTO_PANTALLA_S: Final = 30.0            # el hilo de pantalla terminó solo (sin fuente o roto)
 FRESCURA_VISTAZO_S: Final = 1.0               # como_vistazo: muestra de menos de 1 s
+FRESCURA_INSTANTANEA_S: Final = 2.0           # instantanea_jpeg: cuadro de menos de 2 s (o 2,5 periodos)
+TIMEOUT_INSTANTANEA_S: Final = 5.0            # codificación del JPEG en el executor
 JOIN_HILO_S: Final = 2.0
 _FOURCC_MJPG: Final = sum(ord(c) << (8 * i) for i, c in enumerate("MJPG"))
 _PREFIJO_YUNET: Final = "face_detection_yunet"
@@ -208,6 +214,8 @@ TITULO_MAX: Final = 60
 ANCHO_PRESUBMUESTREO: Final = 256             # la captura se submuestrea a ≤ 256 px de ancho
 TIMEOUT_GRIM_S: Final = 3.0
 TIMEOUT_HYPR_S: Final = 0.25
+MAX_RESPUESTA_HYPR: Final = 1 << 20           # JSON del socket de Hyprland (j/clients puede pesar decenas de KB)
+VENTANAS_ENUMERADAS_MAX: Final = 4096         # EnumWindows: más que esto ⇒ falla cerrada
 ESPERA_SALIDA_CANCELADO_S: Final = 1.0
 _RE_SALIDA_MONITOR: Final = re.compile(r"^[A-Za-z0-9_.\-]{1,64}$")
 _RE_CLASE: Final = re.compile(r"[^a-z0-9_.+\-]+")
@@ -1182,11 +1190,14 @@ def ruta_modelo_yunet(data_dir: Any, *, explicita: Any = None, mayor: int | None
 
 
 class _Win32:
-    """Lecturas de Win32 sin efectos (ventana en primer plano, proceso, rectángulos, QUNS)."""
+    """Lecturas de Win32 sin efectos (ventana en primer plano, ventanas visibles, proceso,
+    rectángulos, QUNS)."""
 
     _PROCESS_QUERY_LIMITED_INFORMATION: Final = 0x1000
     _MONITOR_DEFAULTTONEAREST: Final = 2
     _CLASES_ESCRITORIO: Final = frozenset({"progman", "workerw", "shell_traywnd"})
+    _DWMWA_EXTENDED_FRAME_BOUNDS: Final = 9      # rectángulo que se ve (sin los bordes invisibles)
+    _DWMWA_CLOAKED: Final = 14                   # ≠ 0: oculta por DWM (otro escritorio virtual, UWP suspendida)
 
     def __init__(self) -> None:
         import ctypes
@@ -1231,7 +1242,22 @@ class _Win32:
         k.CloseHandle.restype = wintypes.BOOL
         s.SHQueryUserNotificationState.argtypes = [ctypes.POINTER(ctypes.c_int)]
         s.SHQueryUserNotificationState.restype = ctypes.c_long
-        self._u, self._k, self._s = u, k, s
+        # Enumeración de ventanas de nivel superior (capturas bajo pedido: ventanas visibles).
+        self._WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        u.EnumWindows.argtypes = [self._WNDENUMPROC, wintypes.LPARAM]
+        u.EnumWindows.restype = wintypes.BOOL
+        for nombre in ("IsWindowVisible", "IsIconic"):
+            funcion = getattr(u, nombre)
+            funcion.argtypes = [wintypes.HWND]
+            funcion.restype = wintypes.BOOL
+        d: Any = None
+        try:  # opcional: sin DWM se usa GetWindowRect y ninguna ventana cuenta como oculta
+            d = ctypes.WinDLL("dwmapi", use_last_error=True)
+            d.DwmGetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+            d.DwmGetWindowAttribute.restype = ctypes.c_long
+        except (OSError, AttributeError):
+            d = None
+        self._u, self._k, self._s, self._d = u, k, s, d
 
     def quns(self) -> int | None:
         """``SHQueryUserNotificationState`` (1 bloqueada, 2 ocupada, 3 D3D pantalla completa, 4 presentación, 5 normal)."""
@@ -1251,24 +1277,119 @@ class _Win32:
             return ""
         return buffer.value
 
-    def _exe(self, hwnd: Any) -> str:
+    def _exe(self, hwnd: Any, cache: dict[int, str] | None = None) -> str:
         pid = self._wt.DWORD(0)
         self._u.GetWindowThreadProcessId(hwnd, self._ct.byref(pid))
         if not pid.value:
             return ""
+        if cache is not None and int(pid.value) in cache:
+            return cache[int(pid.value)]
+        nombre = ""
         manejador = self._k.OpenProcess(self._PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
         if manejador:
             try:
                 buffer = self._ct.create_unicode_buffer(1024)
                 tam = self._wt.DWORD(1024)
                 if self._k.QueryFullProcessImageNameW(manejador, 0, buffer, self._ct.byref(tam)):
-                    return _sanear_clase(buffer.value.replace("\\", "/").rsplit("/", 1)[-1])
+                    nombre = _sanear_clase(buffer.value.replace("\\", "/").rsplit("/", 1)[-1])
             finally:
                 self._k.CloseHandle(manejador)
-        if psutil is not None:
+        if not nombre and psutil is not None:
             with contextlib.suppress(Exception):
-                return _sanear_clase(psutil.Process(int(pid.value)).name())
-        return ""
+                nombre = _sanear_clase(psutil.Process(int(pid.value)).name())
+        if cache is not None:
+            cache[int(pid.value)] = nombre
+        return nombre
+
+    def _oculta_por_dwm(self, hwnd: Any) -> bool:
+        """``True`` si DWM la oculta (otro escritorio virtual, app UWP suspendida): no se ve."""
+        if self._d is None:
+            return False
+        valor = self._wt.DWORD(0)
+        try:
+            resultado = self._d.DwmGetWindowAttribute(hwnd, self._DWMWA_CLOAKED, self._ct.byref(valor),
+                                                      self._ct.sizeof(valor))
+        except OSError:
+            return False
+        return resultado == 0 and valor.value != 0
+
+    def _rect_visible(self, hwnd: Any) -> tuple[int, int, int, int] | None:
+        """``(izq, arriba, der, abajo)`` de lo que se ve de la ventana (DWM; si no, ``GetWindowRect``).
+
+        ``GetWindowRect`` incluye los bordes invisibles de redimensionado (~8 px): una ventana
+        maximizada en el monitor de al lado "tocaría" este. DWM da el marco que de verdad se ve.
+        """
+        rect = self._RECT()
+        if self._d is not None:
+            try:
+                if self._d.DwmGetWindowAttribute(hwnd, self._DWMWA_EXTENDED_FRAME_BOUNDS, self._ct.byref(rect),
+                                                 self._ct.sizeof(rect)) == 0:
+                    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+            except OSError:
+                pass
+        try:
+            if self._u.GetWindowRect(hwnd, self._ct.byref(rect)):
+                return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+        except OSError:
+            pass
+        return None
+
+    def ventanas_visibles(self, region: Mapping[str, Any], *,
+                          maximo: int = VENTANAS_ENUMERADAS_MAX) -> list[dict[str, str]] | None:
+        """``[{app, titulo, clase}]`` de las ventanas de nivel superior que se ven en ``region``.
+
+        Cuenta toda ventana visible (``IsWindowVisible``), sin minimizar, no oculta por DWM y cuyo
+        marco toca ``region`` (``{left, top, width, height}``), en orden Z. No calcula la oclusión:
+        una ventana tapada por otra cuenta como visible (ante la duda, se mira). ``None`` si la
+        región no es válida, ``EnumWindows`` falla o hay más de ``maximo`` ventanas: quien llama
+        falla cerrada. Solo lectura; los títulos nunca se registran.
+        """
+        try:
+            izq, arriba = int(region["left"]), int(region["top"])
+            der, abajo = izq + int(region["width"]), arriba + int(region["height"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if der <= izq or abajo <= arriba:
+            return None
+        hwnds: list[Any] = []
+        desbordada = False
+
+        def recolectar(hwnd: Any, _lparam: Any) -> bool:
+            nonlocal desbordada
+            if len(hwnds) >= maximo:
+                desbordada = True
+                return False
+            hwnds.append(hwnd)
+            return True
+
+        retrollamada = self._WNDENUMPROC(recolectar)
+        try:
+            completa = bool(self._u.EnumWindows(retrollamada, 0))
+        except OSError:
+            return None
+        if desbordada or not completa:
+            return None
+        cache: dict[int, str] = {}
+        visibles: list[dict[str, str]] = []
+        for hwnd in hwnds:
+            if not hwnd:
+                continue
+            try:
+                if not self._u.IsWindowVisible(hwnd) or self._u.IsIconic(hwnd) or self._oculta_por_dwm(hwnd):
+                    continue
+                rect = self._rect_visible(hwnd)
+                if rect is not None:
+                    r_izq, r_arriba, r_der, r_abajo = rect
+                    if r_der <= r_izq or r_abajo <= r_arriba:
+                        continue                  # sin área: no se ve
+                    if r_der <= izq or r_izq >= der or r_abajo <= arriba or r_arriba >= abajo:
+                        continue                  # en otro monitor
+                visibles.append({"app": self._exe(hwnd, cache),
+                                 "titulo": self._texto(self._u.GetWindowTextW, hwnd),
+                                 "clase": self._texto(self._u.GetClassNameW, hwnd)})
+            except OSError:
+                return None
+        return visibles
 
     def ventana_activa(self, *, con_titulo: bool) -> dict[str, Any]:
         """``{app, titulo, pantalla_completa, monitor}`` de la ventana en primer plano."""
@@ -1412,8 +1533,13 @@ def _ruta_socket_hypr() -> Path | None:
 
 
 async def _consulta_hypr_socket(comando: str, timeout: float = TIMEOUT_HYPR_S) -> Any:
-    """``j/activewindow`` o ``j/monitors`` por el socket de Hyprland → JSON (``None`` si falla)."""
-    if comando not in ("j/activewindow", "j/monitors") or not hasattr(asyncio, "open_unix_connection"):
+    """``j/activewindow``, ``j/monitors`` o ``j/clients`` por el socket de Hyprland → JSON (``None`` si falla).
+
+    Lee hasta que Hyprland cierra la conexión (una respuesta grande llega en varios trozos) y
+    como mucho ``MAX_RESPUESTA_HYPR`` bytes; una respuesta que no es JSON ("Invalid") da ``None``.
+    """
+    if (comando not in ("j/activewindow", "j/monitors", "j/clients")
+            or not hasattr(asyncio, "open_unix_connection")):
         return None
     ruta = _ruta_socket_hypr()
     if ruta is None:
@@ -1423,7 +1549,17 @@ async def _consulta_hypr_socket(comando: str, timeout: float = TIMEOUT_HYPR_S) -
         lector, escritor = await asyncio.wait_for(asyncio.open_unix_connection(str(ruta)), timeout=timeout)
         escritor.write(comando.encode("ascii"))
         await asyncio.wait_for(escritor.drain(), timeout=timeout)
-        datos = await asyncio.wait_for(lector.read(1 << 20), timeout=timeout)
+        partes: list[bytes] = []
+        total = 0
+        while True:
+            trozo = await asyncio.wait_for(lector.read(65536), timeout=timeout)
+            if not trozo:
+                break
+            partes.append(trozo)
+            total += len(trozo)
+            if total > MAX_RESPUESTA_HYPR:
+                raise ValueError("respuesta de Hyprland demasiado grande")
+        datos = b"".join(partes)
         return json.loads(datos.decode("utf-8", "replace")) if datos else None
     except asyncio.CancelledError:
         raise
@@ -1630,6 +1766,11 @@ class VisionContinua:
         self._detector_tipo: str | None = None
         self._ms_cam: float | None = None
         self._ultima_cam: MuestraCamara | None = None
+        # Último cuadro de la cámara (solo memoria; lo escribe el hilo y solo lo lee instantanea_jpeg).
+        self._cerrojo_cuadro = threading.Lock()
+        self._cuadro: Any = None
+        self._cuadro_ts = 0.0                       # time.monotonic() de la lectura
+        self._cuadro_gen = 0
         self._integrador = Integrador(hfov_deg=float(getattr(settings, "vision_hfov", 70.0) or 70.0),
                                       espejo=bool(getattr(settings, "vision_espejo", False)))
 
@@ -1968,6 +2109,7 @@ class VisionContinua:
                     parar.wait(0.2)
                     continue
                 fallos = 0
+                self._guardar_cuadro(gen, cuadro)   # solo para instantanea_jpeg (se sobrescribe)
                 # Cadencia fija: el periodo cuenta desde la cita anterior, no desde que terminó la
                 # lectura (en DSHOW la 2.ª lectura espera al cuadro siguiente); con retraso no
                 # se recupera a ráfagas: la siguiente lectura va en cuanto se pueda.
@@ -1977,12 +2119,13 @@ class VisionContinua:
                     muestra, previo = analizar(cuadro, previo, detector, hfov_deg=integrador.hfov_deg, tam=tam,
                                                base_yaw=integrador.base_yaw, base_pitch=integrador.base_pitch)
                 finally:
-                    del cuadro                       # el cuadro nunca sale de esta función
+                    del cuadro                       # solo queda la referencia de _guardar_cuadro
                 self._llamar_loop(loop, self._al_muestra_camara, gen, muestra)
         except Exception as exc:
             error = "error"
             log.warning("Fallo en el hilo de la cámara continua (%s)", type(exc).__name__)
         finally:
+            self._soltar_cuadro(gen)
             if captura is not None:
                 try:
                     captura.release()                # SIEMPRE, y desde este hilo: apaga el LED
@@ -2018,6 +2161,20 @@ class VisionContinua:
         parar = self._parar_cam
         if parar is not None:
             parar.set()
+
+    def _guardar_cuadro(self, gen: int, cuadro: Any) -> None:
+        """Hilo de cámara: guarda (sobrescribe) la referencia al último cuadro, solo en memoria."""
+        with self._cerrojo_cuadro:
+            self._cuadro = cuadro
+            self._cuadro_ts = time.monotonic()
+            self._cuadro_gen = gen
+
+    def _soltar_cuadro(self, gen: int | None = None) -> None:
+        """Olvida el último cuadro (pausa, apagado, cierre o fin del hilo de la generación ``gen``)."""
+        with self._cerrojo_cuadro:
+            if gen is None or self._cuadro_gen == gen:
+                self._cuadro = None
+                self._cuadro_ts = 0.0
 
     # -- callbacks en el loop -----------------------------------------------
 
@@ -2470,6 +2627,7 @@ class VisionContinua:
                 self._arrancar_camara()
         elif self._hilo_cam is not None:
             self._detener_camara()
+            self._soltar_cuadro()
         modo = self._pantalla_efectiva(ahora)
         self._pant_modo_actual = modo
         if modo in ("metadatos", "pixeles"):
@@ -2616,6 +2774,7 @@ class VisionContinua:
         self._cerrado = True
         try:
             self._detener_camara()
+            self._soltar_cuadro()
             self._detener_pantalla()
             tareas = [t for t in (*self._tareas, self._tarea_pant) if t is not None and not t.done()]
             for tarea in tareas:
@@ -2659,6 +2818,7 @@ class VisionContinua:
             else:
                 self._camara_runtime = False
                 self._detener_camara()
+                self._soltar_cuadro()
                 self._programar_tick()
             return self._estado_camara(self._reloj())
         except Exception as exc:
@@ -2699,6 +2859,7 @@ class VisionContinua:
             self._pausa_motivo = str(motivo or "usuario")[:32]
             self._pant_modo_actual = "pausada"
             self._detener_camara()
+            self._soltar_cuadro()
             self._detener_pantalla()
             self._programar_tick()
         except Exception as exc:  # defensa: nunca lanza
@@ -2731,6 +2892,20 @@ class VisionContinua:
         except Exception as exc:
             log.debug("estado() falló (%s)", type(exc).__name__)
             return EstadoVision("error", "off", 0.0, 0.0, 0, None, None, 0.0)
+
+    def pausada_por_usuario(self) -> bool:
+        """``True`` mientras dura la pausa que pidió el usuario ("deja de mirarme", ``pausar``).
+
+        ``estado().camara == "pausada"`` no basta para saberlo: también lo da la autopausa
+        (sesión bloqueada, usuario ausente, juego, batería, llamada), que no es una orden del
+        usuario. Una foto que el usuario pide ahora (p. ej. por Telegram) solo debe negarse por
+        esta pausa (y por la llamada, que ``como_vistazo`` ya da como ``ocupada``). Nunca lanza.
+        """
+        try:
+            return self._pausa_usuario_activa(self._reloj())
+        except Exception as exc:
+            log.debug("pausada_por_usuario falló (%s)", type(exc).__name__)
+            return True              # ante la duda, se respeta la privacidad
 
     def calibrar_atencion(self) -> None:
         """Línea base de "mira la pantalla" (main la llama en cada turno local: el usuario teclea)."""
@@ -2774,6 +2949,45 @@ class VisionContinua:
                                     brillo=m.brillo, motivo=texto)
         except Exception as exc:
             log.debug("como_vistazo falló (%s)", type(exc).__name__)
+            return None
+
+    def _instantanea_permitida(self) -> bool:
+        """Cámara continua abierta y sin pausa (del usuario ni autopausa por llamada, bloqueo…)."""
+        if self._cerrado or not self._cam_abierta:
+            return False
+        return self._estado_camara(self._reloj()) in ("continua", "degradada")
+
+    async def instantanea_jpeg(self, *, calidad: int = 85, max_lado: int = 1600) -> bytes | None:
+        """JPEG del último cuadro de la cámara continua (solo en memoria), o ``None``.
+
+        Solo si la cámara continua está abierta, no está en pausa (del usuario o autopausa) y el
+        cuadro es reciente (< 2 s, o 2,5 periodos si el ritmo es menor). La codificación va al
+        executor (``lobes.capturas.codificar_jpeg``) y el resultado se descarta si mientras tanto
+        llegó una pausa. No abre ningún dispositivo ni publica nada. Nunca lanza.
+        """
+        try:
+            if not self._instantanea_permitida():
+                return None
+            with self._cerrojo_cuadro:
+                cuadro, ts, gen = self._cuadro, self._cuadro_ts, self._cuadro_gen
+            frescura = max(FRESCURA_INSTANTANEA_S, 2.5 / max(0.5, self._fps_camara_objetivo()))
+            if cuadro is None or gen != self._gen_cam or time.monotonic() - ts > frescura:
+                return None
+            from lobes.capturas import codificar_jpeg  # diferido: capturas importa este módulo
+
+            loop = asyncio.get_running_loop()
+            ejecutor = self._ejecutor if self._ejecutor is not None and not self._cerrado else None
+            tarea = loop.run_in_executor(ejecutor, functools.partial(
+                codificar_jpeg, cuadro, calidad=calidad, max_lado=max_lado))
+            del cuadro
+            resultado = await asyncio.wait_for(tarea, TIMEOUT_INSTANTANEA_S)
+            if not resultado or not self._instantanea_permitida():
+                return None
+            return bytes(resultado[0])
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("instantanea_jpeg falló (%s)", type(exc).__name__)
             return None
 
     def _veto_vistazo(self, motivo: str, ahora: float) -> str | None:

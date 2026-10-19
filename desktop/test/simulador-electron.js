@@ -19,6 +19,7 @@ function crearElectronFalso({ cursor = { x: 1700, y: 900 }, escala = 1.5 } = {})
     notificaciones: [],
     abiertas: [],
     loginItems: [],
+    portapapeles: [], // textos que main.js copió (v0.2.2: solo el código de una tarjeta de script)
     sesiones: new Map(),
     app: { locks: [], quit: 0, exit: [], userModelId: null },
     cursor,
@@ -48,6 +49,7 @@ function crearElectronFalso({ cursor = { x: 1700, y: 900 }, escala = 1.5 } = {})
     setWindowOpenHandler(fn) { this.openHandler = fn; }
     getURL() { return this.url; }
     reloadIgnoringCache() { this.recargas += 1; }
+    reload() { this.recargas += 1; }
     executeJavaScript() { return Promise.resolve(true); }
 
     /** Simula que el documento `url` empieza a navegar y termina de cargar. */
@@ -57,6 +59,7 @@ function crearElectronFalso({ cursor = { x: 1700, y: 900 }, escala = 1.5 } = {})
       this.mainFrame = { parent: null, url, origin: u.protocol === 'file:' ? 'file://' : u.origin };
       this.emit('did-start-navigation', { url, isMainFrame: true, isSameDocument: false, frame: this.mainFrame });
       this.emit('did-finish-load');
+      this.win.emit('ready-to-show');
     }
 
     /** Evento IPC tal como lo vería ipcMain si viniera de este webContents. */
@@ -99,6 +102,21 @@ function crearElectronFalso({ cursor = { x: 1700, y: 900 }, escala = 1.5 } = {})
     showInactive() { this.visible = true; this.reg('showInactive'); }
     hide() { this.visible = false; this.enfocada = false; this.reg('hide'); }
     focus() { this.enfocada = true; this.reg('focus'); }
+    removeMenu() { this.reg('removeMenu'); }
+    /** Como Electron: 'close' se puede cancelar; si no, se destruye y emite 'closed'. */
+    close() {
+      this.reg('close');
+      let cancelado = false;
+      this.emit('close', { preventDefault: () => { cancelado = true; } });
+      if (cancelado) return;
+      this.destroy();
+    }
+    destroy() {
+      if (this.destruida) return;
+      this.destruida = true;
+      this.visible = false;
+      this.emit('closed');
+    }
     isVisible() { return this.visible; }
     isFocused() { return this.enfocada; }
   }
@@ -109,7 +127,12 @@ function crearElectronFalso({ cursor = { x: 1700, y: 900 }, escala = 1.5 } = {})
       this.nombre = nombre;
       this.handlers = {};
       this.webRequest = { onHeadersReceived: (fn) => { this.handlers.headers = fn; } };
+      this.protocolos = new Map();
+      this.protocol = { handle: (esquema, fn) => { this.protocolos.set(esquema, fn); } };
+      this.borrados = 0;
     }
+
+    clearStorageData() { this.borrados += 1; return Promise.resolve(); }
 
     setPermissionRequestHandler(fn) { this.handlers.request = fn; }
     setPermissionCheckHandler(fn) { this.handlers.check = fn; }
@@ -187,11 +210,20 @@ function crearElectronFalso({ cursor = { x: 1700, y: 900 }, escala = 1.5 } = {})
     },
     shell: { openExternal: (u) => { r.abiertas.push(u); return Promise.resolve(); } },
     Notification: NotificationFalsa,
+    // Portapapeles FALSO: nunca toca el del sistema.
+    clipboard: {
+      writeText: (t) => { r.portapapeles.push(t); },
+      readText: () => (r.portapapeles.length ? r.portapapeles.at(-1) : ''),
+    },
   };
+
+  BrowserWindowFalsa.getAllWindows = () => r.ventanas.filter((v) => !v.destruida);
 
   const ayuda = {
     overlay: () => r.ventanas.find((v) => v.opciones.title === 'Amadeus Overlay'),
     chat: () => r.ventanas.find((v) => v.opciones.title === 'Amadeus Chat'),
+    puter: () => r.ventanas.find((v) => v.opciones.title === 'Amadeus Puter'),
+    conectar: () => r.ventanas.filter((v) => v.opciones.title === 'Conectar Puter').at(-1),
     ipc: (canal, evento, ...args) => {
       const fn = r.ipcOn.get(canal);
       if (!fn) throw new Error(`sin manejador para ${canal}`);

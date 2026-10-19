@@ -32,6 +32,41 @@ v0.2 "Amadeus Companion" (``docs/COMPANION.md`` §C2.14, grupo ``orquestacion``)
 - Iniciativas con el overlay (aparecer, buscar al usuario), curiosidad web, borradores,
   "no molestar" (usuario y sistema) y la traducción de visión/escritorio al conectoma y a la
   presencia, todo con reglas deterministas (sin LLM).
+- Respaldo Puter (§C2.15): si ``puter_habilitado``, hay red (sin ``--offline``) y existe el enlace
+  ``/escritorio``, crea ``RespaldoPuter`` y se lo pasa a ``broca.set_respaldo``: cuando Gemini no
+  puede, Broca pide el texto a Puter.js dentro de Amadeus Desktop (cuenta de Puter del usuario).
+  Diagnóstico ``puter`` en el arranque y en ``/estado``.
+
+v0.2.1 (órdenes naturales, apps del menú Inicio y Telegram multimedia):
+- ``lanzar_app`` con ``args.local`` (Windows, ``RAMS_APPS_MENU_INICIO``): main resuelve el nombre
+  con ``ControlPC.resolver_app_local`` → compuerta (``nivel_app``) → ``ControlPC.lanzar_app_local``
+  (nunca ``aura.ejecutar``, R18 del diseño v0.3); una app confirmada se recuerda
+  (``aprobar_app_local``). Si no la encuentra, responde con nombres parecidos del menú Inicio.
+- Telegram (``RAMS_TELEGRAM_ACCIONES``): las acciones de bajo riesgo llegan con
+  ``args["canal"] = "telegram"``; cada una se anuncia en el PC (consola, chat de escritorio y
+  notificación) y queda en la auditoría.
+- ``enviar_foto`` (cámara o pantalla → Telegram del usuario; por Telegram exige
+  ``RAMS_TELEGRAM_FOTOS``): compuerta → ``lobes.capturas.capturar_jpeg`` →
+  ``riko.enviar_foto_telegram`` y aviso «📸 …» en el PC. Nunca se escribe una imagen a disco.
+- Audio: ``_manejar_telegram(texto, *, voz=False)``; con Gemini y ``RAMS_TELEGRAM_TRANSCRIBIR``,
+  ``riko.set_transcriptor(broca.transcribir_audio)``. La respuesta por Telegram va como nota de
+  voz si ``RAMS_TELEGRAM_AUDIO=siempre`` o (``auto`` y el usuario mandó voz o pidió audio).
+
+v0.2.2 «Correo, Drive y taller de scripts» (``docs/V022_CORREO_DRIVE_SCRIPTS.md`` §14):
+- Construye siempre ``CuentaGoogle``, ``Correo``, ``Drive`` y ``TallerScripts`` (opcionales: si faltan o
+  están apagados, su diagnóstico dice OFF y el motivo). Conectar Google va en segundo plano (el turno
+  no espera); la URL de respaldo solo se imprime en la consola.
+- Tarjetas aprobables: el borrador, la operación de Drive o el script se muestran con
+  ``tarjeta.mostrar`` (contenido completo, solo para ``/escritorio``) y su huella queda registrada en
+  la compuerta. La acción (``enviar_correo``, ``drive_*``, ``ejecutar_script``) nace SOLO al pulsar el
+  botón (``escritorio.tarjeta``), con ``origen="usuario"`` y la huella mostrada, y pasa una vez por
+  la compuerta, que consume la tarjeta. Las decisiones se serializan con ``_lock_tarjetas``.
+- Redacción «en la salida»: el cuerpo, el asunto y los destinatarios van crudos al módulo de correo
+  (su anti-secretos decide); el tema, los alias y la tarea se redactan con la regla del canal justo
+  antes de ir a Gemini. En un turno de correo, Broca y la memoria reciben un resumen sin cuerpo ni
+  direcciones. Las listas de Drive y la salida de un script nunca van a Gemini ni a Telegram.
+- Oferta del taller: sin intención, con una tarea del PC (``pide_tarea_pc``), ofrece un script; un
+  «sí» corto en el turno siguiente (``acepta_oferta``) lo genera.
 
 Dependencias: los módulos P0 (memoria, conectoma, Broca, permisos, presencia y salida) son
 obligatorios y se importan al iniciar; los P1/P2 (visión/PC, VTube Studio, web, HUD, control
@@ -49,6 +84,7 @@ import argparse
 import asyncio
 import dataclasses
 import hashlib
+import hmac
 import importlib
 import importlib.util
 import inspect
@@ -88,6 +124,7 @@ from core.contracts import (
     AccionPC,
     BrocaReply,
     ContextoBroca,
+    DecisionPermiso,
     DiagnosticoModulo,
     EstadoModulo,
     EstadoPresencia,
@@ -123,6 +160,46 @@ try:  # v0.2 (este grupo): constantes del enrutador
 except ImportError:  # enrutador v0.1
     MENSAJE_BUSCAR_DEFECTO = "Me pediste que te buscara"  # type: ignore[misc]
     NOTA_ESCRIBIR_DESPUES = "escribir_despues"  # type: ignore[misc]
+try:  # v0.2.1 (este grupo): "¿pidió la respuesta en audio?"
+    from core.intenciones import quiere_audio
+except ImportError:  # enrutador v0.2
+    def quiere_audio(texto: str) -> bool:  # type: ignore[misc]
+        return False
+try:  # v0.2.2 (este grupo): oferta del taller
+    from core.intenciones import acepta_oferta, pide_tarea_pc
+except ImportError:  # enrutador v0.2.1: sin oferta del taller
+    def pide_tarea_pc(texto: str) -> bool:  # type: ignore[misc]
+        return False
+
+    def acepta_oferta(texto: str) -> bool:  # type: ignore[misc]
+        return False
+try:  # v0.2.2 (grupo base): tarjetas aprobables y taller
+    from core.contracts import (
+        CORREO_RE,
+        DECISIONES_TARJETA,
+        HUELLA_RE,
+        ID_TARJETA_RE,
+        MAX_SALIDA_TARJETA,
+        TTL_TARJETA_S,
+        TTL_TARJETA_TELEGRAM_S,
+        huella_contenido,
+        largo_utf16,
+    )
+except ImportError:  # contratos v0.2.1: los valores de la spec (§3.1)
+    CORREO_RE = re.compile(  # type: ignore[misc]
+        r"^[A-Za-z0-9._%+\-]{1,64}@[A-Za-z0-9\-]{1,63}(?:\.[A-Za-z0-9\-]{1,63})*\.[A-Za-z]{2,24}$")
+    DECISIONES_TARJETA = ("aprobar", "aprobar_publico", "editar", "guardar", "descartar")  # type: ignore[misc]
+    HUELLA_RE = re.compile(r"^[0-9a-f]{64}$")  # type: ignore[misc]
+    ID_TARJETA_RE = re.compile(r"^[0-9a-f]{8}$")  # type: ignore[misc]
+    MAX_SALIDA_TARJETA = 8_192  # type: ignore[misc]
+    TTL_TARJETA_S = 1800.0  # type: ignore[misc]
+    TTL_TARJETA_TELEGRAM_S = 43200.0  # type: ignore[misc]
+
+    def huella_contenido(contenido: Any) -> str:  # type: ignore[misc]
+        return ""                                   # fail-closed: huella inválida
+
+    def largo_utf16(texto: Any) -> int:  # type: ignore[misc]
+        return sum(2 if ord(c) > 0xFFFF else 1 for c in texto) if isinstance(texto, str) else 0
 try:  # nombres legibles de los destinos y saneado del texto (core/permisos.py, este grupo)
     from core.permisos import nombre_destino, sanear_texto_accion
 except ImportError:  # compuerta v0.1
@@ -198,15 +275,21 @@ _NOMBRES_MODULO: Final = {
     "control": "Socket de control (MCP)",
     # v0.2
     "escritorio": "Amadeus Desktop (/escritorio)",
+    "puter": "Respaldo Puter (Amadeus Desktop)",
     "control_pc": "Control del PC",
     "vision_camara": "Visión continua (cámara)",
     "vision_pantalla": "Visión continua (pantalla)",
+    # v0.2.2
+    "google": "Cuenta de Google",
+    "correo": "Correo (Gmail)",
+    "drive": "Google Drive",
+    "taller": "Taller de scripts",
 }
 
-# Orden fijo de las líneas de módulos en el arranque (maqueta de §6.4, ampliada en la v0.2).
+# Orden fijo de las líneas de módulos en el arranque (maqueta de §6.4, ampliada en la v0.2 y la v0.2.2).
 _ORDEN_ARRANQUE: Final = ("broca", "camara", "telemetria", "hyprland", "vts", "avatar3d", "motor", "voz", "telegram",
-                          "web", "nexus", "hud", "escritorio", "control_pc", "vision_camara", "vision_pantalla",
-                          "control")
+                          "web", "nexus", "hud", "escritorio", "puter", "control_pc", "vision_camara",
+                          "vision_pantalla", "google", "correo", "drive", "taller", "control")
 
 # Tarea supervisada → clave de diagnóstico que pasa a DEGRADADO si se desactiva.
 _CLAVE_TAREA: Final = {"conectoma": "conectoma", "salida": "voz", "telemetria": "telemetria",
@@ -239,9 +322,53 @@ TTL_SOLICITUD_MOTOR_S: Final = 20.0
 TRAVESURAS_BASTA_S: Final = 7200.0            # 1.er "basta" del día: 2 h
 TRAVESURAS_ABORTO_S: Final = 7200.0           # el usuario movió el ratón: 2 h
 TTL_ULTIMO_DESTINO_S: Final = 120.0           # "abre whatsapp" → "escríbele a mamá: …"
+# --- v0.2.1: Telegram multimedia, órdenes remotas y apps del menú Inicio ----------
+PLAZO_VOZ_TELEGRAM_S: Final = 90.0            # síntesis + envío de una nota de voz
+PLAZO_FOTO_TELEGRAM_S: Final = 60.0           # captura + envío de una foto
+INSTRUCCION_AUDIO: Final = ("El usuario pidió que le respondas con una nota de voz: contesta breve y natural, "
+                            "como si le hablaras (sin listas ni enlaces).")
+# Motivo de lobes.capturas.ResultadoCaptura → explicación para el usuario (Broca la verbaliza).
+MENSAJES_CAPTURA: Final = {
+    "deshabilitada": "La cámara está desactivada (RAMS_CAMERA=0), así que no puedo tomar la foto.",
+    "sin_camara": "No encontré ninguna cámara conectada al computador.",
+    "camara_ocupada": "La cámara está ocupada por otra app ahora mismo.",
+    "ventana_sensible": "En la pantalla hay una ventana privada (contraseñas, banco o pagos): no la capturo.",
+    "sin_backend": "No tengo con qué capturar en este sistema (faltan mss u OpenCV).",
+    "error": "La captura falló.",
+    "pausada": "Me pediste que no te mirara: tengo la cámara en pausa.",
+    "fotos_desactivadas": ("Las fotos por Telegram están desactivadas: pon RAMS_TELEGRAM_FOTOS=1 en el .env y "
+                           "reinicia R.A.M.S."),
+    "sin_telegram": "No tengo Telegram configurado para mandártela (TELEGRAM_BOT_TOKEN y CHAT_ID).",
+    "envio": "Tomé la imagen, pero Telegram no la aceptó; inténtalo en un momento.",
+}
+# Leyendas cortas de las fotos (voz de Kurisu; nunca llevan datos de la pantalla).
+LEYENDAS_FOTO: Final = {
+    "camara": ("Aquí tienes. Y no, no me quedé mirando.", "Foto tomada. Te ves… funcional. Eso es un cumplido.",
+               "Ahí está. Si sales mal, culpa a la iluminación, no a mí."),
+    "pantalla": ("Tu pantalla, tal cual está ahora.", "Captura lista. No husmeé más de lo necesario.",
+                 "Esto es lo que hay en tu pantalla en este momento."),
+}
 _URL_HTTPS_RE: Final = re.compile(r"^https://[^\s<>\"']+$")
 _ID_CONFIRMACION_RE: Final = re.compile(r"^[0-9a-f]{8}$")
 _EXE_SEGURO_RE: Final = re.compile(r"[^A-Za-z0-9_.\- ]+")
+# --- v0.2.2: Google, correo, Drive y taller (docs/V022_CORREO_DRIVE_SCRIPTS.md §14) -----------
+TTL_OFERTA_TALLER_S: Final = 300.0            # «¿lo intento con un script?» vale 5 min
+TTL_TARJETA_SALIDA_S: Final = 1800.0          # la tarjeta "salida" de un script caduca a los 30 min
+MAX_TITULO_TARJETA: Final = 120
+MAX_RESUMEN_TARJETA: Final = 300
+MAX_AVISO_TARJETA: Final = 300
+MAX_MOTIVO_CIERRE: Final = 200
+MAX_TARJETAS_PUBLICADAS: Final = 32
+CLASES_APROBABLES: Final = ("correo", "drive", "script")
+_TIPO_ACCION_DRIVE: Final = {"subir": "drive_subir", "papelera": "drive_papelera", "compartir": "drive_compartir"}
+_NOMBRES_LENGUAJE: Final = {"powershell": "PowerShell", "python": "Python", "bash": "bash"}
+# Campos que la auditoría admite de las acciones v0.2.2 (§14.5): nunca contenido.
+_CAMPOS_AUDITORIA_V022: Final = frozenset({
+    "n_destinatarios", "n_adjuntos", "bytes", "asunto_len", "cuerpo_len", "cuerpo_sha256", "gmail_id", "codigo",
+    "op", "archivo_sha12", "rol", "publico", "lenguaje", "nivel", "huella12", "codigo_salida", "tiempo_agotado",
+    "dur_s", "bytes_salida", "servicios"})
+_CODIGOS_SCRIPT_CORRIDO: Final = frozenset({"ejecutado", "error_salida", "tiempo_agotado", "politica"})
+MENSAJE_ABRE_CHAT: Final = "Abre el chat de Amadeus Desktop o el del HUD para aprobarlo."
 
 _MESES: Final = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
                  "octubre", "noviembre", "diciembre")
@@ -268,6 +395,9 @@ _DESCRIPCION_COMANDOS: Final = {
     "/vision": ("/vision on|off|pausa [min]|estado", "visión continua local (cámara; opt-in)"),
     "/pantalla": ("/pantalla off|metadatos|pixeles", "qué mira la visión de la pantalla"),
     "/travesuras": ("/travesuras on|off", "travesuras con el cursor real (opt-in)"),
+    "/google": ("/google [estado|conectar|desconectar]", "cuenta de Google (Gmail y Drive)"),
+    "/script": ("/script <tarea>", "taller: escribe un script para revisar y aprobar"),
+    "/habilidades": ("/habilidades", "scripts guardados como habilidades"),
 }
 
 _CATEGORIAS_OBLIGATORIAS: Final = (
@@ -283,6 +413,8 @@ _CATEGORIAS_OBLIGATORIAS: Final = (
     "travesura_cursor", "basta_travesuras", "vision_pausada", "prerrellenar_confirma", "escribir_confirma",
     "escribir_haz_clic", "accion_abrir_ok", "confirmacion_pendiente_chat", "sin_borrador", "sin_borrador_sin_llm",
     "vistazo_presente_continua", "vistazo_ausente_continua", "iniciativa_curiosidad_visual_continua",
+    # v0.2.2
+    "taller_ofrece", "tarjeta_lista", "google_navegador",
 )
 _CATEGORIAS_MINIMO_2: Final = frozenset({"bitacora", "logro"})
 
@@ -422,6 +554,44 @@ def _intencion_redactada(intencion: Intencion, secretos: Sequence[str], *, alta_
                 args[clave] = redactado
                 cambio = True
     return dataclasses.replace(intencion, args=args) if cambio else intencion
+
+
+def _recortar_utf16(texto: str, maximo: int, marca: str = "…") -> tuple[str, bool]:
+    """``texto`` con como mucho ``maximo`` unidades UTF-16 (como ``String.length``), conservando el principio
+    y terminando en ``marca`` si recortó. ``(texto, recortado)``. Nunca parte un carácter fuera del BMP."""
+    texto = str(texto or "")
+    if largo_utf16(texto) <= maximo:
+        return texto, False
+    limite = max(0, maximo - largo_utf16(marca))
+    unidades = 0
+    fin = 0
+    for indice, caracter in enumerate(texto):
+        paso = 2 if ord(caracter) > 0xFFFF else 1
+        if unidades + paso > limite:
+            break
+        unidades += paso
+        fin = indice + 1
+    return texto[:fin] + marca, True
+
+
+def _corto(texto: Any, maximo: int) -> str:
+    """Texto informativo de una tarjeta en una línea y con como mucho ``maximo`` unidades UTF-16."""
+    limpio = " ".join(str(texto or "").split())
+    return _recortar_utf16(limpio, maximo)[0]
+
+
+def _textos(valor: Any, maximo: int = 10) -> list[str]:
+    """Lista de textos no vacíos de un argumento de intención (los demás se descartan)."""
+    if not isinstance(valor, (list, tuple)):
+        return []
+    return [v for v in valor if isinstance(v, str) and v.strip()][:maximo]
+
+
+def _conteo(valor: Any, maximo: int = 999) -> int:
+    """Entero ≥ 0 de un argumento de intención (``0`` si no lo es; nunca un ``bool``)."""
+    if isinstance(valor, bool) or not isinstance(valor, int):
+        return 0
+    return max(0, min(valor, maximo))
 
 
 def _con_detalle(reply: BrocaReply, detalle: str) -> BrocaReply:
@@ -1027,6 +1197,11 @@ class Orquestador:
         self.control: Any = None
         self.control_pc: Any = None  # v0.2: lobes/control_pc.py (apps, teclado y cursor)
         self.vision: Any = None      # v0.2: lobes/vision_continua.py (cámara y pantalla en local)
+        self.puter: Any = None       # v0.2: RespaldoPuter (IA de respaldo de Broca vía Amadeus Desktop)
+        self.google: Any = None      # v0.2.2: lobes/google_cuenta.py (OAuth de Gmail y Drive)
+        self.correo: Any = None      # v0.2.2: lobes/correo.py (borradores y envío con tarjeta)
+        self.drive: Any = None       # v0.2.2: lobes/drive.py
+        self.taller: Any = None      # v0.2.2: lobes/taller_scripts.py
         self._cliente = cliente
         self._cliente_propio = False
         # Estado propio (§10.21)
@@ -1099,6 +1274,18 @@ class Orquestador:
         self._temas_recientes: deque[str] = deque(maxlen=5)
         self._agenda_buscar: set[int] = set()
         self._ultimo_turno_local_mono = float("-inf")
+        # --- v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §14) ---
+        self._clientes_escritorio = 0                    # escritorio.conectado.clientes (Desktop, RINE, móvil)
+        self._oferta_taller: dict[str, Any] | None = None   # {"tarea", "canal", "ts"}
+        self._lock_tarjetas = asyncio.Lock()             # serializa las decisiones de las tarjetas
+        self._tarjetas_info: dict[str, dict[str, Any]] = {}       # tarjetas "salida": id → {"datos", "caduca"}
+        self._tarjetas_publicadas: dict[str, dict[str, Any]] = {}  # id → último tarjeta.mostrar (sin logs)
+        # Anti doble clic entre reaperturas (§14.4): cada botón recibido lleva un número creciente; al reabrir
+        # una tarjeta tras ejecutarla o fallar (misma id y misma huella) se anota el último número recibido.
+        # Un «aprobar» con número ≤ esa marca se pulsó sobre la versión anterior: nunca ejecuta otra vez.
+        self._n_boton_tarjeta = 0
+        self._reabierta_tras_boton: dict[str, int] = {}
+        self._estado_google: dict[str, Any] | None = None
 
     # ------------------------------------------------------------------
     # Construcción y arranque
@@ -1182,6 +1369,73 @@ class Orquestador:
         else:
             log.info("aura no admite fuente continua (set_fuente_continua); pendiente de integración")
 
+    def _configurar_respaldo_puter(self) -> None:
+        """Respaldo Puter de Broca (§C2.15): ``RespaldoPuter`` sobre ``/escritorio`` → ``broca.set_respaldo``.
+
+        Solo si ``puter_habilitado`` (``RAMS_PUTER``, defecto sí), con tope diario > 0
+        (``PUTER_MAX_CALLS_DAY``), sin ``--offline`` (Puter es un servicio en línea) y con el enlace
+        ``/escritorio`` del HUD. Si no, diagnóstico ``OFF`` con el motivo. Nunca lanza: sin respaldo,
+        Broca sigue con Gemini y el banco local.
+        """
+        s = self.settings
+        nombre = _NOMBRES_MODULO["puter"]
+
+        def ausente(estado: EstadoModulo, detalle: str) -> None:
+            self._diag_ausentes["puter"] = DiagnosticoModulo("puter", nombre, estado, detalle)
+
+        if not getattr(s, "puter_habilitado", True):
+            ausente(EstadoModulo.OFF, "deshabilitado (RAMS_PUTER=0)")
+            return
+        tope = getattr(s, "puter_max_llamadas_dia", None)
+        if isinstance(tope, int) and not isinstance(tope, bool) and tope <= 0:
+            ausente(EstadoModulo.OFF, "tope diario 0 (PUTER_MAX_CALLS_DAY=0)")
+            return
+        if s.offline:
+            ausente(EstadoModulo.OFF, "modo offline")
+            return
+        enlace = getattr(self.hud, "escritorio", None) if self.hud is not None else None
+        if enlace is None:
+            detalle = ("sin /escritorio (RAMS_ESCRITORIO=0)" if not getattr(s, "tiene_escritorio", False)
+                       else "sin /escritorio")
+            ausente(EstadoModulo.OFF, detalle)
+            return
+        set_respaldo = getattr(self.broca, "set_respaldo", None)
+        if not callable(set_respaldo):
+            log.warning("El Área de Broca no admite un proveedor de respaldo: Puter no se usará")
+            ausente(EstadoModulo.OFF, "Broca sin respaldo")
+            return
+        modelo = getattr(s, "puter_modelo", "")
+        try:
+            clase = getattr(importlib.import_module("interface.escritorio_link"), "RespaldoPuter")
+            respaldo = clase(enlace, modelo=modelo if isinstance(modelo, str) else "")
+        except Exception as exc:
+            detalle = _detalle_import("interface.escritorio_link", exc)
+            log.warning("No se pudo crear el respaldo Puter (%s); sigo sin él", detalle)
+            ausente(EstadoModulo.DEGRADADO, detalle)
+            return
+        try:
+            set_respaldo(respaldo)
+        except Exception as exc:
+            log.warning("broca.set_respaldo falló (%s): Puter no se usará", type(exc).__name__)
+            respaldo.desvincular()
+            ausente(EstadoModulo.DEGRADADO, "Broca rechazó el respaldo")
+            return
+        self.puter = respaldo
+        primero = bool(getattr(s, "puter_primero", False))
+        log.info("Respaldo Puter preparado (%s; %s)", "antes que Gemini" if primero else "después de Gemini",
+                 respaldo.modelo or "modelo por defecto de Amadeus Desktop")
+
+    def _diagnostico_puter(self) -> DiagnosticoModulo:
+        """``puter.diagnostico()`` o un ``DEGRADADO`` si falla (nunca lanza)."""
+        try:
+            diag = self.puter.diagnostico()
+        except Exception as exc:
+            log.warning("Diagnóstico del respaldo Puter falló: %s", type(exc).__name__)
+            diag = None
+        if isinstance(diag, DiagnosticoModulo):
+            return diag
+        return DiagnosticoModulo("puter", _NOMBRES_MODULO["puter"], EstadoModulo.DEGRADADO, "diagnóstico falló")
+
     def _ruta_datos(self, nombre: str) -> Path:
         return Path(self.settings.data_dir) / nombre
 
@@ -1212,6 +1466,50 @@ class Orquestador:
         except Exception as exc:
             log.debug("pids_excluidos no disponible (%s)", type(exc).__name__)
             return frozenset()
+
+    # --- v0.2.1: compuerta con apps locales, transcriptor de Telegram ---------
+
+    def _nivel_app_local(self, clave: str) -> tuple[str, str] | None:
+        """``ControlPC.nivel_app_local`` para la compuerta (``None`` si no hay índice o falla)."""
+        fuente = getattr(self.control_pc, "nivel_app_local", None) if self.control_pc is not None else None
+        if not callable(fuente):
+            return None
+        try:
+            return fuente(clave)
+        except Exception as exc:
+            log.debug("nivel_app_local falló (%s)", type(exc).__name__)
+            return None
+
+    def _crear_compuerta(self, clase: Any) -> Any:
+        """``CompuertaPermisos`` con la consola, los pids de Amadeus Desktop, las travesuras y (v0.2.1)
+        el índice de apps del menú Inicio. Tolera una compuerta que aún no acepte ``nivel_app``."""
+        base: dict[str, Any] = {"preguntar": self.consola.imprimir_sistema, "pids_extra": self._pids_extra,
+                                "travesuras_activas": self._travesuras_efectivas}
+        try:
+            return clase(self.settings, self.bus, nivel_app=self._nivel_app_local, **base)
+        except TypeError:
+            log.info("La compuerta no admite apps del menú Inicio (nivel_app); sigo sin ellas")
+            return clase(self.settings, self.bus, **base)
+
+    def _conectar_transcriptor(self) -> None:
+        """``riko.set_transcriptor(broca.transcribir_audio)`` si ``RAMS_TELEGRAM_TRANSCRIBIR`` y hay Gemini."""
+        s = self.settings
+        if self.riko is None or self.broca is None:
+            return
+        fijar = getattr(self.riko, "set_transcriptor", None)
+        if not callable(fijar):
+            log.info("La mensajería no admite notas de voz entrantes (set_transcriptor); sigo sin ellas")
+            return
+        transcribir = getattr(self.broca, "transcribir_audio", None)
+        activo = (bool(getattr(s, "telegram_transcribir", True)) and bool(getattr(s, "tiene_gemini", False))
+                  and callable(transcribir))
+        try:
+            fijar(transcribir if activo else None)
+        except Exception as exc:
+            log.warning("No se pudo conectar el transcriptor de Telegram: %s", type(exc).__name__)
+            return
+        if activo:
+            log.info("Notas de voz de Telegram: se transcriben con Gemini")
 
     async def iniciar(self, *, lanzar_tareas: bool = True, imprimir_arranque: bool = True) -> list[DiagnosticoModulo]:
         """Construye y conecta los módulos (orden normativo de §10.21), hace los diagnósticos y,
@@ -1264,6 +1562,8 @@ class Orquestador:
         # 3. Área de Broca.
         clase_broca = _importar_obligatorio("lobes.broca_llm", "BrocaLLM")
         self.broca = clase_broca(s, cliente=self._cliente)
+        # 3b. v0.2: respaldo Puter de Broca sobre /escritorio (necesita el HUD ya construido).
+        self._configurar_respaldo_puter()
 
         # 4. Memoria (Salieri consolida y lo anuncia por el bus).
         clase_memoria = _importar_obligatorio("core.memory_engine", "MemoryEngine")
@@ -1290,8 +1590,7 @@ class Orquestador:
         # también llegan al chat de escritorio como botones). pids_extra: ventanas de Amadeus
         # Desktop; travesuras_activas: estado efectivo de main (§C2.14.4).
         clase_permisos = _importar_obligatorio("core.permisos", "CompuertaPermisos")
-        self.permisos = clase_permisos(s, self.bus, preguntar=self.consola.imprimir_sistema,
-                                       pids_extra=self._pids_extra, travesuras_activas=self._travesuras_efectivas)
+        self.permisos = self._crear_compuerta(clase_permisos)
 
         # 8. Lóbulos periféricos (P1/P2, opcionales).
         self.aura = self._construir_opcional(
@@ -1301,6 +1600,16 @@ class Orquestador:
                                               lambda cls: cls(s, self.bus))
         self.web = self._construir_opcional("lobes.web_researcher", "WebResearcher", ("web",),
                                             lambda cls: cls(s, cliente=self._cliente))
+        # v0.2.2: cuenta de Google, correo, Drive y taller. Se construyen SIEMPRE (aunque estén apagados:
+        # su diagnóstico dice OFF y el motivo). El taller recibe a Broca como generador si hay Gemini.
+        self.google = self._construir_opcional("lobes.google_cuenta", "CuentaGoogle", ("google",),
+                                               lambda cls: cls(s, self.bus, cliente=self._cliente))
+        self.correo = self._construir_opcional("lobes.correo", "Correo", ("correo",),
+                                               lambda cls: cls(s, self.google, self.bus))
+        self.drive = self._construir_opcional("lobes.drive", "Drive", ("drive",),
+                                              lambda cls: cls(s, self.google, self.bus))
+        self.taller = self._construir_opcional("lobes.taller_scripts", "TallerScripts", ("taller",),
+                                               lambda cls: cls(s, self.bus, generador=self._generador_script()))
         # Avatar 3D VRM (VTuber AI Studio): escucha el bus; no sustituye a VTube Studio.
         if getattr(s, "vtuber_ai_habilitado", False):
             self.avatar3d = self._construir_opcional(
@@ -1325,6 +1634,8 @@ class Orquestador:
         self.riko = clase_riko(s, self.bus, avatar=self.vtube, memoria=self.memoria,
                                presencia=self.presencia.estado, cliente=self._cliente,
                                imprimir=self.consola.imprimir_amadeus)
+        # 10b. v0.2.1: notas de voz de Telegram → texto (Gemini, modelo ligero).
+        self._conectar_transcriptor()
 
         # 11. Socket de control para el puente MCP de Nexus.
         self.control = self._construir_opcional("core.control_server", "ServidorControl", ("control",),
@@ -1345,6 +1656,8 @@ class Orquestador:
         self._diags_arranque = list(diags)
         # v0.2: la corteza y el chat conocen el estado efectivo de las travesuras desde el arranque.
         self._publicar_travesuras(forzar=True)
+        # v0.2.2: Broca conoce desde el arranque qué herramientas de Google y del taller hay.
+        self._actualizar_herramientas()
         self._ultimo_campo = self.conectoma.estado().campo
         self._ultima_fuente = self.conectoma.estado().fuente
 
@@ -1448,6 +1761,14 @@ class Orquestador:
             trabajos.append((("control_pc",), self.control_pc.iniciar, 4.0))
         if self.vision is not None:
             trabajos.append((("vision_camara", "vision_pantalla"), self.vision.iniciar, 4.0))
+        # v0.2.2: la cuenta de Google primero (carga el token, sin red) y después correo y Drive, que
+        # dependen de ella; el taller va aparte. Cada uno con wait_for(…, 4).
+        claves_google = tuple(c for c, m in (("google", self.google), ("correo", self.correo),
+                                             ("drive", self.drive)) if m is not None)
+        if claves_google:
+            trabajos.append((claves_google, self._iniciar_google, 12.5))
+        if self.taller is not None:
+            trabajos.append((("taller",), self.taller.iniciar, 4.0))
         resultados = await asyncio.gather(*(self._medir(f, t) for _c, f, t in trabajos))
 
         por_clave: dict[str, DiagnosticoModulo] = {}
@@ -1496,6 +1817,10 @@ class Orquestador:
         if self.hud is not None and getattr(s, "tiene_escritorio", False):
             por_clave["escritorio"] = self._diagnostico_escritorio()
             tiempos["escritorio"] = time.monotonic() - self._inicio_mono
+        # v0.2: respaldo Puter (después del HUD: depende de /escritorio y de la app conectada).
+        if self.puter is not None:
+            por_clave["puter"] = self._diagnostico_puter()
+            tiempos["puter"] = time.monotonic() - self._inicio_mono
         for clave, diag in self._diag_ausentes.items():
             por_clave.setdefault(clave, diag)
             tiempos.setdefault(clave, time.monotonic() - self._inicio_mono)
@@ -1503,6 +1828,34 @@ class Orquestador:
         diags = [por_clave[c] for c in orden if c in por_clave]
         diags.extend(d for c, d in por_clave.items() if c not in orden)
         return diags, tiempos
+
+    async def _iniciar_google(self) -> list[DiagnosticoModulo]:
+        """``iniciar()`` de la cuenta de Google y, después, de correo y Drive (v0.2.2), cada uno ≤ 4 s."""
+        diags: list[DiagnosticoModulo] = []
+        for clave, modulo in (("google", self.google), ("correo", self.correo), ("drive", self.drive)):
+            if modulo is None:
+                continue
+            nombre = _NOMBRES_MODULO[clave]
+            try:
+                diag = await asyncio.wait_for(_quizas_await(modulo.iniciar()), timeout=4.0)
+            except asyncio.CancelledError:
+                raise
+            except asyncio.TimeoutError:
+                diag = DiagnosticoModulo(clave, nombre, EstadoModulo.SIN_CONEXION, "sin respuesta en 4 s")
+            except Exception as exc:
+                log.warning("iniciar() de %s falló: %s", clave, type(exc).__name__)
+                diag = DiagnosticoModulo(clave, nombre, EstadoModulo.DEGRADADO,
+                                         f"diagnóstico falló: {type(exc).__name__}")
+            if isinstance(diag, DiagnosticoModulo):
+                diags.append(diag)
+        return diags
+
+    def _generador_script(self) -> Callable[..., Awaitable[Any]] | None:
+        """``broca.generar_script`` si Broca lo ofrece y hay clave de Gemini; si no, ``None`` (§14.1)."""
+        generar = getattr(self.broca, "generar_script", None) if self.broca is not None else None
+        if callable(generar) and bool(getattr(self.settings, "tiene_gemini", False)):
+            return generar
+        return None
 
     def _diagnostico_escritorio(self) -> DiagnosticoModulo:
         """``hud.diagnostico_escritorio()`` (grupo escritorio-ws) o un ``OFF`` si aún no existe."""
@@ -1626,8 +1979,11 @@ class Orquestador:
             "voz": "Salida de voz",
             "telegram": "Mensajería (Telegram/RINE)", "web": "Investigación web", "nexus": "Nexus IDE",
             "hud": "HUD", "control": "Socket de control (MCP)",
-            "escritorio": "Amadeus Desktop (/escritorio)", "control_pc": "Control del PC",
+            "escritorio": "Amadeus Desktop (/escritorio)", "puter": "Respaldo Puter (Amadeus Desktop)",
+            "control_pc": "Control del PC",
             "vision_camara": "Visión continua (cámara)", "vision_pantalla": "Visión continua (pantalla)",
+            "google": "Cuenta de Google", "correo": "Correo (Gmail)", "drive": "Google Drive",
+            "taller": "Taller de scripts",
         }
         for clave in _ORDEN_ARRANQUE:
             diag = diags.get(clave)
@@ -1805,6 +2161,9 @@ class Orquestador:
             sub("vision.estado", self._ev_vision_estado),
             sub("pantalla.estado", self._ev_pantalla_estado),
             sub("pantalla.estimulo", self._ev_pantalla_estimulo),
+            # v0.2.2 (§11): botones de las tarjetas (privado, solo main) y estado de la cuenta de Google.
+            sub("escritorio.tarjeta", self._ev_escritorio_tarjeta),
+            sub("google.estado", self._ev_google_estado),
         ]
 
     def _inyectar(self, evento: str, **datos: Any) -> None:
@@ -2107,8 +2466,12 @@ class Orquestador:
         self._recalcular_no_molestar()
 
     def _ev_escritorio_conectado(self, evento: Evento) -> None:
-        """Electron conectado/desconectado (nunca se usa ``clientes`` para decidir)."""
+        """Electron conectado/desconectado. v0.2.2: ``clientes`` solo sirve para avisar de que, sin ningún
+        cliente de ``/escritorio``, una tarjeta no se puede aprobar («abre el chat…»)."""
         self._overlay_conectado = bool(evento.datos.get("overlay"))
+        clientes = evento.datos.get("clientes")
+        if isinstance(clientes, int) and not isinstance(clientes, bool) and clientes >= 0:
+            self._clientes_escritorio = clientes
         if not self._overlay_conectado:
             self._overlay_visible = False
         # Un cliente nuevo no conoce el estado: se reenvía el de las travesuras.
@@ -2572,6 +2935,7 @@ class Orquestador:
         await self._evaluar_no_molestar()
         self._publicar_travesuras()      # publica solo si vence apagadas_hasta_ts (cambio efectivo)
         self._refrescar_rostro()
+        self._purgar_tarjetas()          # v0.2.2: las tarjetas caducadas se cierran
 
     def _refrescar_rostro(self) -> None:
         """``registrar_rostro(True)`` cada 30 s mientras ``vision.estado().presente is True``."""
@@ -2643,6 +3007,10 @@ class Orquestador:
             return "terminal"
         if intencion.explicacion_tecnica:
             return "terminal_largo"          # nunca va a voz
+        # v0.2.1: "háblame" / "respóndeme por audio" en local pide la voz (también desde el chat).
+        if intencion.tipo == "pedir_audio" and intencion.args.get("destino") != "telegram" \
+                and self.riko.voz_disponible:
+            return "voz"
         # v0.2: el chat de escritorio responde por texto (chat y globo, labios mudos) salvo
         # RAMS_ESCRITORIO_VOZ=1, que aplica la regla de voz de la v0.1.
         if canal_entrada == "escritorio" and not getattr(self.settings, "escritorio_voz", False):
@@ -2689,11 +3057,15 @@ class Orquestador:
             return
         self._crear_tarea(self._turno_serializado(linea, "terminal"), "turno")
 
-    async def _manejar_telegram(self, texto: str) -> None:
-        """Mensaje de Telegram (ya filtrado por riko): turno serializado en segundo plano."""
+    async def _manejar_telegram(self, texto: str, *, voz: bool = False) -> None:
+        """Mensaje de Telegram (ya filtrado por riko): turno serializado en segundo plano.
+
+        ``voz`` (v0.2.1): el texto viene de una nota de voz transcrita; con
+        ``RAMS_TELEGRAM_AUDIO=auto`` la respuesta vuelve también como nota de voz.
+        """
         if self._apagando:
             return
-        self._crear_tarea(self._turno_serializado(texto, "telegram"), "turno_telegram")
+        self._crear_tarea(self._turno_serializado(texto, "telegram", voz=bool(voz)), "turno_telegram")
 
     def _crear_tarea(self, corrutina: Awaitable[Any], nombre: str) -> asyncio.Task[Any]:
         tarea = asyncio.ensure_future(corrutina)
@@ -2701,11 +3073,14 @@ class Orquestador:
         tarea.add_done_callback(self._tareas_sueltas.discard)
         return tarea
 
-    async def _turno_serializado(self, texto: str, canal: str) -> None:
+    async def _turno_serializado(self, texto: str, canal: str, *, voz: bool = False) -> None:
         """Toma ``_lock_turno`` y procesa el turno; un error nunca tumba nada (frase ``error_propio``)."""
         async with self._lock_turno:
             try:
-                await self.procesar_entrada(texto, canal)
+                if voz:
+                    await self.procesar_entrada(texto, canal, voz=True)
+                else:
+                    await self.procesar_entrada(texto, canal)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -2727,8 +3102,11 @@ class Orquestador:
     # Turno (§10.21, 9 pasos)
     # ------------------------------------------------------------------
 
-    async def procesar_entrada(self, texto: str, canal: str = "terminal") -> BrocaReply | None:
-        """Procesa una entrada del usuario y devuelve la respuesta (``None`` para comandos y confirmaciones)."""
+    async def procesar_entrada(self, texto: str, canal: str = "terminal", *, voz: bool = False) -> BrocaReply | None:
+        """Procesa una entrada del usuario y devuelve la respuesta (``None`` para comandos y confirmaciones).
+
+        ``voz`` (v0.2.1): el texto es la transcripción de una nota de voz de Telegram.
+        """
         texto = str(texto or "").strip()
         if not texto or self._apagando:
             return None
@@ -2786,16 +3164,16 @@ class Orquestador:
         # Los payloads del bus nunca llevan secretos (§5): se publica el texto ya redactado.
         self.bus.publicar("usuario.entrada", {"texto": texto_seguro, "canal": canal}, origen="main")
 
-        # 2. Intención (sin LLM) y comandos. v0.2: sinónimos de RAMS_DESTINOS y, en los canales
-        # locales, lanzar_app (RAMS_APPS) solo en Linux.
+        # 2. Intención (sin LLM) y comandos. v0.2: sinónimos de RAMS_DESTINOS y lanzar_app
+        # (RAMS_APPS) solo en Linux. v0.2.1: apps del menú Inicio en Windows y, por Telegram, las
+        # acciones de bajo riesgo si RAMS_TELEGRAM_ACCIONES=1.
         ahora = ahora_local(s)
-        intencion = enrutar(texto, ahora=ahora, apps=s.apps_permitidas, canal=canal,
-                            destinos=getattr(s, "destinos_permitidos", None),
-                            plataforma=sys.platform if local else None)
+        intencion = self._enrutar(texto, ahora, canal)
         entrada_broca: str | None = texto_seguro
         texto_turno = texto_seguro
         instruccion_extra: str | None = None
         frase_fija: tuple[str, dict[str, Any]] | None = None   # v0.2: respuesta local sin Broca
+        desde_comando = False                                   # v0.2.2: /google, /script, /habilidades
         if intencion.tipo == "comando":
             comando = str(intencion.args.get("comando", ""))
             resto = str(intencion.args.get("resto", ""))
@@ -2805,6 +3183,11 @@ class Orquestador:
                     return None
                 intencion = Intencion("buscar_web", {"consulta": resto},
                                       explicacion_tecnica=intencion.explicacion_tecnica)
+            elif comando in ("/google", "/script", "/habilidades"):
+                convertida = await self._intencion_de_comando_v022(comando, resto, canal)
+                if convertida is None:
+                    return None
+                intencion, desde_comando = convertida, True
             elif comando == "/devolver_llamada":
                 instruccion_extra = await self._instruccion_devolver_llamada()
                 entrada_broca = None
@@ -2821,6 +3204,10 @@ class Orquestador:
         accion_pendiente: ResultadoAccion | None = None
         if entrada_broca is not None:
             intencion, accion_pendiente = self._resolver_programar_pendiente(texto, intencion, ahora, canal)
+        # 2b'. v0.2.2: oferta del taller del turno anterior. Un «sí» corto (mismo canal local, ≤ 5 min)
+        # la acepta; cualquier otro mensaje la anula.
+        if entrada_broca is not None and not desde_comando:
+            intencion = self._resolver_oferta_taller(texto, intencion, canal)
         # 2c. Los argumentos de la intención salen del texto crudo: se redactan aquí, una sola vez y
         # con la regla del canal, antes de llegar a la memoria, la agenda, el bus, la red o Broca.
         intencion = _intencion_redactada(intencion, secretos, alta_entropia=alta)
@@ -2888,6 +3275,9 @@ class Orquestador:
                 self.presencia.registrar_rostro(vision.rostro)
                 if vision.error is None:
                     self._stats["vistazos"] += 1
+        elif tipo == "accion_pc" and not await self._es_orden_de_app(args):
+            # v0.2.1: "pon <algo>" que no es una app única del menú Inicio: es conversación.
+            intencion = Intencion("ninguna", {}, explicacion_tecnica=intencion.explicacion_tecnica)
         elif tipo == "accion_pc":
             accion_usuario = self._ajustar_accion_usuario(args)
             accion, error_propio = await self._accion_pc(accion_usuario, canal=canal)
@@ -2948,6 +3338,29 @@ class Orquestador:
                 frase_fija = ("vision_pausada", {})
             else:
                 accion = ResultadoAccion(True, mensaje, accion_tipo="vision")
+        # v0.2.1: fotos a Telegram y respuestas en audio.
+        elif tipo == "enviar_foto":
+            accion = await self._enviar_foto(str(args.get("fuente") or ""), canal)
+        elif tipo == "pedir_audio":
+            instruccion_extra = (f"{instruccion_extra} {INSTRUCCION_AUDIO}" if instruccion_extra
+                                 else INSTRUCCION_AUDIO)
+        # v0.2.2 (§14.2): cuenta de Google, correo, Drive y taller. Sus fallos no son errores propios
+        # (no inyectan «error» en el conectoma), salvo una excepción interna.
+        elif tipo in ("google", "correo", "drive", "taller"):
+            accion, resumen_turno, error_propio = await self._turno_v022(tipo, args, canal, alta, texto_seguro)
+            if resumen_turno is not None:
+                # Turno de correo: Broca y la memoria reciben un resumen sin cuerpo ni direcciones.
+                entrada_broca = resumen_turno
+                texto_turno = resumen_turno
+            if desde_comando:
+                if accion is not None and accion.accion_tipo not in ("google_estado", "taller_habilidades"):
+                    await self._salida_comando(accion.mensaje, canal)
+                return None
+        elif (tipo == "ninguna" and accion is None and entrada_broca is not None
+              and self._ofrecer_taller(texto, texto_seguro, canal)):
+            # v0.2.2: sin herramienta para una tarea del PC, Amadeus ofrece escribir un script.
+            accion = ResultadoAccion(True, "No tengo herramienta para eso; ofrécele escribir un script y que lo "
+                                           "apruebe en la tarjeta", accion_tipo="taller_oferta")
         if accion is not None and not accion.ok and tipo in ("accion_pc", "recordar", "programar",
                                                              "publicar_borrador", "recordatorio_personal"):
             self._inyectar("error", severidad=0.3)
@@ -3026,14 +3439,16 @@ class Orquestador:
                                            etiquetas=reply.etiquetas)
         self._stats["turnos"] += 1
         if entrada_broca is not None:
-            self._temas.append(texto_seguro[:60])
+            # v0.2.2: texto_turno (= texto_seguro, salvo el resumen sin contenido de un turno de correo).
+            self._temas.append(texto_turno[:60])
         # v0.2 (§C2.14.8): el último borrador es una respuesta de Broca (redactada por el LLM) a
         # un turno LOCAL de conversación; nunca de Nexus, iniciativas, Telegram, una acción ni la
         # web: un turno con resultados de búsqueda, vistazo o captura (contenido de terceros que
         # puede traer una inyección de prompt) no deja borrador publicable (§C2.12 "Origen").
         if (local and frase_fija is None and entrada_broca is not None and reply.fuente != "local"
                 and intencion.tipo in ("ninguna", "memoria_consulta") and busqueda_web is None
-                and ctx.vision is None and png is None and reply.texto_plano):
+                and ctx.vision is None and png is None and reply.texto_plano
+                and (accion is None or accion.accion_tipo != "taller_oferta")):
             self._ultimo_borrador = (reply.texto_plano[:MAX_BORRADOR], self._reloj())
         elif local and reply.fuente != "local" and (busqueda_web is not None or ctx.vision is not None
                                                     or png is not None):
@@ -3041,7 +3456,13 @@ class Orquestador:
             # olvida el borrador anterior para no publicar por sorpresa un texto más viejo.
             self._ultimo_borrador = None
 
-        # 8. Salida por el canal elegido.
+        # 8. Salida por el canal elegido. v0.2.1: por Telegram puede ir como nota de voz (y "mándame
+        # un audio al telegram" desde el PC también); si la nota falla, va el texto de siempre.
+        if self._responder_con_nota_de_voz(canal, intencion, texto, voz):
+            if await self._enviar_nota_de_voz(reply):
+                if canal != "telegram":
+                    await self.riko.decir(reply, origen="respuesta", canal=canal_salida)
+                return reply
         await self.riko.decir(reply, origen="respuesta", canal=canal_salida)
         # 9.
         return reply
@@ -3224,6 +3645,1681 @@ class Orquestador:
             texto = f"Recordatorio para {cuando}: {mensaje}."
         return ResultadoAccion(True, texto, {"id": item_id, "tipo": tipo}, accion_tipo="programar")
 
+    # --- v0.2.1: enrutado, apps del menú Inicio, fotos y notas de voz ------------
+
+    def _apps_locales_activas(self) -> bool:
+        """Apps del menú Inicio por nombre: Windows y ``RAMS_APPS_MENU_INICIO=1`` (por defecto)."""
+        return sys.platform == "win32" and bool(getattr(self.settings, "apps_menu_inicio", True))
+
+    def _enrutar(self, texto: str, ahora: datetime, canal: str) -> Intencion:
+        """``enrutar`` con los ajustes de la v0.2.1 (tolera un enrutador v0.2 sin ellos)."""
+        s = self.settings
+        base: dict[str, Any] = {"ahora": ahora, "apps": s.apps_permitidas, "canal": canal,
+                                "destinos": getattr(s, "destinos_permitidos", None)}
+        local = canal in CANALES_LOCALES
+        try:
+            return enrutar(texto, plataforma=sys.platform if (local or canal == "telegram") else None,
+                           apps_locales=self._apps_locales_activas(),
+                           telegram_acciones=bool(getattr(s, "telegram_acciones", False)), **base)
+        except TypeError:
+            return enrutar(texto, plataforma=sys.platform if local else None, **base)
+
+    async def _es_orden_de_app(self, args: Mapping[str, Any]) -> bool:
+        """¿Es de verdad una orden de abrir una app del menú Inicio? ``False`` = conversación.
+
+        - "pon <algo>" (``explicito=False``): solo si es UNA app del menú Inicio.
+        - ``tentativa`` ("lanza una moneda", "arranca el carro", "abre un archivo"): salvo que
+          nada del menú Inicio se le parezca (``ninguna`` sin sugerencias).
+        - "abre <nombre>": siempre (si no existe, main dice "No encuentro…" con sugerencias).
+        """
+        accion = args.get("accion")
+        if not (isinstance(accion, AccionPC) and accion.tipo == "lanzar_app" and accion.args.get("local") is True):
+            return True
+        explicito = accion.args.get("explicito", True) is not False
+        tentativa = accion.args.get("tentativa") is True
+        if explicito and not tentativa:
+            return True
+        resolver = getattr(self.control_pc, "resolver_app_local", None) if self.control_pc is not None else None
+        if not callable(resolver):
+            return explicito
+        try:
+            resolucion = await resolver(str(accion.args.get("nombre") or ""))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("resolver_app_local falló (%s)", type(exc).__name__)
+            return explicito
+        estado = getattr(resolucion, "estado", "")
+        if not explicito:
+            return estado == "unica"
+        return not (estado == "ninguna" and not tuple(getattr(resolucion, "opciones", ()) or ()))
+
+    def _anunciar_en_pc(self, texto: str, canal: str) -> None:
+        """Aviso visible en el PC: consola siempre; chat de escritorio si no vino de la terminal; y,
+        si lo pidieron por Telegram, también una notificación de Amadeus Desktop."""
+        limpio = str(texto or "").strip()[:MAX_TEXTO_NOTIFICACION]
+        if not limpio:
+            return
+        self.consola.imprimir_sistema(limpio)
+        if canal != "terminal":
+            self._sistema_escritorio(limpio)
+        if canal == "telegram" and self._overlay_conectado and not self._no_molestar_activo():
+            self._orden_escritorio("notificar", texto=limpio)
+
+    def _anunciar_accion_remota(self, accion: AccionPC, resultado: ResultadoAccion) -> None:
+        """Toda acción pedida por Telegram se anuncia en el PC (§ v0.2.1): quien esté delante lo sabe."""
+        if resultado.ok:
+            texto = f"📱 Desde Telegram: {resultado.mensaje}"
+        else:
+            que = " ".join(str(accion.descripcion or accion.tipo).split())[:60]
+            texto = f"📱 Desde Telegram pidieron «{que}»: {resultado.mensaje}"
+        self._anunciar_en_pc(texto, "telegram")
+
+    @staticmethod
+    def _accion_por_telegram(accion: AccionPC) -> AccionPC:
+        """La acción con ``args["canal"] = "telegram"`` (la compuerta aplica las reglas de Telegram)."""
+        if accion.args.get("canal") == "telegram":
+            return accion
+        return AccionPC(accion.tipo, {**accion.args, "canal": "telegram"}, accion.descripcion, origen=accion.origen)
+
+    def _media_en_control_pc(self) -> bool:
+        """En Windows la música se controla con las teclas multimedia de ControlPC (aura usa playerctl)."""
+        return sys.platform == "win32" and callable(getattr(self.control_pc, "media", None))
+
+    @staticmethod
+    def _mensaje_app_no_unica(nombre: str, estado: str, opciones: Sequence[str], motivo: str) -> str:
+        """Respuesta útil cuando "abre X" no da UNA app del menú Inicio (nunca abre nada)."""
+        cita = f"«{nombre}»" if nombre else "esa app"
+        nombres = [f"«{o}»" for o in opciones if isinstance(o, str) and o][:3]
+        lista = (", ".join(nombres[:-1]) + f" o {nombres[-1]}") if len(nombres) > 1 else "".join(nombres)
+        if estado == "desactivada":
+            if "RAMS_APPS_MENU_INICIO" in motivo:
+                return "Abrir apps del menú Inicio está desactivado (RAMS_APPS_MENU_INICIO=0)."
+            return "Abrir apps por nombre solo funciona en Windows; aquí uso las de RAMS_APPS."
+        if estado == "excluida":
+            return (f"Lo que encuentro como {cita} en el menú Inicio {motivo or 'no es una app'}: "
+                    "eso no lo abro.")
+        # "abre steam y discord": una orden abre una sola app (si "X y Y" no es el nombre de una).
+        partes = [p.strip() for p in re.split(r"\s+(?:y|e)\s+", nombre) if p.strip()] if nombre else []
+        if estado == "ninguna" and len(partes) > 1:
+            pasos = " y luego ".join(f"«abre {p}»" for p in partes[:3])
+            return f"Las apps las abro de una en una: dime {pasos}."
+        if estado == "varias" and lista:
+            return f"Hay varias apps parecidas a {cita} en el menú Inicio: {lista}. Dime cuál con «abre <nombre>»."
+        if lista:
+            return f"No encuentro {cita} en el menú Inicio. ¿Quisiste decir {lista}? Pídemelo con «abre <nombre>»."
+        return (f"No encuentro {cita} en el menú Inicio de Windows. Dime el nombre tal como aparece allí "
+                "(por ejemplo «abre Steam»).")
+
+    async def _accion_app_local(self, accion: AccionPC, canal: str) -> tuple[ResultadoAccion, bool]:
+        """``lanzar_app`` local (R18): resolver en el menú Inicio → compuerta (una vez) → ControlPC.
+
+        Nunca va a ``aura.ejecutar``. Si la compuerta pidió confirmación y el usuario aceptó, la app
+        queda aprobada (``data/apps_aprobadas.json``) y la próxima vez no se pregunta.
+        """
+        tipo = "lanzar_app"
+        cp = self.control_pc
+        resolver = getattr(cp, "resolver_app_local", None) if cp is not None else None
+        lanzar = getattr(cp, "lanzar_app_local", None) if cp is not None else None
+        remota = canal == "telegram"
+
+        async def terminar(resultado: ResultadoAccion, veredicto: str, motivo: str,
+                           auditada: AccionPC = accion) -> tuple[ResultadoAccion, bool]:
+            await self._auditar(auditada, canal, veredicto, motivo, resultado)
+            if remota:
+                self._anunciar_accion_remota(auditada, resultado)
+            return resultado, False
+
+        if not callable(resolver) or not callable(lanzar):
+            return await terminar(ResultadoAccion(False, "Abrir apps del menú Inicio no está disponible en esta "
+                                                         "instalación.", accion_tipo=tipo),
+                                  "no_disponible", "sin índice de apps")
+        nombre = str(accion.args.get("nombre") or accion.args.get("alias") or "").strip()[:60]
+        nombre_seguro = redactar(nombre, self.settings.secretos(), alta_entropia=True)
+        try:
+            resolucion = await resolver(nombre)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("No se pudo buscar la app en el menú Inicio: %s", type(exc).__name__)
+            return await terminar(ResultadoAccion(False, "No pude buscar la app por un error interno.",
+                                                  accion_tipo=tipo), "fallo", "error al resolver")
+        estado = str(getattr(resolucion, "estado", "ninguna") or "ninguna")
+        app = getattr(resolucion, "app", None)
+        clave = getattr(app, "clave", None)
+        nombre_app = str(getattr(app, "nombre", "") or "")[:80]
+        if estado != "unica" or not isinstance(clave, str) or not clave:
+            opciones = [str(o)[:80] for o in (getattr(resolucion, "opciones", ()) or ())][:3]
+            mensaje = self._mensaje_app_no_unica(nombre_seguro, estado, opciones,
+                                                 str(getattr(resolucion, "motivo", "") or ""))
+            return await terminar(ResultadoAccion(False, mensaje, {"nombre": nombre_seguro, "opciones": opciones},
+                                                  accion_tipo=tipo), "sin_app", estado)
+        final = AccionPC(tipo, {"alias": clave, "local": True, "nombre": nombre_app or clave, "canal": canal},
+                         f"abrir {nombre_app or clave}", origen="usuario")
+        if self.permisos is None:
+            return await terminar(ResultadoAccion(False, "Acción no autorizada: compuerta de permisos no disponible.",
+                                                  accion_tipo=tipo), "denegada", "sin compuerta", final)
+        try:
+            decision = await self.permisos.autorizar(final)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La compuerta falló con una app local: %s", type(exc).__name__)
+            return await terminar(ResultadoAccion(False, "Acción no autorizada: la compuerta falló.", accion_tipo=tipo),
+                                  "denegada", "compuerta rota", final)
+        if not decision.aprobada:
+            veredicto = decision.veredicto if decision.veredicto != "confirmar" else "rechazada"
+            return await terminar(ResultadoAccion(False, f"Acción no autorizada: {decision.motivo}",
+                                                  {"nombre_destino": nombre_app}, accion_tipo=tipo),
+                                  veredicto, decision.motivo, final)
+        recordada = False
+        if decision.veredicto == "confirmar":
+            aprobar = getattr(cp, "aprobar_app_local", None)
+            if callable(aprobar):
+                try:
+                    recordada = bool(await aprobar(clave))
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning("No se pudo recordar la aprobación de la app: %s", type(exc).__name__)
+        try:
+            control = await lanzar(clave)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("ControlPC falló al abrir una app local: %s", type(exc).__name__, exc_info=True)
+            resultado = ResultadoAccion(False, "La acción falló por un error interno.", accion_tipo=tipo)
+            await self._auditar(final, canal, decision.veredicto, decision.motivo, resultado)
+            return resultado, True
+        resultado = self._resultado_control(control, final)
+        if resultado.ok and recordada:
+            resultado = dataclasses.replace(resultado, mensaje=f"{resultado.mensaje.rstrip()} La próxima vez la abro "
+                                                                "sin preguntarte.")
+        return await terminar(resultado, decision.veredicto, decision.motivo, final)
+
+    def _titulo_ventana_activa(self) -> str | None:
+        """Título de la ventana activa (ControlPC; si no, la última muestra de la pantalla). Nunca se registra."""
+        fuente = getattr(self.control_pc, "titulo_activa", None) if self.control_pc is not None else None
+        if callable(fuente):
+            try:
+                titulo = fuente()
+            except Exception as exc:
+                log.debug("titulo_activa falló (%s)", type(exc).__name__)
+                titulo = None
+            if isinstance(titulo, str):
+                return titulo
+        muestra = self._pantalla_fresca()
+        if muestra is not None and isinstance(muestra.get("titulo"), str):
+            return str(muestra["titulo"])
+        return None
+
+    def _pausa_de_camara_del_usuario(self) -> bool:
+        """``True`` si el usuario pidió que no lo mirara ("deja de mirarme", ``vision.pausar(…, "usuario")``).
+
+        Usa ``VisionContinua.pausada_por_usuario()``: ``estado().camara == "pausada"`` también lo da
+        la autopausa. Solo sin ese método (visión antigua o solo el bus) se recurre al estado.
+        """
+        vision = self.vision
+        pausada_por_usuario = getattr(vision, "pausada_por_usuario", None) if vision is not None else None
+        if callable(pausada_por_usuario):
+            try:
+                return bool(pausada_por_usuario())
+            except Exception as exc:
+                log.debug("pausada_por_usuario falló (%s)", type(exc).__name__)
+                return True              # ante la duda, se respeta la privacidad
+        return (self._estado_vision() or {}).get("camara") == "pausada"
+
+    def _camara_bloqueada(self) -> str | None:
+        """``"pausada"`` ("no me mires"), ``"deshabilitada"`` (configuración o botón del HUD) o ``None``.
+
+        Una foto pedida por Telegram nunca se salta la privacidad que el usuario fijó en el PC. La
+        autopausa de la visión (usuario ausente, sesión bloqueada, juego, batería, llamada) no es
+        una orden suya: no bloquea aquí (``capturas`` abre la cámara un instante o responde
+        ``camara_ocupada`` si la tiene una llamada).
+        """
+        if self._pausa_de_camara_del_usuario():
+            return "pausada"
+        if not getattr(self.settings, "camara_habilitada", False):
+            return "deshabilitada"
+        if self.aura is not None and getattr(self.aura, "camara_habilitada", True) is False:
+            return "deshabilitada"
+        return None
+
+    async def _capturar(self, fuente: str, titulo: str | None) -> tuple[bool, bytes | None, str]:
+        """``lobes.capturas.capturar_jpeg`` → ``(ok, jpeg, motivo)``. Nunca escribe a disco ni lanza.
+
+        Pasa el ``bus``: si la foto abre la cámara un instante, ``capturas`` publica
+        ``vision.camara{activa, fuente:"vistazo"}`` mientras está abierta (LED del HUD, consola y
+        ojo del overlay, §C2.13), igual que los vistazos.
+        """
+        try:
+            capturar = getattr(importlib.import_module("lobes.capturas"), "capturar_jpeg")
+        except Exception as exc:
+            log.info("Capturas no disponibles (%s)", _detalle_import("lobes.capturas", exc))
+            return False, None, "sin_backend"
+        try:
+            resultado = await asyncio.wait_for(
+                capturar(fuente, settings=self.settings, vision=self.vision, ventana_titulo=titulo, bus=self.bus),
+                PLAZO_FOTO_TELEGRAM_S)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            log.warning("La captura (%s) superó su plazo", fuente)
+            return False, None, "error"
+        except Exception as exc:
+            log.warning("La captura (%s) falló: %s", fuente, type(exc).__name__)
+            return False, None, "error"
+        jpeg = getattr(resultado, "jpeg", None)
+        if getattr(resultado, "ok", False) and isinstance(jpeg, (bytes, bytearray)) and jpeg:
+            return True, bytes(jpeg), ""
+        motivo = getattr(resultado, "motivo", None)
+        return False, None, motivo if isinstance(motivo, str) and motivo else "error"
+
+    async def _enviar_foto(self, fuente: str, canal: str) -> ResultadoAccion:
+        """Foto de la cámara o captura de la pantalla → Telegram del usuario (v0.2.1).
+
+        Por Telegram exige ``RAMS_TELEGRAM_FOTOS=1``. Pasa por la compuerta (``enviar_foto``: solo el
+        usuario, ≤ 10 por hora), respeta la pausa de la cámara y las ventanas privadas, y avisa en
+        el PC («📸 …»). La imagen solo vive en memoria.
+        """
+        tipo = "enviar_foto"
+        s = self.settings
+        remota = canal == "telegram"
+
+        def fallo(motivo: str, mensaje: str | None = None) -> ResultadoAccion:
+            return ResultadoAccion(False, mensaje or MENSAJES_CAPTURA.get(motivo, "No pude tomar la imagen."),
+                                   {"fuente": fuente, "motivo": motivo}, accion_tipo=tipo)
+
+        if fuente not in ("camara", "pantalla"):
+            return fallo("error", "No sé de dónde tomar la foto.")
+        if remota and not getattr(s, "telegram_fotos", False):
+            return fallo("fotos_desactivadas")
+        enviar = getattr(self.riko, "enviar_foto_telegram", None)
+        if not callable(enviar) or not getattr(s, "tiene_telegram", False):
+            return fallo("sin_telegram")
+        if fuente == "camara":
+            bloqueo = self._camara_bloqueada()
+            if bloqueo is not None:
+                return fallo(bloqueo)
+        que = "una foto de la cámara" if fuente == "camara" else "una captura de la pantalla"
+        accion = AccionPC(tipo, {"fuente": fuente, "canal": canal}, f"enviar {que} a tu Telegram", origen="usuario")
+        if self.permisos is None:
+            return fallo("denegada", "Acción no autorizada: compuerta de permisos no disponible.")
+        try:
+            decision = await self.permisos.autorizar(accion)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La compuerta falló con una foto: %s", type(exc).__name__)
+            return fallo("denegada", "Acción no autorizada: la compuerta falló.")
+        if not decision.aprobada:
+            motivo = "fotos_desactivadas" if "RAMS_TELEGRAM_FOTOS" in decision.motivo else "denegada"
+            resultado = fallo(motivo, f"Acción no autorizada: {decision.motivo}")
+            await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado)
+            return resultado
+        if fuente == "pantalla" and (self._pantalla_fresca() or {}).get("privada"):
+            resultado = fallo("ventana_sensible")
+            await self._auditar(accion, canal, decision.veredicto, "ventana privada", resultado)
+            return resultado
+        titulo = self._titulo_ventana_activa() if fuente == "pantalla" else None
+        ok, jpeg, motivo = await self._capturar(fuente, titulo)
+        if not ok or jpeg is None:
+            resultado = fallo(motivo)
+            await self._auditar(accion, canal, decision.veredicto, motivo, resultado)
+            return resultado
+        leyenda = self._rng.choice(LEYENDAS_FOTO[fuente])
+        try:
+            enviado = bool(await asyncio.wait_for(enviar(jpeg, leyenda=leyenda), PLAZO_FOTO_TELEGRAM_S))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:   # incluye el plazo vencido
+            log.warning("No se pudo enviar la imagen por Telegram: %s", type(exc).__name__)
+            enviado = False
+        finally:
+            jpeg = None          # la imagen no se guarda en ningún sitio
+        if not enviado:
+            resultado = fallo("envio")
+            await self._auditar(accion, canal, decision.veredicto, "telegram no la aceptó", resultado)
+            return resultado
+        aviso = ("📸 Envié una foto de la cámara a tu Telegram" if fuente == "camara"
+                 else "📸 Envié una captura de la pantalla a tu Telegram")
+        self._anunciar_en_pc(aviso + (" (la pediste desde Telegram)." if remota else "."), canal)
+        hecho = "la foto de la cámara" if fuente == "camara" else "la captura de la pantalla"
+        resultado = ResultadoAccion(True, f"Te mandé {hecho} por Telegram.", {"fuente": fuente}, accion_tipo=tipo)
+        await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado)
+        return resultado
+
+    def _responder_con_nota_de_voz(self, canal: str, intencion: Intencion, texto: str, voz: bool) -> bool:
+        """Regla de la respuesta por voz (v0.2.1): por Telegram, ``siempre`` o (``auto`` y el usuario
+        mandó una nota de voz o pidió audio); desde el PC, "mándame un audio al telegram"."""
+        s = self.settings
+        if canal == "telegram":
+            modo = str(getattr(s, "telegram_audio", "auto") or "auto").strip().lower()
+            if modo == "siempre":
+                return True
+            if modo != "auto":
+                return False
+            return bool(voz) or intencion.tipo == "pedir_audio" or quiere_audio(texto)
+        return (canal in CANALES_LOCALES and intencion.tipo == "pedir_audio"
+                and intencion.args.get("destino") == "telegram" and bool(getattr(s, "tiene_telegram", False)))
+
+    async def _enviar_nota_de_voz(self, reply: BrocaReply) -> bool:
+        """``riko.enviar_voz_telegram`` con la respuesta; ``False`` si no se pudo (va el texto)."""
+        enviar = getattr(self.riko, "enviar_voz_telegram", None)
+        texto = reply.texto_plano.strip()
+        if not callable(enviar) or not texto:
+            return False
+        tono = reply.segmentos[0].etiquetas.tone if reply.segmentos else "calido"
+        try:
+            ok = bool(await asyncio.wait_for(enviar(texto, tone=tono), PLAZO_VOZ_TELEGRAM_S))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:   # incluye el plazo vencido
+            log.warning("No se pudo enviar la nota de voz por Telegram: %s", type(exc).__name__)
+            ok = False
+        if ok:
+            try:
+                self.consola.imprimir_amadeus(f"[→ Telegram 🎤] {texto}", reply.etiquetas)
+            except Exception as exc:
+                log.debug("No se pudo mostrar la nota de voz en la consola: %s", type(exc).__name__)
+        else:
+            log.info("La nota de voz no salió; respondo por texto")
+        return ok
+
+    # ------------------------------------------------------------------
+    # v0.2.2: Google, correo, Drive y taller (docs/V022_CORREO_DRIVE_SCRIPTS.md §14)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _atributo(modulo: Any, nombre: str, defecto: Any = None) -> Any:
+        """``getattr`` que nunca lanza (una propiedad rota de un módulo opcional cuenta como ``defecto``)."""
+        if modulo is None:
+            return defecto
+        try:
+            return getattr(modulo, nombre, defecto)
+        except Exception as exc:
+            log.debug("Atributo %s no disponible (%s)", nombre, type(exc).__name__)
+            return defecto
+
+    def _disponible(self, modulo: Any) -> bool:
+        return bool(self._atributo(modulo, "disponible", False))
+
+    def _estado_google_actual(self) -> dict[str, Any]:
+        """``google.estado().a_dict()`` (la cuenta ya va enmascarada) o ``{}``."""
+        estado_fn = self._atributo(self.google, "estado")
+        if not callable(estado_fn):
+            return dict(self._estado_google or {})
+        try:
+            estado = estado_fn()
+            a_dict = getattr(estado, "a_dict", None)
+            datos = a_dict() if callable(a_dict) else estado
+            return dict(datos) if isinstance(datos, Mapping) else {}
+        except Exception as exc:
+            log.debug("Estado de Google no disponible (%s)", type(exc).__name__)
+            return dict(self._estado_google or {})
+
+    def _actualizar_herramientas(self, estado: Mapping[str, Any] | None = None) -> None:
+        """``broca.set_herramientas`` (§10.5) con lo que hay ahora: al arrancar y en cada ``google.estado``."""
+        fijar = self._atributo(self.broca, "set_herramientas")
+        if not callable(fijar):
+            return
+        s = self.settings
+        if estado is None:
+            estado = self._estado_google_actual()
+        drive = self._disponible(self.drive)
+        herramientas = {
+            "google": bool(getattr(s, "tiene_google", False)) and self.google is not None,
+            "google_conectado": bool(estado.get("conectado")) if isinstance(estado, Mapping) else False,
+            "correo": self._disponible(self.correo),
+            "drive": drive,
+            "drive_escribir": drive and bool(self._atributo(self.drive, "puede_escribir", False)),
+            "taller": bool(getattr(s, "tiene_taller", False)) and self._disponible(self.taller),
+        }
+        try:
+            fijar(herramientas)
+        except Exception as exc:
+            log.debug("set_herramientas falló (%s)", type(exc).__name__)
+
+    def _ev_google_estado(self, evento: Evento) -> None:
+        """``google.estado`` → capacidades de Broca y, si el permiso caducó, aviso en el PC (§14.1)."""
+        datos = dict(evento.datos) if isinstance(evento.datos, Mapping) else {}
+        previo, self._estado_google = self._estado_google, datos
+        self._actualizar_herramientas(datos)
+        if (previo is not None and previo.get("conectado") and not datos.get("conectado")
+                and datos.get("motivo") == "token_invalido" and not self._apagando):
+            self._aviso_local("Tu permiso de Google caducó o se revocó: di «conecta mi cuenta de Google».",
+                              "escritorio")
+
+    def _mensaje_google_apagado(self) -> str:
+        s = self.settings
+        if not getattr(s, "google_habilitado", False):
+            return ("La conexión con Google está apagada: pon RAMS_GOOGLE=1 en el .env, sigue la guía "
+                    "(docs/V022_CORREO_DRIVE_SCRIPTS.md §17) y reinicia.")
+        if s.offline:
+            return "Estoy en modo --offline: sin red no hay conexión con Google."
+        return "La conexión con Google no está disponible."
+
+    def _motivo_google_no_listo(self, modulo: Any, servicio: str) -> str | None:
+        """``None`` si el módulo (correo o Drive) está listo; si no, el porqué en español (§16)."""
+        nombre = "El correo" if servicio == "correo" else "Drive"
+        if not getattr(self.settings, "tiene_google", False):
+            return self._mensaje_google_apagado()
+        if self.google is None or modulo is None:
+            return f"{nombre} no está disponible en esta instalación."
+        if self._disponible(modulo):
+            return None
+        servicios = tuple(getattr(self.settings, "google_servicios", ("correo", "drive")) or ())
+        if servicio not in servicios:
+            return f"{nombre} no está activado (RAMS_GOOGLE_SERVICIOS)."
+        estado = self._estado_google_actual()
+        if estado.get("motivo") == "sin_cliente":
+            return ("Me falta el archivo del cliente OAuth: sigue la guía (docs/V022_CORREO_DRIVE_SCRIPTS.md §17) y "
+                    "guárdalo como data/google_cliente.json.")
+        if not estado.get("conectado"):
+            return "Primero conecta tu cuenta de Google: di «conecta mi cuenta de Google»."
+        que = "enviar correo" if servicio == "correo" else "Drive"
+        return f"No marcaste el permiso de {que}: reconecta Google y marca la casilla."
+
+    async def _autorizar_v022(self, accion: AccionPC, canal: str) -> DecisionPermiso:
+        """``permisos.autorizar`` con el canal del turno en ``_CANAL_ACCION`` (nunca lanza, salvo cancelación)."""
+        if self.permisos is None:
+            return DecisionPermiso("denegada", "compuerta de permisos no disponible")
+        token = _CANAL_ACCION.set(canal)
+        try:
+            return await self.permisos.autorizar(accion)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La compuerta falló con la acción %s: %s", accion.tipo, type(exc).__name__)
+            return DecisionPermiso("denegada", "la compuerta falló")
+        finally:
+            _CANAL_ACCION.reset(token)
+
+    async def _intencion_de_comando_v022(self, comando: str, resto: str, canal: str) -> Intencion | None:
+        """``/google [estado|conectar|desconectar]``, ``/script <tarea>`` y ``/habilidades`` → intención."""
+        if comando == "/google":
+            op = resto.strip().lower() or "estado"
+            if op not in ("estado", "conectar", "desconectar"):
+                await self._salida_comando("Uso: /google [estado|conectar|desconectar]", canal)
+                return None
+            if canal == "telegram" and op != "estado":
+                await self._salida_comando("Conectar o desconectar Google solo se hace desde el computador.", canal)
+                return None
+            return Intencion("google", {"op": op})
+        if comando == "/script":
+            if not resto.strip():
+                await self._salida_comando("Uso: /script <qué quieres que haga>", canal)
+                return None
+            return Intencion("taller", {"op": "crear", "tarea": resto.strip()[:500]})
+        return Intencion("taller", {"op": "habilidades"})
+
+    # --- oferta del taller (§14.2, paso 2b) ---------------------------------
+
+    def _resolver_oferta_taller(self, texto: str, intencion: Intencion, canal: str) -> Intencion:
+        """Un «sí» corto en el mismo canal local y ≤ 5 min acepta la oferta; cualquier otro mensaje la anula."""
+        oferta, self._oferta_taller = self._oferta_taller, None
+        if oferta is None:
+            return intencion
+        try:
+            vigente = self._reloj() - float(oferta.get("ts", float("-inf"))) <= TTL_OFERTA_TALLER_S
+        except (TypeError, ValueError):
+            vigente = False
+        if vigente and canal in CANALES_LOCALES and oferta.get("canal") == canal and acepta_oferta(texto):
+            return Intencion("taller", {"op": "crear", "tarea": str(oferta.get("tarea") or "")[:500]})
+        return intencion
+
+    def _ofrecer_taller(self, texto: str, texto_seguro: str, canal: str) -> bool:
+        """Sin intención, en un canal local y con el taller listo: ¿el mensaje pide una tarea del PC?"""
+        s = self.settings
+        if canal not in CANALES_LOCALES or not getattr(s, "tiene_taller", False):
+            return False
+        if not getattr(s, "taller_ofrecer", True) or not self._disponible(self.taller):
+            return False
+        if not pide_tarea_pc(texto):
+            return False
+        self._oferta_taller = {"tarea": texto_seguro[:500], "canal": canal, "ts": self._reloj()}
+        return True
+
+    # --- ramas del paso 3 -----------------------------------------------------
+
+    async def _turno_v022(self, tipo: str, args: Mapping[str, Any], canal: str, alta: bool,
+                          texto_seguro: str) -> tuple[ResultadoAccion | None, str | None, bool]:
+        """``(resultado, resumen del turno, error_propio)`` de las ramas ``google``/``correo``/``drive``/``taller``.
+
+        El resumen solo existe en los turnos de correo: lo que reciben Broca y la memoria en lugar del
+        mensaje (sin cuerpo ni direcciones, §14.2). Una excepción interna es un error propio.
+        """
+        resumen = self._resumen_turno_correo(args, alta) if tipo == "correo" else None
+        try:
+            if tipo == "google":
+                return await self._turno_google(args, canal), None, False
+            if tipo == "correo":
+                return await self._turno_correo(args, canal, alta), resumen, False
+            if tipo == "drive":
+                return await self._turno_drive(args, canal, texto_seguro), None, False
+            return await self._turno_taller(args, canal, alta), None, False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # nunca con el contenido en el log
+            log.warning("Fallo interno en la rama %s del turno (%s)", tipo, type(exc).__name__)
+            return (ResultadoAccion(False, "Algo falló por un error interno; no hice nada.",
+                                    accion_tipo=f"{tipo}_error"), resumen, True)
+
+    def _alias_y_direcciones(self, destinatarios: Sequence[str], alta: bool) -> str:
+        """«mamá, mi jefe y 2 direcciones más»: alias redactados con la regla del canal; las direcciones
+        solo se cuentan (nunca salen hacia Gemini, Puter, Telegram ni la memoria)."""
+        secretos = self.settings.secretos()
+        alias = [redactar(d.strip()[:40], secretos, alta_entropia=alta) for d in destinatarios if "@" not in d]
+        n_direcciones = sum(1 for d in destinatarios if "@" in d)
+        nombres = ", ".join(a for a in alias[:5] if a)
+        if nombres and n_direcciones:
+            return f"{nombres} y {_plural(n_direcciones, 'dirección', 'direcciones')} más"
+        if nombres:
+            return nombres
+        if n_direcciones:
+            return _plural(n_direcciones, "dirección", "direcciones")
+        return ""
+
+    def _resumen_turno_correo(self, args: Mapping[str, Any], alta: bool) -> str:
+        destinatarios = [*_textos(args.get("para")), *_textos(args.get("cc")), *_textos(args.get("cco"))]
+        para = self._alias_y_direcciones(destinatarios, alta)
+        return f"(pidió preparar un correo para {para})" if para else "(pidió preparar un correo)"
+
+    def _texto_estado_google(self) -> str:
+        """Estado local (sin red) de la cuenta de Google para ``/google`` (cuenta enmascarada)."""
+        s = self.settings
+        if self.google is None:
+            return "Cuenta de Google: no disponible en esta instalación."
+        if not getattr(s, "tiene_google", False):
+            return "Cuenta de Google: " + ("apagada (RAMS_GOOGLE=0)." if not getattr(s, "google_habilitado", False)
+                                           else "sin red (--offline).")
+        e = self._estado_google_actual()
+        if not e.get("conectado"):
+            motivos = {
+                "sin_cliente": "falta data/google_cliente.json (guía en docs/V022_CORREO_DRIVE_SCRIPTS.md §17)",
+                "cliente_invalido": "el cliente OAuth no es válido (¿es de tipo Web?)",
+                "conectando": "esperando tu autorización en el navegador",
+                "token_invalido": "el permiso caducó o se revocó: di «conecta mi cuenta de Google»",
+            }
+            detalle = motivos.get(str(e.get("motivo") or ""), "sin conectar: di «conecta mi cuenta de Google»")
+            return f"Cuenta de Google: {detalle}."
+        cuenta = _corto(e.get("cuenta") or "", 80)
+        lineas = [f"Cuenta de Google: conectada{f' ({cuenta})' if cuenta else ''}."]
+        lineas.append("Gmail: solo enviar." if e.get("correo")
+                      else "Gmail: sin permiso (reconecta y marca «Enviar correo»).")
+        if e.get("drive_completo"):
+            drive = "completo (leer y modificar todo)"
+        elif e.get("drive_leer") and e.get("drive_escribir"):
+            drive = "leer todo + modificar lo que cree Amadeus"
+        elif e.get("drive_leer"):
+            drive = "solo leer"
+        else:
+            drive = "sin permiso (reconecta y marca Drive)"
+        lineas.append(f"Drive: {drive}.")
+        return "\n".join(lineas)
+
+    async def _releer_cliente_google(self) -> None:
+        """Sin cliente OAuth válido, vuelve a leer ``data/google_cliente.json`` (y el token): el usuario puede
+        guardarlo con R.A.M.S. en marcha, como indica la guía. Sin red; nunca lanza (salvo la cancelación)."""
+        if not getattr(self.settings, "tiene_google", False):
+            return
+        if self._estado_google_actual().get("motivo") not in ("sin_cliente", "cliente_invalido"):
+            return
+        releer = self._atributo(self.google, "releer_cliente")
+        if not callable(releer):
+            return
+        try:
+            await releer()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.debug("No se pudo releer el cliente de Google (%s)", type(exc).__name__)
+
+    async def _turno_google(self, args: Mapping[str, Any], canal: str) -> ResultadoAccion:
+        op = args.get("op")
+        await self._releer_cliente_google()
+        if op == "estado":
+            await self._salida_comando(self._texto_estado_google(), canal)
+            donde = "te lo mandé por aquí" if canal == "telegram" else "está en pantalla"
+            return ResultadoAccion(True, f"El estado de la cuenta de Google {donde}.", accion_tipo="google_estado")
+        if self.google is None:
+            return ResultadoAccion(False, "La cuenta de Google no está disponible en esta instalación.",
+                                   accion_tipo=f"google_{op}")
+        if op == "conectar":
+            return await self._google_conectar(canal)
+        if op == "desconectar":
+            return await self._google_desconectar(canal)
+        return ResultadoAccion(False, "No entendí qué hacer con la cuenta de Google.", accion_tipo="google")
+
+    async def _google_conectar(self, canal: str) -> ResultadoAccion:
+        """Compuerta (permitida en local) y conexión EN SEGUNDO PLANO: el turno no espera al navegador."""
+        if not getattr(self.settings, "tiene_google", False):
+            return ResultadoAccion(False, self._mensaje_google_apagado(), accion_tipo="google_conectar")
+        if bool(self._atributo(self.google, "conectando", False)):
+            return ResultadoAccion(False, "Ya estoy esperando tu autorización en el navegador: termina allí (tienes "
+                                          "5 minutos).", accion_tipo="google_conectar")
+        if self._estado_google_actual().get("motivo") == "sin_cliente":
+            return ResultadoAccion(False, "Me falta el archivo del cliente OAuth: sigue la guía "
+                                          "(docs/V022_CORREO_DRIVE_SCRIPTS.md §17) y guárdalo como "
+                                          "data/google_cliente.json.", accion_tipo="google_conectar")
+        accion = AccionPC("conectar_google", {"canal": canal}, "conectar tu cuenta de Google", origen="usuario")
+        decision = await self._autorizar_v022(accion, canal)
+        if not decision.aprobada:
+            resultado = ResultadoAccion(False, f"Acción no autorizada: {decision.motivo}", accion_tipo="google_conectar")
+            await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado, destino="google")
+            return resultado
+        self._crear_tarea(self._conectar_google(canal, accion), "conectar_google")
+        return ResultadoAccion(True, "Abrí el navegador para conectar tu cuenta de Google. Si sale «Google no verificó "
+                                     "esta app», es tu propia app: Configuración avanzada → Ir a Amadeus, y marca las "
+                                     "casillas de correo y Drive.", accion_tipo="google_conectar")
+
+    def _mostrar_url_google(self, url: str) -> None:
+        """La URL de autorización solo en la consola local (nunca en el log, el bus, el chat ni Telegram)."""
+        self.consola.imprimir_sistema("Si no se abrió el navegador, abre este enlace para conectar Google "
+                                      f"(solo en esta terminal): {url}")
+
+    @staticmethod
+    def _servicios_de_scopes(scopes: Any) -> list[str]:
+        """Scopes concedidos → ``["correo", "drive_leer", "drive_escribir"]`` (para la auditoría)."""
+        servicios: list[str] = []
+        for scope in scopes if isinstance(scopes, (list, tuple)) else ():
+            texto = str(scope)
+            if texto.endswith("/gmail.send"):
+                nuevos = ["correo"]
+            elif texto.endswith("/drive.readonly"):
+                nuevos = ["drive_leer"]
+            elif texto.endswith("/drive.file"):
+                nuevos = ["drive_escribir"]
+            elif texto.endswith("/drive"):
+                nuevos = ["drive_leer", "drive_escribir"]
+            else:
+                nuevos = []
+            servicios.extend(n for n in nuevos if n not in servicios)
+        return servicios
+
+    async def _conectar_google(self, canal: str, accion: AccionPC) -> None:
+        """Tarea de fondo: ``CuentaGoogle.conectar`` y su resultado anunciado en el PC y auditado."""
+        conectar = self._atributo(self.google, "conectar")
+        resultado_conexion: Any = None
+        if callable(conectar):
+            try:
+                resultado_conexion = await conectar(mostrar_url=self._mostrar_url_google)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("La conexión con Google falló (%s)", type(exc).__name__)
+        ok = bool(getattr(resultado_conexion, "ok", False))
+        codigo = str(getattr(resultado_conexion, "codigo", "") or "error")[:40]
+        mensaje = str(getattr(resultado_conexion, "mensaje", "") or "").strip()
+        if not mensaje:
+            mensaje = "Cuenta de Google conectada." if ok else "No pude conectar tu cuenta de Google."
+        if not self._apagando:
+            self._anunciar_en_pc(mensaje, canal)
+        resultado = ResultadoAccion(ok, mensaje[:200], accion_tipo="conectar_google")
+        servicios = self._servicios_de_scopes(getattr(resultado_conexion, "concedidos", ()))
+        await self._auditar(accion, canal, "permitida", "conexión con Google", resultado,
+                            extra={"servicios": servicios, "codigo": codigo}, destino="google")
+        self._actualizar_herramientas()
+
+    async def _google_desconectar(self, canal: str) -> ResultadoAccion:
+        """Confirmación clásica de la compuerta → revoca y borra el token local (§1.1)."""
+        accion = AccionPC("desconectar_google", {"canal": canal},
+                          "Desconectar tu cuenta de Google (revoca el permiso de Gmail y Drive)", origen="usuario")
+        decision = await self._autorizar_v022(accion, canal)
+        if not decision.aprobada:
+            resultado = ResultadoAccion(False, f"Acción no autorizada: {decision.motivo}",
+                                        accion_tipo="google_desconectar")
+            await self._auditar(accion, canal, decision.veredicto if decision.veredicto != "confirmar" else "rechazada",
+                                decision.motivo, resultado, destino="google")
+            return resultado
+        resultado_desconexion: Any = None
+        try:
+            resultado_desconexion = await self.google.desconectar()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La desconexión de Google falló (%s)", type(exc).__name__)
+        ok = bool(getattr(resultado_desconexion, "ok", False))
+        mensaje = str(getattr(resultado_desconexion, "mensaje", "") or "").strip() or (
+            "Listo: desconecté tu cuenta de Google." if ok else "No pude desconectar tu cuenta de Google.")
+        resultado = ResultadoAccion(ok, mensaje[:300], accion_tipo="google_desconectar")
+        await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado,
+                            extra={"codigo": str(getattr(resultado_desconexion, "codigo", "") or "error")[:40]},
+                            destino="google")
+        self._actualizar_herramientas()
+        return resultado
+
+    async def _turno_correo(self, args: Mapping[str, Any], canal: str, alta: bool) -> ResultadoAccion:
+        """Prepara el borrador (texto CRUDO hacia el módulo) y muestra su tarjeta (§14.2)."""
+        s = self.settings
+        if canal == "telegram" and not getattr(s, "telegram_correo", True):
+            return ResultadoAccion(False, "Preparar correos desde Telegram está desactivado (RAMS_TELEGRAM_CORREO=1).",
+                                   accion_tipo="correo_borrador")
+        await self._releer_cliente_google()
+        motivo = self._motivo_google_no_listo(self.correo, "correo")
+        if motivo is not None:
+            if motivo.startswith("Primero conecta"):
+                motivo += " Mientras tanto, puedo dejarte un borrador en Gmail: «escríbele a juan por gmail: …»."
+            return ResultadoAccion(False, motivo, accion_tipo="correo_borrador")
+        para, cc, cco = _textos(args.get("para")), _textos(args.get("cc")), _textos(args.get("cco"))
+        adjuntos = _textos(args.get("adjuntos"), 5)
+        asunto = args.get("asunto") if isinstance(args.get("asunto"), str) else None
+        cuerpo = args.get("cuerpo") if isinstance(args.get("cuerpo"), str) else None
+        tema = args.get("tema") if isinstance(args.get("tema"), str) else None
+        avisos: list[str] = []
+        # Lo que el enrutador quitó por el contrato (§4.1) se avisa en la tarjeta: nunca en silencio.
+        descartados = args.get("descartados") if isinstance(args.get("descartados"), Mapping) else {}
+        sin_destinatarios, sin_adjuntos = (_conteo(descartados.get(clave)) for clave in ("destinatarios", "adjuntos"))
+        if sin_destinatarios:
+            avisos.append(f"No entraron {_plural(sin_destinatarios, 'destinatario', 'destinatarios')} de los que "
+                          "dictaste (máximo 10 por campo): mándalos en otro correo")
+        if sin_adjuntos:
+            avisos.append(f"No adjunté {_plural(sin_adjuntos, 'archivo', 'archivos')}: di solo el nombre o una ruta "
+                          "como «documentos/plan.xlsx» (sin «..» ni rutas absolutas; como mucho 5) y "
+                          f"{'agrégalo' if sin_adjuntos == 1 else 'agrégalos'} en Editar")
+        if args.get("redactar") and tema:
+            # Hacia Gemini solo el tema y los ALIAS, redactados con la regla del canal (nunca direcciones).
+            secretos = s.secretos()
+            alias = [p for p in para if "@" not in p]
+            destinatario = redactar(", ".join(alias), secretos, alta_entropia=alta) if alias else ""
+            generado: Any = None
+            redactar_correo = self._atributo(self.broca, "redactar_correo")
+            if callable(redactar_correo):
+                try:
+                    generado = await redactar_correo(redactar(tema, secretos, alta_entropia=alta),
+                                                     destinatario=destinatario)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.debug("redactar_correo falló (%s)", type(exc).__name__)
+            if isinstance(generado, Mapping) and isinstance(generado.get("cuerpo"), str) and generado["cuerpo"]:
+                cuerpo = generado["cuerpo"]
+                if not asunto and isinstance(generado.get("asunto"), str):
+                    asunto = generado["asunto"] or None
+            else:
+                cuerpo = tema                      # el texto del usuario, sin redactar (es el entregable)
+                avisos.append("No tengo a Gemini: usé tu texto tal cual")
+        ttl = TTL_TARJETA_TELEGRAM_S if canal == "telegram" else TTL_TARJETA_S
+        borrador = await self.correo.preparar(para=para, cc=cc, cco=cco, asunto=asunto, cuerpo=cuerpo,
+                                              adjuntos=adjuntos, canal_origen=canal, ttl_s=ttl, avisos=avisos)
+        destinatarios = [*para, *cc, *cco]
+        local = ", ".join(d for d in destinatarios if "@" not in d)[:80]
+        n_dir = sum(1 for d in destinatarios if "@" in d)
+        que_pc = "un correo" + (f" para {local}" if local else "") + (
+            f"{' y' if local else ' para'} {_plural(n_dir, 'dirección', 'direcciones')}" if n_dir else "")
+        if self._mostrar_tarjeta("correo", borrador, canal, que_pc=que_pc, boton="Enviar") is None:
+            self._descartar_en_modulo("correo", self._atributo(borrador, "id"))
+            return ResultadoAccion(False, "No pude mostrar el borrador en una tarjeta.", accion_tipo="correo_borrador")
+        para_broca = self._alias_y_direcciones(destinatarios, alta) or "sin destinatario todavía"
+        asunto_broca = _corto(redactar(str(self._atributo(borrador, "asunto", "") or ""), s.secretos(),
+                                       alta_entropia=alta), 120)
+        if canal == "telegram":
+            mensaje = (f"Te dejé el borrador para {para_broca} («{asunto_broca}»). Apruébalo en el computador con "
+                       "el botón Enviar: desde aquí no envío nada.")
+        else:
+            mensaje = (f"Borrador para {para_broca} («{asunto_broca}») listo en la tarjeta: revísalo y pulsa Enviar. "
+                       "No lo envío sin eso.")
+            if self._clientes_escritorio == 0:
+                mensaje += f" {MENSAJE_ABRE_CHAT}"
+        problemas = tuple(self._atributo(borrador, "problemas", ()) or ())
+        if problemas:
+            mensaje += (f" Ojo: la tarjeta marca {_plural(len(problemas), 'problema', 'problemas')} por resolver "
+                        "antes de enviar.")
+        if sin_destinatarios or sin_adjuntos:
+            fuera = " y ".join(t for t in (
+                _plural(sin_destinatarios, "destinatario", "destinatarios") if sin_destinatarios else "",
+                _plural(sin_adjuntos, "adjunto", "adjuntos") if sin_adjuntos else "") if t)
+            mensaje += f" Ojo: dejé fuera {fuera}; el aviso de la tarjeta dice por qué."
+        return ResultadoAccion(True, mensaje, {"que": "el borrador del correo"}, accion_tipo="correo_borrador")
+
+    async def _turno_drive(self, args: Mapping[str, Any], canal: str, texto_seguro: str) -> ResultadoAccion:
+        """Buscar e info (listas por ``_salida_comando``; a Broca solo conteos), descargar, leer, crear carpetas
+        y las propuestas con tarjeta (subir, papelera, compartir)."""
+        s = self.settings
+        op = str(args.get("op") or "")
+        tipo_resultado = f"drive_{op}" if op in ("buscar", "info", "descargar", "leer", "crear_carpeta") \
+            else "drive_propuesta"
+        if canal == "telegram" and not getattr(s, "telegram_drive", False):
+            return ResultadoAccion(False, "Buscar en Drive desde Telegram está desactivado (RAMS_TELEGRAM_DRIVE=1).",
+                                   accion_tipo=tipo_resultado)
+        await self._releer_cliente_google()
+        motivo = self._motivo_google_no_listo(self.drive, "drive")
+        if motivo is not None:
+            return ResultadoAccion(False, motivo, accion_tipo=tipo_resultado)
+        ref = str(args.get("ref") or "")
+        if op == "buscar":
+            consulta = args.get("consulta") if isinstance(args.get("consulta"), str) else None
+            resultado = await self.drive.buscar(consulta)
+            if not getattr(resultado, "ok", False):
+                return ResultadoAccion(False, str(getattr(resultado, "mensaje", "") or "La búsqueda en Drive falló."),
+                                       accion_tipo="drive_buscar")
+            archivos = tuple(getattr(resultado, "archivos", ()) or ())
+            if archivos:
+                lineas = [f"Drive · {_plural(len(archivos), 'archivo', 'archivos')}:"]
+                lineas += [str(a.linea(i)) for i, a in enumerate(archivos, start=1)]
+                await self._salida_comando("\n".join(lineas), canal)
+            else:
+                await self._salida_comando("Drive: no encontré archivos con eso.", canal)
+            donde = "te la mandé por aquí" if canal == "telegram" else "la lista está en pantalla"
+            return ResultadoAccion(True, f"Encontré {_plural(len(archivos), 'archivo', 'archivos')} en Drive; {donde}."
+                                   if archivos else "No encontré archivos con eso en Drive.", accion_tipo="drive_buscar")
+        if op == "info":
+            resultado = await self.drive.info(ref)
+            if not getattr(resultado, "ok", False):
+                return ResultadoAccion(False, str(getattr(resultado, "mensaje", "") or "No encontré ese archivo."),
+                                       accion_tipo="drive_info")
+            await self._salida_comando(self._texto_info_drive(resultado), canal)
+            donde = "te los mandé por aquí" if canal == "telegram" else "están en pantalla"
+            return ResultadoAccion(True, f"Los detalles del archivo {donde}.", accion_tipo="drive_info")
+        if op == "descargar":
+            return await self._drive_descargar(args, canal)
+        if op == "leer":
+            return await self._drive_leer(ref, texto_seguro)
+        if op == "crear_carpeta":
+            return await self._drive_crear_carpeta(args, canal)
+        ttl = TTL_TARJETA_TELEGRAM_S if canal == "telegram" else TTL_TARJETA_S
+        if op == "subir":
+            operacion = await self.drive.preparar_subida(str(args.get("nombre") or ""),
+                                                         carpeta=args.get("carpeta") or None, canal_origen=canal,
+                                                         ttl_s=ttl)
+            que = "subir un archivo"
+        elif op == "papelera":
+            operacion = await self.drive.preparar_papelera(ref, canal_origen=canal, ttl_s=ttl)
+            que = "mover un archivo a la papelera"
+        elif op == "compartir":
+            publico = bool(args.get("publico"))
+            rol = str(args.get("rol") or "reader")
+            operacion = await self.drive.preparar_compartir(ref, correo=args.get("correo") or None, rol=rol,
+                                                            publico=publico, canal_origen=canal, ttl_s=ttl)
+            que = "compartir un archivo en público" if publico else "compartir un archivo"
+        else:
+            return ResultadoAccion(False, "No entendí qué hacer en Drive.", accion_tipo="drive_propuesta")
+        if self._mostrar_tarjeta("drive", operacion, canal, que_pc=f"una operación de Drive ({que})",
+                                 boton="el botón") is None:
+            self._descartar_en_modulo("drive", self._atributo(operacion, "id"))
+            return ResultadoAccion(False, "No pude mostrar la operación de Drive en una tarjeta.",
+                                   accion_tipo="drive_propuesta")
+        mensaje = (f"Preparé la operación de Drive ({que}) en la tarjeta: revísala y pulsa el botón. No la hago sin "
+                   "eso.")
+        if op == "compartir" and bool(args.get("publico")):
+            mensaje += " Hacerlo público pide dos confirmaciones y siempre es de solo lectura."
+        problemas = tuple(self._atributo(operacion, "problemas", ()) or ())
+        if problemas:
+            mensaje += f" Ojo: la tarjeta marca {_plural(len(problemas), 'problema', 'problemas')}."
+        if self._clientes_escritorio == 0:
+            mensaje += f" {MENSAJE_ABRE_CHAT}"
+        return ResultadoAccion(True, mensaje, {"que": "la operación de Drive"}, accion_tipo="drive_propuesta")
+
+    @staticmethod
+    def _texto_info_drive(resultado: Any) -> str:
+        """Detalles de un archivo de Drive para la consola, el chat o Telegram (nunca para Gemini)."""
+        archivos = tuple(getattr(resultado, "archivos", ()) or ())
+        if not archivos:
+            return str(getattr(resultado, "mensaje", "") or "Sin detalles.")
+        a = archivos[0]
+        tamano = getattr(a, "tamano", None)
+        lineas = [f"Drive · {getattr(a, 'nombre', '')}"]
+        tipo = getattr(a, "tipo_legible", None)
+        lineas.append(f"Tipo: {tipo() if callable(tipo) else getattr(a, 'tipo_mime', '')}")
+        if isinstance(tamano, int) and not isinstance(tamano, bool):
+            lineas.append(f"Tamaño: {_miles(tamano)} bytes")
+        lineas.append(f"Modificado: {getattr(a, 'modificado', '')}")
+        lineas.append("Dueño: tú" if getattr(a, "propio", False) else "Dueño: otra persona")
+        enlace = getattr(a, "enlace", None)
+        if enlace:
+            lineas.append(f"Enlace: {enlace}")
+        puede = [n for n, c in (("descargar", "puede_descargar"), ("editar", "puede_editar"),
+                                ("mandar a la papelera", "puede_papelera"), ("compartir", "puede_compartir"))
+                 if getattr(a, c, False)]
+        lineas.append("Puedo: " + (", ".join(puede) if puede else "solo verlo"))
+        return "\n".join(lineas)
+
+    async def _drive_descargar(self, args: Mapping[str, Any], canal: str) -> ResultadoAccion:
+        destino = str(args.get("destino") or "descargas")
+        formato = args.get("formato") if isinstance(args.get("formato"), str) else None
+        accion = AccionPC("drive_descargar", {"canal": canal, "destino": destino, "formato": formato},
+                          "descargar un archivo de Drive", origen="usuario")
+        decision = await self._autorizar_v022(accion, canal)
+        if not decision.aprobada:
+            resultado = ResultadoAccion(False, f"Acción no autorizada: {decision.motivo}", accion_tipo="drive_descargar")
+            await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado, destino="drive",
+                                extra={"op": "descargar"})
+            return resultado
+        r = await self.drive.descargar(str(args.get("ref") or ""), destino=destino, formato=formato)
+        datos = getattr(r, "datos", {}) or {}
+        ok = bool(getattr(r, "ok", False))
+        if ok and datos.get("guardado"):
+            tamano = datos.get("bytes")
+            extra_tamano = f" ({_miles(tamano)} bytes)" if isinstance(tamano, int) and not isinstance(tamano, bool) else ""
+            mensaje = f"Lo guardé en {datos['guardado']}{extra_tamano}."
+            if datos.get("nota"):
+                mensaje += f" {datos['nota']}"
+        else:
+            mensaje = str(getattr(r, "mensaje", "") or ("Descargado." if ok else "No pude descargarlo."))
+        resultado = ResultadoAccion(ok, mensaje, accion_tipo="drive_descargar")
+        archivo_id = str(datos.get("archivo_id") or "")
+        await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado, destino="drive",
+                            extra={"op": "descargar", "codigo": str(getattr(r, "codigo", ""))[:40],
+                                   "bytes": datos.get("bytes") if isinstance(datos.get("bytes"), int) else None,
+                                   "archivo_sha12": hashlib.sha256(archivo_id.encode()).hexdigest()[:12]
+                                   if archivo_id else None})
+        return resultado
+
+    async def _drive_leer(self, ref: str, texto_seguro: str) -> ResultadoAccion:
+        """Leer para resumir: solo a pedido y solo con Gemini (Puter no resume documentos)."""
+        if not bool(self._atributo(self.broca, "gemini_disponible", False)):
+            return ResultadoAccion(False, "Para resumirlo necesito a Gemini; si quieres, te lo descargo.",
+                                   accion_tipo="drive_leer")
+        r = await self.drive.leer_texto(ref)
+        datos = getattr(r, "datos", {}) or {}
+        texto = datos.get("texto")
+        if not getattr(r, "ok", False) or not isinstance(texto, str) or not texto.strip():
+            return ResultadoAccion(False, str(getattr(r, "mensaje", "") or "No pude leer ese documento."),
+                                   accion_tipo="drive_leer")
+        archivos = tuple(getattr(r, "archivos", ()) or ())
+        nombre = str(getattr(archivos[0], "nombre", "") or ref) if archivos else ref
+        resumir = self._atributo(self.broca, "resumir_documento")
+        resumen = await resumir(texto, nombre=nombre, pedido=texto_seguro) if callable(resumir) else None
+        if not resumen:
+            return ResultadoAccion(False, "No pude resumirlo ahora; si quieres, te lo descargo.", accion_tipo="drive_leer")
+        notas = []
+        if datos.get("recortado"):
+            notas.append("leí solo el principio, porque es largo")
+        if datos.get("nota"):
+            notas.append(str(datos["nota"]))
+        extra = f" ({'; '.join(notas)})" if notas else ""
+        return ResultadoAccion(True, f"Resumen de «{nombre}»{extra}: {resumen}", accion_tipo="drive_leer")
+
+    async def _drive_crear_carpeta(self, args: Mapping[str, Any], canal: str) -> ResultadoAccion:
+        nombre = str(args.get("nombre") or "")
+        accion = AccionPC("drive_crear_carpeta", {"canal": canal, "nombre": nombre}, "crear una carpeta en Drive",
+                          origen="usuario")
+        decision = await self._autorizar_v022(accion, canal)
+        if not decision.aprobada:
+            resultado = ResultadoAccion(False, f"Acción no autorizada: {decision.motivo}",
+                                        accion_tipo="drive_crear_carpeta")
+            await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado, destino="drive",
+                                extra={"op": "crear_carpeta"})
+            return resultado
+        r = await self.drive.crear_carpeta(nombre, dentro=args.get("carpeta") or None)
+        ok = bool(getattr(r, "ok", False))
+        mensaje = str(getattr(r, "mensaje", "") or ("Carpeta creada en Drive." if ok else "No pude crear la carpeta."))
+        resultado = ResultadoAccion(ok, mensaje, accion_tipo="drive_crear_carpeta")
+        await self._auditar(accion, canal, decision.veredicto, decision.motivo, resultado, destino="drive",
+                            extra={"op": "crear_carpeta", "codigo": str(getattr(r, "codigo", ""))[:40]})
+        return resultado
+
+    async def _turno_taller(self, args: Mapping[str, Any], canal: str, alta: bool) -> ResultadoAccion:
+        s = self.settings
+        op = str(args.get("op") or "")
+        tipo_resultado = {"crear": "taller_propuesta", "ejecutar_habilidad": "taller_propuesta",
+                          "habilidades": "taller_habilidades"}.get(op, "taller_habilidad")
+        if not getattr(s, "tiene_taller", False):
+            mensaje = ("El taller está apagado (RAMS_TALLER=1 en el .env)." if not getattr(s, "taller_habilitado", False)
+                       else "El taller de scripts no funciona en este sistema.")
+            return ResultadoAccion(False, mensaje, accion_tipo=tipo_resultado)
+        if self.taller is None:
+            return ResultadoAccion(False, "El taller de scripts no está disponible en esta instalación.",
+                                   accion_tipo=tipo_resultado)
+        if op == "habilidades":
+            habilidades = tuple(self.taller.habilidades() or ())
+            if habilidades:
+                lineas = ["Habilidades guardadas:"]
+                for h in habilidades:
+                    lenguaje = _NOMBRES_LENGUAJE.get(str(getattr(h, "lenguaje", "")), str(getattr(h, "lenguaje", "")))
+                    usos = int(getattr(h, "usos", 0) or 0)
+                    lineas.append(f"  {getattr(h, 'nombre', '')} · {lenguaje} · riesgo {getattr(h, 'nivel', '?')} · "
+                                  f"{_plural(usos, 'uso', 'usos')}")
+                texto = "\n".join(lineas)
+            else:
+                texto = "No tengo habilidades guardadas todavía."
+            await self._salida_comando(texto, canal)
+            return ResultadoAccion(True, f"Tienes {_plural(len(habilidades), 'habilidad', 'habilidades')} guardadas; "
+                                         "la lista está en pantalla.", accion_tipo="taller_habilidades")
+        if op == "olvidar_habilidad":
+            nombre = str(args.get("nombre") or "")
+            ok = bool(await self.taller.olvidar_habilidad(nombre))
+            return ResultadoAccion(ok, f"Olvidé la habilidad «{nombre}»." if ok
+                                   else f"No tengo ninguna habilidad llamada «{nombre}».", accion_tipo="taller_habilidad")
+        if op == "crear":
+            tarea = str(args.get("tarea") or "").strip()
+            if not tarea:
+                return ResultadoAccion(False, "Dime qué quieres que haga el script: «hazme un script que …».",
+                                       accion_tipo="taller_propuesta")
+            # Hacia Gemini, la tarea redactada con la regla del canal (§14.2).
+            propuesta = await self.taller.proponer(redactar(tarea, s.secretos(), alta_entropia=alta)[:500],
+                                                   canal_origen=canal, ttl_s=TTL_TARJETA_S)
+        elif op == "ejecutar_habilidad":
+            propuesta = await self.taller.cargar_habilidad(str(args.get("nombre") or ""), canal_origen=canal,
+                                                           ttl_s=TTL_TARJETA_S)
+        else:
+            return ResultadoAccion(False, "No entendí qué hacer con el taller.", accion_tipo="taller_propuesta")
+        if not callable(getattr(propuesta, "huella", None)):        # FalloTaller
+            return ResultadoAccion(False, str(getattr(propuesta, "mensaje", "") or "No pude escribir el script."),
+                                   accion_tipo="taller_propuesta")
+        aviso = ("El código cambió desde que lo guardaste: revísalo de nuevo."
+                 if getattr(propuesta, "habilidad_cambiada", False) else "")
+        if self._mostrar_tarjeta("script", propuesta, canal, que_pc="un script", boton="Ejecutar", aviso=aviso) is None:
+            self._descartar_en_modulo("script", self._atributo(propuesta, "id"))
+            return ResultadoAccion(False, "No pude mostrar el script en una tarjeta.", accion_tipo="taller_propuesta")
+        analisis = getattr(propuesta, "analisis", None)
+        lenguaje = _NOMBRES_LENGUAJE.get(str(getattr(propuesta, "lenguaje", "")), "?")
+        nivel = str(getattr(analisis, "nivel", "?"))
+        if bool(getattr(analisis, "ejecutable", False)):
+            mensaje = (f"Script de {lenguaje}, riesgo {nivel}, en la tarjeta: léelo y pulsa Ejecutar si estás de "
+                       "acuerdo. No lo ejecuto sin eso.")
+        else:
+            mensaje = f"Script de {lenguaje}, riesgo {nivel}: no lo ejecuto desde la app; te lo dejo para copiar."
+        if aviso:
+            mensaje += f" {aviso}"
+        if self._clientes_escritorio == 0:
+            mensaje += f" {MENSAJE_ABRE_CHAT}"
+        return ResultadoAccion(True, mensaje, {"que": "el script"}, accion_tipo="taller_propuesta")
+
+    # --- tarjetas (§14.3) -----------------------------------------------------
+
+    def _modulo_de_clase(self, clase: str) -> Any:
+        return {"correo": self.correo, "drive": self.drive, "script": self.taller}.get(clase)
+
+    def _descartar_en_modulo(self, clase: str, ident: Any) -> None:
+        descartar = self._atributo(self._modulo_de_clase(clase), "descartar")
+        if callable(descartar) and isinstance(ident, str):
+            try:
+                descartar(ident)
+            except Exception as exc:
+                log.debug("descartar(%s) falló (%s)", clase, type(exc).__name__)
+
+    def _objeto_tarjeta(self, clase: str, ident: str) -> Any:
+        """El borrador, la operación o la propuesta vigente en su módulo (o ``None``)."""
+        nombre = {"correo": "borrador", "drive": "operacion", "script": "propuesta"}.get(clase, "")
+        obtener = self._atributo(self._modulo_de_clase(clase), nombre)
+        if not callable(obtener):
+            return None
+        try:
+            return obtener(ident)
+        except Exception as exc:
+            log.debug("%s(%s) falló (%s)", nombre, clase, type(exc).__name__)
+            return None
+
+    @staticmethod
+    def _tipo_accion_tarjeta(clase: str, objeto: Any) -> str | None:
+        if clase == "correo":
+            return "enviar_correo"
+        if clase == "script":
+            return "ejecutar_script"
+        if clase == "drive":
+            return _TIPO_ACCION_DRIVE.get(str(getattr(objeto, "op", "")))
+        return None
+
+    def _reloj_compuerta(self) -> float:
+        reloj = self._atributo(self.permisos, "reloj")
+        try:
+            return float(reloj()) if callable(reloj) else time.monotonic()
+        except Exception as exc:
+            log.debug("Reloj de la compuerta no disponible (%s)", type(exc).__name__)
+            return time.monotonic()
+
+    def _presentacion_tarjeta(self, clase: str, seccion: Mapping[str, Any]) -> tuple[str, str, list[str]]:
+        """``(titulo, resumen, botones)`` de una tarjeta aprobable: nunca cuerpo, direcciones ni código (§12.2)."""
+        if clase == "correo":
+            n = sum(len(seccion.get(k) or ()) for k in ("para", "cc", "cco"))
+            problemas = len(seccion.get("problemas") or ())
+            resumen = "Revisa Para, asunto, cuerpo y adjuntos: el correo sale de tu Gmail solo si pulsas Enviar."
+            if problemas:
+                resumen += f" Hay {_plural(problemas, 'problema', 'problemas')} por resolver."
+            return f"Correo para {_plural(n, 'destinatario', 'destinatarios')}", resumen, ["aprobar", "editar",
+                                                                                          "descartar"]
+        if clase == "drive":
+            op = seccion.get("op")
+            paso = seccion.get("paso")
+            if op == "subir":
+                return ("Subir un archivo a Drive", "Revisa el archivo y la carpeta de destino: se sube solo si pulsas "
+                        "Subir.", ["aprobar", "descartar"])
+            if op == "papelera":
+                return ("Mover a la papelera de Drive", "Se puede restaurar durante 30 días: nunca borro de forma "
+                        "definitiva.", ["aprobar", "descartar"])
+            compartir = seccion.get("compartir") if isinstance(seccion.get("compartir"), Mapping) else {}
+            if compartir.get("publico"):
+                if paso == 2:
+                    return ("Compartir en público (paso 2 de 2)", "Confirma en menos de 2 minutos: cualquiera con el "
+                            "enlace podrá verlo (solo lectura).", ["aprobar_publico", "descartar"])
+                return ("Compartir en público (paso 1 de 2)", "Cualquiera con el enlace podrá verlo (solo lectura). "
+                        "Pide dos confirmaciones.", ["aprobar", "descartar"])
+            return ("Compartir un archivo de Drive", "Google le avisará por correo a la persona.",
+                    ["aprobar", "descartar"])
+        lenguaje = _NOMBRES_LENGUAJE.get(str(seccion.get("lenguaje") or ""), "?")
+        nivel = str(seccion.get("nivel") or "?")
+        if seccion.get("ejecutable"):
+            botones = ["aprobar", "guardar", "copiar", "descartar"]
+            if seccion.get("habilidad") and not seccion.get("habilidad_cambiada"):
+                botones.remove("guardar")
+            resumen = "Lee el código completo y el análisis: solo se ejecuta si pulsas Ejecutar."
+        else:
+            botones = ["copiar", "descartar"]
+            resumen = ("Riesgo crítico o con errores: no lo ejecuto desde la app. Te lo dejo para copiar, por si lo "
+                       "quieres revisar y correr tú.")
+        return f"Script de {lenguaje} · riesgo {nivel}", resumen, botones
+
+    def _datos_tarjeta(self, clase: str, objeto: Any, t: Any, *, aviso: str = "",
+                       ajustes: Mapping[str, Any] | None = None) -> dict[str, Any] | None:
+        """Mensaje ``tarjeta.mostrar`` (§12.2) a partir de ``objeto.vista()`` y la tarjeta de la compuerta."""
+        try:
+            seccion = dict(objeto.vista())
+        except Exception as exc:
+            log.warning("La vista de la tarjeta %s falló (%s)", clase, type(exc).__name__)
+            return None
+        if ajustes:
+            seccion.update(ajustes)
+        if clase == "drive":
+            doble_hasta = getattr(t, "doble_ok_hasta", None)
+            seccion["paso"] = 2 if (getattr(t, "doble", False) and doble_hasta is not None
+                                    and self._reloj_compuerta() < float(doble_hasta)) else 1
+        titulo, resumen, botones = self._presentacion_tarjeta(clase, seccion)
+        restante = max(0.0, float(getattr(t, "caduca", 0.0)) - self._reloj_compuerta())
+        return {"id": str(t.id), "clase": clase, "version": int(t.version), "sha256": str(t.huella),
+                "titulo": _corto(titulo, MAX_TITULO_TARJETA), "resumen": _corto(resumen, MAX_RESUMEN_TARJETA),
+                "aviso": _corto(aviso, MAX_AVISO_TARJETA), "botones": botones,
+                "caduca_ts": time.time() + restante, "canal_origen": str(t.canal_origen),
+                "correo": seccion if clase == "correo" else None, "drive": seccion if clase == "drive" else None,
+                "script": seccion if clase == "script" else None, "salida": None}
+
+    def _publicar_tarjeta(self, datos: dict[str, Any]) -> None:
+        """``tarjeta.mostrar`` (privado: solo para ``/escritorio``; nadie lo registra)."""
+        ident = str(datos.get("id"))
+        self._tarjetas_publicadas.pop(ident, None)
+        self._tarjetas_publicadas[ident] = datos
+        while len(self._tarjetas_publicadas) > MAX_TARJETAS_PUBLICADAS:
+            self._tarjetas_publicadas.pop(next(iter(self._tarjetas_publicadas)))
+        self._publicar("tarjeta.mostrar", datos)
+
+    def _publicar_cerrada(self, ident: str, clase: str, resultado: str, motivo: str) -> None:
+        """``tarjeta.cerrada{id, clase, resultado, motivo}`` (limpia los clientes)."""
+        self._tarjetas_publicadas.pop(ident, None)
+        self._reabierta_tras_boton.pop(ident, None)     # cerrada: un clic tardío ya cae en «no vigente»
+        if clase not in ("correo", "drive", "script", "salida"):
+            return
+        self._publicar("tarjeta.cerrada", {"id": ident, "clase": clase, "resultado": resultado,
+                                           "motivo": _corto(motivo, MAX_MOTIVO_CIERRE)})
+
+    def _registrar_y_publicar(self, clase: str, objeto: Any, canal_origen: str, *,
+                              aviso: str = "") -> dict[str, Any] | None:
+        """Registra (o reabre: misma id → ``version+1``) la tarjeta en la compuerta y la publica (§14.3, pasos 1-2)."""
+        registrar = self._atributo(self.permisos, "registrar_tarjeta")
+        tipo_accion = self._tipo_accion_tarjeta(clase, objeto)
+        if not callable(registrar) or tipo_accion is None:
+            return None
+        try:
+            ident = str(objeto.id)
+            huella = str(objeto.huella())
+        except Exception as exc:
+            log.warning("La tarjeta %s no trae id o huella (%s)", clase, type(exc).__name__)
+            return None
+        ttl = TTL_TARJETA_TELEGRAM_S if canal_origen == "telegram" else TTL_TARJETA_S
+        doble = clase == "drive" and bool(getattr(objeto, "publico", False))
+        nueva, reemplazada = registrar(ident, tipo_accion=tipo_accion, huella=huella, ttl_s=ttl,
+                                       canal_origen=canal_origen, doble=doble)
+        if nueva is None:
+            log.warning("La compuerta no aceptó la tarjeta %s", clase)
+            return None
+        if reemplazada is not None:
+            self._descartar_en_modulo(reemplazada.clase, reemplazada.id)
+            self._publicar_cerrada(reemplazada.id, reemplazada.clase, "reemplazado", "la reemplazó una tarjeta nueva")
+        datos = self._datos_tarjeta(clase, objeto, nueva, aviso=aviso)
+        if datos is None:
+            self.permisos.retirar_tarjeta(ident)
+            return None
+        self._publicar_tarjeta(datos)
+        return datos
+
+    def _mostrar_tarjeta(self, clase: str, objeto: Any, canal_origen: str, *, que_pc: str = "", boton: str = "",
+                         aviso: str = "") -> dict[str, Any] | None:
+        """§14.3: registra la tarjeta, la publica y avisa según el canal de origen."""
+        datos = self._registrar_y_publicar(clase, objeto, canal_origen, aviso=aviso)
+        if datos is None:
+            return None
+        if canal_origen == "terminal":
+            # La vista previa completa SOLO en la pantalla local (nunca en el log).
+            self.consola.imprimir_sistema(self._vista_previa_consola(clase, datos))
+            if self._overlay_conectado:
+                self._orden_escritorio("abrir_chat")
+        elif canal_origen == "telegram":
+            self._anunciar_en_pc(f"📱 Desde Telegram preparaste {que_pc or 'algo'}: revísalo en el chat y pulsa "
+                                 f"{boton or 'el botón'}.", "telegram")
+        return datos
+
+    def _vista_previa_consola(self, clase: str, datos: Mapping[str, Any]) -> str:
+        """Vista previa completa de una tarjeta para la consola local (§1.2)."""
+        lineas = [f"── Tarjeta: {datos.get('titulo', '')}"]
+        seccion = datos.get(clase) if isinstance(datos.get(clase), Mapping) else {}
+        if clase == "correo":
+            for etiqueta, clave in (("Para", "para"), ("CC", "cc"), ("CCO", "cco")):
+                if seccion.get(clave):
+                    lineas.append(f"{etiqueta}: {', '.join(str(x) for x in seccion[clave])}")
+            lineas.append(f"Asunto: {seccion.get('asunto', '')}")
+            for adjunto in seccion.get("adjuntos") or ():
+                if isinstance(adjunto, Mapping):
+                    lineas.append(f"Adjunto: {adjunto.get('nombre', '')} ({_miles(adjunto.get('bytes', 0))} bytes)")
+            lineas.append("Cuerpo:")
+            lineas.extend(str(seccion.get("cuerpo") or "").split("\n"))
+        elif clase == "drive":
+            archivo = seccion.get("archivo") if isinstance(seccion.get("archivo"), Mapping) else None
+            local = seccion.get("local") if isinstance(seccion.get("local"), Mapping) else None
+            compartir = seccion.get("compartir") if isinstance(seccion.get("compartir"), Mapping) else None
+            if archivo:
+                lineas.append(f"Archivo de Drive: {archivo.get('nombre', '')}")
+            if local:
+                lineas.append(f"Archivo local: {local.get('nombre', '')} ({_miles(local.get('bytes', 0))} bytes)")
+            if seccion.get("carpeta_destino"):
+                lineas.append(f"Carpeta de destino: {seccion.get('carpeta_destino')}")
+            if compartir:
+                con = "cualquiera con el enlace" if compartir.get("publico") else str(compartir.get("con") or "")
+                lineas.append(f"Compartir con: {con} ({compartir.get('rol', '')})")
+        else:
+            lineas.append(str(seccion.get("explicacion") or ""))
+            for hallazgo in seccion.get("hallazgos") or ():
+                if isinstance(hallazgo, Mapping):
+                    linea = f" (línea {hallazgo.get('linea')})" if hallazgo.get("linea") else ""
+                    lineas.append(f"  [{hallazgo.get('nivel', '')}] {hallazgo.get('detalle', '')}{linea}")
+            for numero, codigo in enumerate(str(seccion.get("codigo") or "").split("\n"), start=1):
+                lineas.append(f"{numero:>4} │ {codigo}")
+        for problema in seccion.get("problemas") or ():
+            lineas.append(f"⚠ {problema}")
+        if datos.get("aviso"):
+            lineas.append(f"⚠ {datos.get('aviso')}")
+        lineas.append("Se aprueba solo con el botón de la tarjeta, en el chat de Amadeus Desktop o del HUD."
+                      + ("" if self._clientes_escritorio else f" {MENSAJE_ABRE_CHAT}"))
+        return "\n".join(lineas)
+
+    # --- decisiones de las tarjetas (§14.4) -----------------------------------
+
+    def _ev_escritorio_tarjeta(self, evento: Evento) -> None:
+        """Botón de una tarjeta (``escritorio.tarjeta``, ya validado por escritorio_link). Síncrono: valida los
+        formatos y programa ``_decidir_tarjeta``. Nunca registra los campos."""
+        if self._apagando or not self._iniciado:
+            return
+        d = evento.datos if isinstance(evento.datos, Mapping) else {}
+        ident, sha, decision = d.get("id"), d.get("sha256"), d.get("decision")
+        if not (isinstance(ident, str) and ID_TARJETA_RE.fullmatch(ident)):
+            return
+        if not (isinstance(sha, str) and HUELLA_RE.fullmatch(sha)) or decision not in DECISIONES_TARJETA:
+            return
+        nombre: str | None = None
+        campos: dict[str, Any] | None = None
+        if decision == "guardar":
+            bruto = d.get("nombre")
+            if not isinstance(bruto, str) or not 1 <= len(bruto.strip()) <= 40:
+                return
+            nombre = bruto.strip()
+        if decision == "editar":
+            bruto_campos = d.get("campos")
+            if not isinstance(bruto_campos, Mapping):
+                return
+            campos = {str(k): v for k, v in bruto_campos.items() if isinstance(v, str)}
+        # Número de llegada, asignado aquí (síncrono, al publicarse el botón) y no al tomar el lock: un clic
+        # que espera en la cola mientras se ejecuta la aprobación anterior queda «antes» de la reapertura.
+        self._n_boton_tarjeta += 1
+        self._crear_tarea(self._decidir_tarjeta(ident, sha, str(decision), nombre, campos, self._n_boton_tarjeta),
+                          "tarjeta")
+
+    async def _decidir_tarjeta(self, ident: str, sha: str, decision: str, nombre: str | None,
+                               campos: Mapping[str, Any] | None, n_boton: int) -> None:
+        """Una decisión cada vez (``_lock_tarjetas``); un fallo nunca tumba nada."""
+        async with self._lock_tarjetas:
+            try:
+                await self._decidir_tarjeta_cuerpo(ident, sha, decision, nombre, campos, n_boton)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # nunca con el contenido en el log
+                log.warning("No se pudo procesar el botón de una tarjeta (%s)", type(exc).__name__)
+                self._aviso_local("No pude procesar el botón de la tarjeta por un error interno.", "escritorio")
+
+    async def _decidir_tarjeta_cuerpo(self, ident: str, sha: str, decision: str, nombre: str | None,
+                                      campos: Mapping[str, Any] | None, n_boton: int) -> None:
+        # 1. Tarjetas «salida»: solo se cierran.
+        if ident in self._tarjetas_info:
+            if decision == "descartar":
+                self._tarjetas_info.pop(ident, None)
+                self._publicar_cerrada(ident, "salida", "descartado", "cerrada")
+            return
+        t = self._atributo(self.permisos, "tarjeta")
+        t = t(ident) if callable(t) else None
+        if t is None:
+            publicada = self._tarjetas_publicadas.get(ident)
+            if publicada is not None:
+                self._publicar_cerrada(ident, str(publicada.get("clase")), "caducado", "ya no está vigente")
+            self._sistema_escritorio("Esa tarjeta ya no está vigente.")
+            return
+        clase = str(t.clase)
+        # 1b. Clic anterior a la reapertura (doble clic, o Desktop y RINE a la vez): la reapertura conserva id y
+        # huella, así que la huella no lo distingue. Nunca ejecuta otra vez (§0.3, §1.2: nada se reintenta solo);
+        # se republica la versión vigente tal cual (con su aviso, p. ej. «Puede que ya se haya enviado»).
+        if decision in ("aprobar", "aprobar_publico") and n_boton <= self._reabierta_tras_boton.get(ident, 0):
+            log.info("Botón de aprobar anterior a la reapertura de una tarjeta %s: ignorado", clase)
+            vigente = self._tarjetas_publicadas.get(ident)
+            if vigente is not None:
+                self._publicar_tarjeta(vigente)
+            return
+        objeto = self._objeto_tarjeta(clase, ident)
+        # 2. Huella: salvo descartar, el clic debe ser sobre lo que está registrado.
+        if decision != "descartar" and not hmac.compare_digest(str(t.huella).encode("ascii"), sha.encode("ascii")):
+            if objeto is not None:
+                datos = self._datos_tarjeta(clase, objeto, t, aviso="Cambió: revisa la versión nueva.")
+                if datos is not None:
+                    self._publicar_tarjeta(datos)
+            return
+        # 3. Decisión.
+        if decision == "descartar":
+            self._descartar_en_modulo(clase, ident)
+            self.permisos.retirar_tarjeta(ident)
+            self._publicar_cerrada(ident, clase, "descartado", "descartada")
+            return
+        if objeto is None:
+            self.permisos.retirar_tarjeta(ident)
+            self._publicar_cerrada(ident, clase, "caducado", "ya no está vigente")
+            self._sistema_escritorio("Esa tarjeta ya no está vigente.")
+            return
+        if decision == "editar":
+            await self._editar_correo(ident, t, campos or {}, clase)
+            return
+        if decision == "guardar":
+            await self._guardar_habilidad(ident, sha, t, objeto, clase, nombre or "")
+            return
+        if (decision == "aprobar" and clase == "drive" and getattr(t, "doble", False)
+                and (t.doble_ok_hasta is None or self._reloj_compuerta() >= float(t.doble_ok_hasta))):
+            # Compartir en público, 1.er clic: la tarjeta pasa al paso 2 (≤ 120 s para el 2.º).
+            t2 = self.permisos.marcar_primera_confirmacion(ident, sha)
+            datos = self._datos_tarjeta(clase, objeto, t2 or t,
+                                        aviso="" if t2 is not None else "No pude registrar la primera confirmación.")
+            if datos is not None:
+                self._publicar_tarjeta(datos)
+            return
+        await self._aprobar_tarjeta(clase, objeto, t, sha, decision)
+
+    async def _editar_correo(self, ident: str, t: Any, campos: Mapping[str, Any], clase: str) -> None:
+        if clase != "correo" or not campos or self.correo is None:
+            return
+        borrador = await self.correo.editar(ident, campos)          # crudos: el módulo revalida todo
+        t2 = self.permisos.actualizar_tarjeta(ident, borrador.huella()) if borrador is not None else None
+        if borrador is None or t2 is None:
+            self.permisos.retirar_tarjeta(ident)
+            self._publicar_cerrada(ident, clase, "caducado", "ya no está vigente")
+            self._sistema_escritorio("Ese borrador ya no está vigente.")
+            return
+        datos = self._datos_tarjeta(clase, borrador, t2)
+        if datos is not None:
+            self._publicar_tarjeta(datos)
+
+    async def _guardar_habilidad(self, ident: str, sha: str, t: Any, propuesta: Any, clase: str,
+                                 nombre: str) -> None:
+        if clase != "script" or not nombre or self.taller is None:
+            return
+        habilidad = await self.taller.guardar_habilidad(ident, sha, nombre)
+        # Habilidad | FalloTaller (este último trae «codigo» y «mensaje»).
+        guardada = habilidad is not None and not (hasattr(habilidad, "codigo") and hasattr(habilidad, "mensaje"))
+        if guardada:
+            nombre_real = str(getattr(habilidad, "nombre", nombre))
+            aviso = f"Guardé la habilidad «{nombre_real}»."
+            ajustes: dict[str, Any] | None = {"habilidad": nombre_real[:40], "habilidad_cambiada": False}
+        else:
+            aviso = str(getattr(habilidad, "mensaje", "") or "No pude guardar la habilidad.")
+            ajustes = None
+        self._aviso_local(aviso, "escritorio")
+        datos = self._datos_tarjeta(clase, propuesta, t, aviso=aviso, ajustes=ajustes)
+        if datos is not None:
+            self._publicar_tarjeta(datos)
+
+    async def _aprobar_tarjeta(self, clase: str, objeto: Any, t: Any, sha: str, decision: str) -> None:
+        """Construye la ``AccionPC`` (solo metadatos), la pasa una vez por la compuerta y ejecuta el módulo."""
+        ident = str(t.id)
+        args: dict[str, Any] = {"canal": "escritorio", "tarjeta": ident, "sha256": sha, "aprobacion": "tarjeta"}
+        if clase == "correo":
+            if not bool(getattr(objeto, "listo", False)):
+                datos = self._datos_tarjeta(clase, objeto, t, aviso="Resuelve los problemas del borrador antes de "
+                                                                     "enviarlo.")
+                if datos is not None:
+                    self._publicar_tarjeta(datos)
+                return
+            n = int(getattr(objeto, "n_destinatarios", 0) or 0)
+            tipo, destino = "enviar_correo", "gmail"
+            args["n_destinatarios"] = n
+            descripcion = f"enviar un correo a {_plural(n, 'destinatario', 'destinatarios')}"
+        elif clase == "drive":
+            op = str(getattr(objeto, "op", ""))
+            tipo, destino = _TIPO_ACCION_DRIVE.get(op, ""), "drive"
+            if tipo == "drive_compartir":
+                args.update({"rol": getattr(objeto, "rol", None), "publico": bool(getattr(objeto, "publico", False)),
+                             "doble_confirmacion": decision == "aprobar_publico"})
+            descripcion = {"drive_subir": "subir un archivo a Drive", "drive_papelera": "mover un archivo a la papelera "
+                           "de Drive", "drive_compartir": "compartir un archivo de Drive"}.get(tipo, "operación de Drive")
+        else:
+            analisis = getattr(objeto, "analisis", None)
+            nivel = str(getattr(analisis, "nivel", "") or "")
+            lenguaje = str(getattr(objeto, "lenguaje", "") or "")
+            tipo, destino = "ejecutar_script", lenguaje or "script"
+            if not bool(getattr(analisis, "ejecutable", False)):
+                motivo_fn = self._atributo(analisis, "motivo_no_ejecutable", "")
+                try:
+                    motivo = str((motivo_fn() if callable(motivo_fn) else motivo_fn) or "")
+                except Exception as exc:
+                    log.debug("motivo_no_ejecutable falló (%s)", type(exc).__name__)
+                    motivo = ""
+                datos = self._datos_tarjeta(clase, objeto, t, aviso=motivo or "Riesgo crítico: no lo ejecuto desde "
+                                                                               "la app.")
+                if datos is not None:
+                    self._publicar_tarjeta(datos)
+                return
+            args["nivel"] = nivel
+            descripcion = (f"ejecutar un script de {_NOMBRES_LENGUAJE.get(lenguaje, lenguaje)} (riesgo {nivel})")
+        accion = AccionPC(tipo, args, descripcion, origen="usuario")
+        decision_permiso = await self._autorizar_v022(accion, "escritorio")
+        if not decision_permiso.aprobada:
+            resultado = ResultadoAccion(False, f"Acción no autorizada: {decision_permiso.motivo}", accion_tipo=tipo)
+            await self._auditar(accion, "escritorio", decision_permiso.veredicto, decision_permiso.motivo, resultado,
+                                destino=destino)
+            vigente = self.permisos.tarjeta(ident) or t
+            datos = self._datos_tarjeta(clase, objeto, vigente, aviso=decision_permiso.motivo)
+            if datos is not None:
+                self._publicar_tarjeta(datos)
+            return
+        if clase == "correo":
+            await self._enviar_correo_aprobado(accion, objeto, ident, sha, decision_permiso)
+        elif clase == "drive":
+            await self._ejecutar_drive_aprobado(accion, objeto, ident, sha, decision_permiso)
+        else:
+            await self._ejecutar_script_aprobado(accion, objeto, ident, sha, decision_permiso)
+
+    def _reabrir_tarjeta(self, clase: str, ident: str, objeto: Any, aviso: str) -> None:
+        """Reapertura tras un fallo o tras ejecutar: misma id → ``version+1`` (otro clic para reintentar).
+
+        Solo con el objeto VIGENTE en su módulo: si ya no está (lo reemplazó otro o caducó), la tarjeta se
+        cierra en vez de reabrir una copia vieja que desplazaría a la nueva de su clase.
+        """
+        if objeto is None:
+            self._publicar_cerrada(ident, clase, "fallo", aviso or "ya no está vigente")
+            return
+        canal_origen = str(getattr(objeto, "canal_origen", "escritorio") or "escritorio")
+        if canal_origen not in ("terminal", "escritorio", "telegram"):
+            canal_origen = "escritorio"
+        # Todo botón ya recibido se pulsó sobre la versión anterior (ver _decidir_tarjeta_cuerpo, paso 1b).
+        self._reabierta_tras_boton.pop(ident, None)
+        self._reabierta_tras_boton[ident] = self._n_boton_tarjeta
+        while len(self._reabierta_tras_boton) > MAX_TARJETAS_PUBLICADAS:
+            self._reabierta_tras_boton.pop(next(iter(self._reabierta_tras_boton)))
+        if self._registrar_y_publicar(clase, objeto, canal_origen, aviso=aviso) is None:
+            self._publicar_cerrada(ident, clase, "fallo", aviso or "no se pudo reabrir")
+
+    async def _enviar_correo_aprobado(self, accion: AccionPC, borrador: Any, ident: str, sha: str,
+                                      decision: DecisionPermiso) -> None:
+        resultado_envio: Any = None
+        try:
+            resultado_envio = await self.correo.enviar(ident, sha)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:   # una excepción cuenta como «pudo salir»: no se libera el cupo
+            log.warning("El envío del correo falló (%s)", type(exc).__name__)
+        ok = bool(getattr(resultado_envio, "ok", False))
+        codigo = str(getattr(resultado_envio, "codigo", "") or "error")[:40]
+        cuerpo = str(getattr(borrador, "cuerpo", "") or "")
+        n = int(getattr(borrador, "n_destinatarios", 0) or 0)
+        extra = {"n_destinatarios": n, "n_adjuntos": len(tuple(getattr(borrador, "adjuntos", ()) or ())),
+                 "bytes": getattr(resultado_envio, "bytes", None), "asunto_len": len(str(getattr(borrador, "asunto", "")
+                                                                                         or "")),
+                 "cuerpo_len": len(cuerpo), "cuerpo_sha256": hashlib.sha256(cuerpo.encode("utf-8")).hexdigest()[:12],
+                 "gmail_id": getattr(resultado_envio, "gmail_id", None), "codigo": codigo}
+        if ok:
+            self._publicar_cerrada(ident, "correo", "enviado", "enviado a Gmail")
+            asunto = _corto(getattr(borrador, "asunto", "") or "", 80)
+            self._aviso_local(f"📧 Enviado a Gmail: «{asunto}» para {_plural(n, 'destinatario', 'destinatarios')}.",
+                              "escritorio")
+            mensaje = "enviado a Gmail"
+        else:
+            pudo_salir = True if resultado_envio is None else bool(getattr(resultado_envio, "pudo_salir", True))
+            if not pudo_salir:
+                liberar = self._atributo(self.permisos, "liberar_envio_correo")
+                if callable(liberar):
+                    liberar(ident)             # nada salió: el intento no gasta cupo (§5.4)
+            mensaje = str(getattr(resultado_envio, "mensaje", "") or "") or (
+                "El envío falló por un error interno: puede que haya salido. Revisa Enviados en Gmail antes de volver "
+                "a pulsar Enviar.")
+            self._reabrir_tarjeta("correo", ident, self._objeto_tarjeta("correo", ident), mensaje)
+        resultado = ResultadoAccion(ok, mensaje[:200], accion_tipo="enviar_correo")
+        await self._auditar(accion, "escritorio", decision.veredicto, decision.motivo, resultado, extra=extra,
+                            destino="gmail")
+
+    async def _ejecutar_drive_aprobado(self, accion: AccionPC, operacion: Any, ident: str, sha: str,
+                                       decision: DecisionPermiso) -> None:
+        resultado_drive: Any = None
+        try:
+            resultado_drive = await self.drive.ejecutar(ident, sha)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La operación de Drive falló (%s)", type(exc).__name__)
+        ok = bool(getattr(resultado_drive, "ok", False))
+        datos = getattr(resultado_drive, "datos", {}) or {}
+        mensaje = str(getattr(resultado_drive, "mensaje", "") or ("Hecho en Drive." if ok else
+                                                                   "La operación de Drive falló."))
+        if ok:
+            self._publicar_cerrada(ident, "drive", "hecho", "hecho")
+            aviso = f"Drive: {mensaje}"
+            if datos.get("enlace"):
+                aviso += f" Enlace: {datos['enlace']}"
+            self._aviso_local(aviso, "escritorio")
+        else:
+            self._reabrir_tarjeta("drive", ident, self._objeto_tarjeta("drive", ident), mensaje)
+        archivo = getattr(operacion, "archivo", None)
+        archivo_id = str(getattr(archivo, "id", "") or "")
+        extra = {"op": str(getattr(operacion, "op", ""))[:20],
+                 "archivo_sha12": hashlib.sha256(archivo_id.encode()).hexdigest()[:12] if archivo_id else None,
+                 "bytes": getattr(operacion, "local_bytes", None), "rol": getattr(operacion, "rol", None),
+                 "publico": bool(getattr(operacion, "publico", False)),
+                 "codigo": str(getattr(resultado_drive, "codigo", "") or "error")[:40]}
+        resultado = ResultadoAccion(ok, mensaje[:200], accion_tipo=accion.tipo)
+        await self._auditar(accion, "escritorio", decision.veredicto, decision.motivo, resultado, extra=extra,
+                            destino="drive")
+
+    async def _ejecutar_script_aprobado(self, accion: AccionPC, propuesta: Any, ident: str, sha: str,
+                                        decision: DecisionPermiso) -> None:
+        resultado_script: Any = None
+        try:
+            resultado_script = await self.taller.ejecutar(ident, sha)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La ejecución del script falló (%s)", type(exc).__name__)
+        codigo = str(getattr(resultado_script, "codigo", "") or "error")[:40]
+        corrido = codigo in _CODIGOS_SCRIPT_CORRIDO
+        mensaje = str(getattr(resultado_script, "mensaje", "") or "")
+        if corrido:
+            self._tarjeta_salida(propuesta, resultado_script)
+            duracion = getattr(resultado_script, "duracion_s", 0.0)
+            if getattr(resultado_script, "tiempo_agotado", False):
+                aviso = "Script terminado por tiempo límite."
+            else:
+                aviso = (f"Script terminado: código {getattr(resultado_script, 'codigo_salida', None)} en "
+                         f"{formatear_decimal(float(duracion or 0.0), 1)} s.")
+            if codigo == "politica" and mensaje:
+                aviso += f" {mensaje}"
+            self._aviso_local(aviso, "escritorio")
+            reabrir = self._atributo(self.taller, "reabrir")
+            nueva = reabrir(ident) if callable(reabrir) else None
+            self._reabrir_tarjeta("script", ident, nueva, "")
+        else:
+            aviso = mensaje or "No pude ejecutar el script."
+            self._aviso_local(aviso, "escritorio")
+            self._reabrir_tarjeta("script", ident, self._objeto_tarjeta("script", ident), aviso)
+        analisis = getattr(propuesta, "analisis", None)
+        extra = {"lenguaje": str(getattr(propuesta, "lenguaje", "") or "")[:20],
+                 "nivel": str(getattr(analisis, "nivel", "") or "")[:20], "huella12": sha[:12],
+                 "codigo_salida": getattr(resultado_script, "codigo_salida", None),
+                 "tiempo_agotado": bool(getattr(resultado_script, "tiempo_agotado", False)),
+                 "dur_s": round(float(getattr(resultado_script, "duracion_s", 0.0) or 0.0), 3),
+                 "bytes_salida": getattr(resultado_script, "bytes_salida", None), "codigo": codigo}
+        resultado = ResultadoAccion(bool(getattr(resultado_script, "ok", False)), aviso[:200],
+                                    accion_tipo="ejecutar_script")
+        await self._auditar(accion, "escritorio", decision.veredicto, decision.motivo, resultado, extra=extra,
+                            destino=extra["lenguaje"] or "script")
+
+    def _tarjeta_salida(self, propuesta: Any, resultado: Any) -> None:
+        """Tarjeta «salida» (§12.2): stdout y stderr recortados a ``MAX_SALIDA_TARJETA`` unidades UTF-16,
+        conservando el principio. Reemplaza a la anterior. Nunca va a Gemini, Telegram ni al log."""
+        carpeta = _corto(getattr(resultado, "carpeta", "") or "", 160)
+        stdout, recortado_1 = _recortar_utf16(str(getattr(resultado, "stdout", "") or ""), MAX_SALIDA_TARJETA,
+                                              f"\n… (salida recortada: completa en {carpeta}/salida.txt)")
+        stderr, recortado_2 = _recortar_utf16(str(getattr(resultado, "stderr", "") or ""), MAX_SALIDA_TARJETA,
+                                              f"\n… (salida recortada: completa en {carpeta}/errores.txt)")
+        codigo_salida = getattr(resultado, "codigo_salida", None)
+        if isinstance(codigo_salida, bool) or not isinstance(codigo_salida, int):
+            codigo_salida = None
+        try:
+            duracion = round(float(getattr(resultado, "duracion_s", 0.0) or 0.0), 3)
+        except (TypeError, ValueError):
+            duracion = 0.0
+        if duracion != duracion or duracion in (float("inf"), float("-inf")):
+            duracion = 0.0
+        script_id = str(getattr(propuesta, "id", "") or "")
+        contenido = {"clase": "salida", "script_id": script_id, "codigo_salida": codigo_salida, "duracion_s": duracion}
+        sha = huella_contenido(contenido) or hashlib.sha256(
+            json.dumps(contenido, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        tiempo_agotado = bool(getattr(resultado, "tiempo_agotado", False))
+        resumen = ("Terminado por tiempo límite." if tiempo_agotado
+                   else f"Código {codigo_salida} en {formatear_decimal(duracion, 1)} s.")
+        canal_origen = str(getattr(propuesta, "canal_origen", "escritorio") or "escritorio")
+        ident = os.urandom(4).hex()
+        datos = {"id": ident, "clase": "salida", "version": 1, "sha256": sha, "titulo": "Salida del script",
+                 "resumen": resumen, "aviso": "", "botones": ["descartar"],
+                 "caduca_ts": time.time() + TTL_TARJETA_SALIDA_S,
+                 "canal_origen": canal_origen if canal_origen in ("terminal", "escritorio") else "escritorio",
+                 "correo": None, "drive": None, "script": None,
+                 "salida": {"script_id": script_id, "lenguaje": str(getattr(propuesta, "lenguaje", "") or ""),
+                            "codigo_salida": codigo_salida, "tiempo_agotado": tiempo_agotado, "duracion_s": duracion,
+                            "stdout": stdout, "stderr": stderr,
+                            "recortada": bool(getattr(resultado, "recortada", False)) or recortado_1 or recortado_2,
+                            "carpeta": carpeta}}
+        for anterior in list(self._tarjetas_info):
+            self._tarjetas_info.pop(anterior, None)
+            self._publicar_cerrada(anterior, "salida", "reemplazado", "la reemplazó una salida nueva")
+        self._tarjetas_info[ident] = {"datos": datos, "caduca": self._reloj() + TTL_TARJETA_SALIDA_S}
+        self._publicar_tarjeta(datos)
+
+    def _purgar_tarjetas(self) -> None:
+        """Bucle de vigilancia: cierra las tarjetas caducadas (aprobables y «salida»)."""
+        purgar = self._atributo(self.permisos, "purgar_caducadas")
+        if callable(purgar):
+            try:
+                vencidas = tuple(purgar())
+            except Exception as exc:
+                log.debug("purgar_caducadas falló (%s)", type(exc).__name__)
+                vencidas = ()
+            for t in vencidas:
+                self._descartar_en_modulo(t.clase, t.id)
+                self._publicar_cerrada(t.id, t.clase, "caducado", "caducó sin aprobarse")
+        ahora = self._reloj()
+        for ident, info in list(self._tarjetas_info.items()):
+            if ahora >= float(info.get("caduca", 0.0)):
+                self._tarjetas_info.pop(ident, None)
+                self._publicar_cerrada(ident, "salida", "caducado", "caducó")
+
     async def _accion_pc(self, accion: Any, *, canal: str = "terminal") -> tuple[ResultadoAccion, bool]:
         """Ejecuta una ``AccionPC`` (fijando antes el objetivo de ``cerrar_ventana``). Devuelve (resultado, error_propio).
 
@@ -3241,11 +5337,21 @@ class Orquestador:
         """Cuerpo de :meth:`_accion_pc` (con ``_CANAL_ACCION`` ya fijado)."""
         if not isinstance(accion, AccionPC):
             return ResultadoAccion(False, "No entendí qué acción ejecutar."), False
-        if accion.tipo in TIPOS_ACCION_V02:
+        if canal == "telegram":
+            # v0.2.1: lo pedido por Telegram lleva SIEMPRE su canal (la compuerta aplica sus reglas).
+            accion = self._accion_por_telegram(accion)
+        if accion.tipo == "lanzar_app" and accion.args.get("local") is True:
+            return await self._accion_app_local(accion, canal)
+        if accion.tipo in TIPOS_ACCION_V02 or (accion.tipo == "media" and self._media_en_control_pc()):
             return await self._accion_pc_v02(accion, canal)
         if self.aura is None:
-            return ResultadoAccion(False, "Control del PC no disponible en esta instalación.",
-                                   accion_tipo=accion.tipo), False
+            resultado = ResultadoAccion(False, "Control del PC no disponible en esta instalación.",
+                                        accion_tipo=accion.tipo)
+            if canal == "telegram":
+                self._anunciar_accion_remota(accion, resultado)
+            return resultado, False
+        if canal == "telegram":
+            return await self._accion_aura_remota(accion)
         if accion.tipo == "cerrar_ventana":
             v = self._ventana_previa
             if v is None:
@@ -3269,14 +5375,49 @@ class Orquestador:
                         and "no disponible" not in mensaje and "no soportad" not in mensaje)
         return resultado, error_propio
 
+    async def _accion_aura_remota(self, accion: AccionPC) -> tuple[ResultadoAccion, bool]:
+        """Acción de aura pedida por Telegram (``lanzar_app`` de RAMS_APPS o la música en Linux).
+
+        aura vuelve a pasar por la compuerta (con ``canal="telegram"``); aquí se audita y se anuncia
+        en el PC, como toda acción remota.
+        """
+        try:
+            resultado = await self.aura.ejecutar(accion)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("La acción remota %s falló: %s", accion.tipo, type(exc).__name__)
+            resultado = ResultadoAccion(False, "La acción falló por un error interno.", accion_tipo=accion.tipo)
+        if not isinstance(resultado, ResultadoAccion):
+            resultado = ResultadoAccion(False, "La acción no devolvió resultado.", accion_tipo=accion.tipo)
+        mensaje = resultado.mensaje or ""
+        if resultado.ok:
+            veredicto = "permitida"
+        elif mensaje.startswith("Acción no autorizada"):
+            veredicto = "denegada"
+        else:
+            veredicto = "fallo"
+        await self._auditar(accion, "telegram", veredicto, mensaje[:120], resultado)
+        self._anunciar_accion_remota(accion, resultado)
+        return resultado, False
+
     # --- v0.2: acciones de ControlPC (§C2.8, §C2.12) ------------------------------
 
     async def _accion_pc_v02(self, accion: AccionPC, canal: str) -> tuple[ResultadoAccion, bool]:
-        """``abrir_destino``/``buscar_en``/``prerrellenar``/``escribir_texto``/``travesura_cursor``.
+        """``abrir_destino``/``buscar_en``/``prerrellenar``/``escribir_texto``/``travesura_cursor``
+        (v0.2.1: y ``media`` en Windows, con las teclas multimedia de ControlPC).
 
         Orden: objetivo de ``escribir_texto`` (ventana previa) → compuerta (una vez) → ControlPC
-        → auditoría (``data/acciones_pc.jsonl`` sin el texto) y ``pc.accion``.
+        → auditoría (``data/acciones_pc.jsonl`` sin el texto) y ``pc.accion``. Lo pedido por
+        Telegram se anuncia además en el PC.
         """
+        resultado, error_propio = await self._accion_pc_v02_cuerpo(accion, canal)
+        if canal == "telegram":
+            self._anunciar_accion_remota(accion, resultado)
+        return resultado, error_propio
+
+    async def _accion_pc_v02_cuerpo(self, accion: AccionPC, canal: str) -> tuple[ResultadoAccion, bool]:
+        """Cuerpo de :meth:`_accion_pc_v02`."""
         tipo = accion.tipo
         if self.control_pc is None:
             resultado = ResultadoAccion(False, "Control del PC no disponible en esta instalación.", accion_tipo=tipo)
@@ -3385,6 +5526,8 @@ class Orquestador:
         if tipo == "travesura_cursor":
             return await cp.empujon_cursor(str(args.get("patron")), int(args.get("amplitud_px") or 0),
                                            segundos=float(args.get("segundos") or 0.0))
+        if tipo == "media":
+            return await cp.media(str(args.get("orden") or ""))
         return ResultadoAccion(False, "Tipo de acción no soportado por el control del PC.", accion_tipo=tipo)
 
     @staticmethod
@@ -3401,13 +5544,22 @@ class Orquestador:
         if isinstance(alias, str) and alias:
             datos["destino"] = alias
             datos["nombre_destino"] = nombre_destino(alias)
+            nombre_app = accion.args.get("nombre")
+            if accion.tipo == "lanzar_app" and isinstance(nombre_app, str) and nombre_app.strip():
+                datos["nombre_destino"] = nombre_app.strip()[:60]   # v0.2.1: app del menú Inicio
         if crudos.get("abortada_usuario"):
             datos["abortada_usuario"] = True
         return ResultadoAccion(ok, mensaje, datos, accion_tipo=accion.tipo)
 
     async def _auditar(self, accion: AccionPC, canal: str, veredicto: str, motivo: str,
-                       resultado: ResultadoAccion) -> None:
-        """Auditoría de las acciones v0.2 (§C2.12): JSONL privado y ``pc.accion``; nunca el texto ni títulos."""
+                       resultado: ResultadoAccion, *, extra: Mapping[str, Any] | None = None,
+                       destino: str | None = None) -> None:
+        """Auditoría de las acciones v0.2 (§C2.12): JSONL privado y ``pc.accion``; nunca el texto ni títulos.
+
+        v0.2.2 (§14.5): ``extra`` añade solo metadatos de ``_CAMPOS_AUDITORIA_V022`` (tamaños, conteos,
+        códigos y huellas[:12]; nunca cuerpo, direcciones, nombres de archivo, consultas, código ni
+        salida) y ``destino`` es ``"gmail"``, ``"drive"``, ``"google"`` o el lenguaje del script.
+        """
         args = accion.args
         texto = ""
         if accion.tipo in ("prerrellenar", "escribir_texto"):
@@ -3416,7 +5568,8 @@ class Orquestador:
             texto = str(args.get("consulta") or "")
         exe = _EXE_SEGURO_RE.sub("", str(args.get("exe") or "")).strip()[:60] or None
         clase = _EXE_SEGURO_RE.sub("", str(args.get("clase") or "")).strip()[:60] or None
-        alias = str(args.get("alias") or "") or None
+        # v0.2.1: la "fuente" de una foto (cámara o pantalla) cuenta como destino en la auditoría.
+        alias = destino or str(args.get("alias") or args.get("fuente") or args.get("orden") or "")[:40] or None
         if resultado.datos.get("abortada_usuario"):
             estado = "abortada"
         elif resultado.ok:
@@ -3434,6 +5587,12 @@ class Orquestador:
             "texto_sha256": hashlib.sha256(texto.encode("utf-8")).hexdigest()[:12] if texto else None,
             "resultado": estado,
         }
+        for clave, valor in (extra or {}).items():
+            if clave in _CAMPOS_AUDITORIA_V022 and clave not in registro:
+                if isinstance(valor, (str, int, float, bool)) or valor is None:
+                    registro[clave] = valor[:80] if isinstance(valor, str) else valor
+                elif isinstance(valor, (list, tuple)):
+                    registro[clave] = [str(v)[:40] for v in valor][:8]
         self._publicar("pc.accion", {"tipo": accion.tipo, "resultado": estado, "destino": alias or exe or clase})
         try:
             await asyncio.to_thread(_anexar_jsonl_privado, self._ruta_datos("acciones_pc.jsonl"), registro)
@@ -3709,6 +5868,58 @@ class Orquestador:
             return f"Travesuras apagadas hasta las {self._fecha_local(hasta).strftime('%H:%M')}. Uso: /travesuras on|off"
         return "Travesuras apagadas. Uso: /travesuras on|off"
 
+    def _texto_estado_puter(self) -> str:
+        """Línea de ``/estado`` del respaldo Puter: disponibilidad, orden en la cadena y contadores.
+
+        «lista» = Broca lo usaría en el próximo turno (app conectada, sesión de Puter, bajo el tope
+        diario y sin pausa por fallos); con la app lista pero Broca no, «tope diario alcanzado» o
+        «en pausa»; con la app conectada y con sesión pero el saldo de Puter agotado, «en pausa (saldo
+        de Puter agotado, reintento en N min)», con la cuenta atrás de ese momento; si no, «en espera».
+        Los contadores son los del día de Broca (``PUTER_MAX_CALLS_DAY``: lo paga el usuario) o, si
+        Broca no los da, los de la sesión del propio respaldo.
+        """
+        orden = "antes que Gemini" if getattr(self.settings, "puter_primero", False) else "si Gemini no puede"
+        tope = getattr(self.settings, "puter_max_llamadas_dia", None)
+        tope = tope if isinstance(tope, int) and not isinstance(tope, bool) and tope > 0 else None
+        try:
+            app_lista = bool(self.puter.disponible)
+            leer_estado = getattr(self.puter, "estado", None)
+            estado_app = leer_estado() if callable(leer_estado) else None
+            pausa_cuota = 0.0
+            if isinstance(estado_app, Mapping) and estado_app.get("conectado") and estado_app.get("listo"):
+                restante = estado_app.get("enfriamiento_s")
+                if isinstance(restante, (int, float)) and not isinstance(restante, bool) and restante > 0:
+                    pausa_cuota = float(restante)
+            usable = getattr(self.broca, "respaldo_disponible", None)
+            usable = app_lista if usable is None else bool(usable)
+            llamadas_hoy = getattr(self.broca, "llamadas_hoy", None)
+            hoy = llamadas_hoy() if callable(llamadas_hoy) else None
+            if isinstance(hoy, Mapping) and "respaldo" in hoy:
+                pedidos = int(hoy.get("respaldo", 0) or 0)
+                respondidos = int(hoy.get("respaldo_ok", 0) or 0)
+                cuenta = (f"hoy {pedidos} de {tope} pedidos" if tope is not None
+                          else f"hoy {_plural(pedidos, 'pedido', 'pedidos')}")
+            else:
+                cuentas = self.puter.estadisticas()
+                pedidos = int(cuentas.get("pedidos", 0) or 0)
+                respondidos = int(cuentas.get("respuestas", 0) or 0)
+                cuenta = f"en esta sesión {_plural(pedidos, 'pedido', 'pedidos')}"
+        except Exception as exc:
+            log.debug("Estado del respaldo Puter no disponible: %s", type(exc).__name__)
+            return f"IA de respaldo (Puter): sin datos · {orden}"
+        if usable:
+            situacion = "lista"
+        elif not app_lista and pausa_cuota > 0:
+            minutos = max(1, int(-(-pausa_cuota // 60)))
+            situacion = f"en pausa (saldo de Puter agotado, reintento en {minutos} min)"
+        elif not app_lista:
+            situacion = "en espera"
+        elif tope is not None and pedidos >= tope and cuenta.startswith("hoy"):
+            situacion = "tope diario alcanzado"
+        else:
+            situacion = "en pausa"
+        return f"IA de respaldo (Puter): {situacion} · {orden} · {cuenta}, {respondidos} con respuesta"
+
     def _texto_estado(self, estado: HomeostaticState) -> str:
         """Texto de ``/estado``: homeostasis, divergencia, presencia y tabla de módulos."""
         lineas = [
@@ -3735,6 +5946,8 @@ class Orquestador:
             molestar = f" · no molestar ({motivo or 'usuario'})"
         travesuras = "activas" if self._travesuras_efectivas() else "apagadas"
         lineas.append(f"Escritorio: {escritorio}{molestar} · travesuras {travesuras}")
+        if self.puter is not None:
+            lineas.append(self._texto_estado_puter())
         if self.vision is not None:
             lineas.append(self._texto_estado_vision())
         if self._diagnosticos:
@@ -3743,6 +5956,8 @@ class Orquestador:
                 diag = self._diagnosticos.get(clave)
                 if diag is None:
                     continue
+                if clave == "puter" and self.puter is not None:
+                    diag = self._diagnostico_puter()   # el de ahora, no el último publicado
                 detalle = f" ({diag.detalle})" if diag.detalle and clave != "hud" else ""
                 lineas.append(f"  {_NOMBRES_MODULO.get(clave, clave):<28} {diag.estado.value}{detalle}")
         return "\n".join(lineas)
@@ -4301,11 +6516,18 @@ class Orquestador:
         # v0.2: la visión suelta la cámara en su hilo; ControlPC para sus sondeos; el HUD borra el token.
         await self._cerrar_modulo("vision", self.vision, limite)
         await self._cerrar_modulo("control_pc", self.control_pc, limite)
+        # v0.2.2: el taller mata el script en curso (Job Object / grupo de procesos).
+        await self._cerrar_modulo("taller", self.taller, limite)
         await self._cerrar_modulo("hud", self.hud, limite)
         await self._cerrar_modulo("control", self.control, limite)
         await self._cerrar_modulo("aura", self.aura, limite)
         await self._cerrar_modulo("riko", self.riko, limite)
         await self._cerrar_modulo("web", self.web, limite)
+        # v0.2.2: Drive y correo antes que la cuenta de Google (cancela una conexión en curso; no revoca).
+        # Las tarjetas viven solo en memoria: se pierden.
+        await self._cerrar_modulo("drive", self.drive, limite)
+        await self._cerrar_modulo("correo", self.correo, limite)
+        await self._cerrar_modulo("google", self.google, limite)
         await self._cerrar_modulo("broca", self.broca, limite)
         await self._cerrar_modulo("conectoma", self.conectoma, limite, timeout=2.0)
         await self._cerrar_modulo("memoria", self.memoria, limite)
@@ -4344,7 +6566,9 @@ _MODULOS_P0: Final = ("core.config", "core.bus", "core.contracts", "core.etiquet
 _MODULOS_OPCIONALES: Final = ("core.flywire_loader", "core.control_server", "lobes.aura_vision_pc",
                               "lobes.nexus_link", "lobes.nexus_mcp_bridge", "lobes.web_researcher",
                               "lobes.vtube_bridge", "lobes.vtuber_ai_bridge", "lobes.corteza_motora",
-                              "interface.hud_server", "lobes.control_pc", "lobes.vision_continua")
+                              "interface.hud_server", "lobes.control_pc", "lobes.vision_continua",
+                              # v0.2.2
+                              "lobes.google_cuenta", "lobes.correo", "lobes.drive", "lobes.taller_scripts")
 _DEPENDENCIAS_OPCIONALES: Final = ("numpy", "cv2", "psutil", "httpx", "websockets", "edge_tts", "ddgs",
                                    "sounddevice", "soundfile", "prompt_toolkit")
 _BINARIOS: Final = ("hyprctl", "grim", "pw-play", "paplay", "aplay", "ffmpeg", "mpv", "ffplay", "notify-send",

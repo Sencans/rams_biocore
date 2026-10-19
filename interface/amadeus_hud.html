@@ -528,6 +528,58 @@
   }
   .rine-form button[type="submit"] { background: var(--rine-osc); border-color: var(--rine); color: #fff; }
 
+  /* ---------- Chip «Google» (google.estado, v0.2.2) ---------- */
+  .google-chip {
+    display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; max-width: 46ch;
+    border: 1px solid var(--bd); color: var(--txt-d); font-size: 12px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis;
+  }
+  .google-chip.ok { color: var(--bata); border-color: var(--ok); }
+  .google-chip.aviso { color: var(--aviso); border-color: var(--aviso); }
+
+  /* ---------- Tarjetas aprobables en el chat RINE (correo, Drive, scripts; v0.2.2) ---------- */
+  .msg.tarjeta { align-self: stretch; max-width: none; }
+  .msg.tarjeta .burbuja {
+    background: rgba(12, 20, 36, .95); color: var(--txt); border: 1px solid var(--pri); border-radius: 6px;
+    white-space: normal;
+  }
+  .msg.tarjeta.correo .burbuja { border-color: #4f8fd8; }
+  .msg.tarjeta.drive .burbuja { border-color: var(--ok); }
+  .msg.tarjeta.salida .burbuja { border-color: var(--bd); }
+  .msg.tarjeta.cerrada .burbuja { border-style: dashed; opacity: .8; }
+  .tarjeta-cabecera { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .tarjeta-cabecera .tipo { font: 600 12px/1.3 var(--f-sans); letter-spacing: .08em; text-transform: uppercase; }
+  .insignia-nivel { padding: 1px 8px; border-radius: 10px; font: 600 11px/1.4 var(--f-sans); color: #10131a; }
+  .insignia-nivel.bajo { background: #3fbf7f; }
+  .insignia-nivel.medio { background: #e0c23a; }
+  .insignia-nivel.alto { background: #e8833a; }
+  .insignia-nivel.critico { background: var(--corbata); color: #fff; }
+  .msg.tarjeta p { margin: 0 0 6px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .msg.tarjeta .tenue { color: var(--txt-d); font-size: 12.5px; }
+  .msg.tarjeta .aviso-tarjeta { color: var(--aviso); }
+  .msg.tarjeta .aviso-grande { padding: 6px 8px; border: 1px solid var(--corbata); background: rgba(40, 10, 8, .92); font-weight: 600; }
+  .msg.tarjeta ul { margin: 2px 0 6px; padding-left: 18px; }
+  .msg.tarjeta .problemas li, .msg.tarjeta .motivo { color: #ff9a8f; }
+  .msg.tarjeta .avisos-tarjeta li { color: var(--aviso); }  /* «.avisos» ya es la caja flotante del HUD */
+  .tarjeta-campo { display: flex; gap: 8px; }
+  .tarjeta-campo .etq { flex: 0 0 56px; color: var(--txt-d); font-size: 12.5px; }
+  .tarjeta-campo .val { min-width: 0; overflow-wrap: anywhere; }
+  .tarjeta-cuerpo, .msg.tarjeta pre {
+    margin: 6px 0; padding: 6px 8px; max-height: 280px; overflow: auto; background: rgba(0, 0, 0, .4);
+    font: 12.5px/1.45 var(--f-mono); white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  .msg.tarjeta pre.codigo { display: grid; grid-template-columns: auto 1fr; gap: 0 10px; white-space: pre; overflow-wrap: normal; tab-size: 4; }
+  .msg.tarjeta pre.codigo .lineas { color: var(--txt-d); text-align: right; user-select: none; }
+  .msg.tarjeta pre.codigo code { font: inherit; }
+  .msg.tarjeta .riesgo { display: flex; gap: 8px; align-items: center; color: var(--aviso); cursor: pointer; }
+  .msg.tarjeta .edicion label { display: flex; flex-direction: column; gap: 2px; margin-bottom: 6px; font-size: 12px; color: var(--txt-d); }
+  .msg.tarjeta input[type="text"], .msg.tarjeta textarea {
+    width: 100%; min-height: 32px; padding: 6px 8px; font: 14px/1.35 var(--f-sans); color: var(--txt);
+    background: rgba(12, 20, 36, .9); border: 1px solid var(--bd); resize: vertical;
+  }
+  .msg.tarjeta textarea { min-height: 120px; }
+  .msg.tarjeta .acciones input[type="text"] { flex: 1 1 100%; }
+
   /* ---------- Responsive: por debajo de 720 px las columnas se apilan ---------- */
   @media (max-width: 719.98px) {
     .app {
@@ -600,6 +652,7 @@
     </div>
     <div class="interlocutor" id="interlocutor"></div>
     <div class="derecha">
+      <span class="google-chip" id="google-chip" role="status" hidden>Google</span>
       <span class="ojo" id="ojo" role="status" aria-label="Visión local apagada" hidden><span aria-hidden="true">👁</span><span id="ojo-texto"></span></span>
       <div class="senal" id="senal" role="img" aria-label="Señal: sin datos">
         <span></span><span></span><span></span><span></span><em>señal</em>
@@ -1317,6 +1370,41 @@
     actualizarOjo();
   }
 
+  // Chip «Google» (google.estado por /ws, v0.2.2): desconectado, conectado (cuenta enmascarada) ·
+  // Gmail · Drive (leer / archivos propios / completo), o «reconecta». Solo textContent.
+  const MOTIVOS_GOOGLE = {
+    sin_conectar: "desconectado", conectando: "conectando…", sin_cliente: "falta el cliente OAuth",
+    cliente_invalido: "cliente OAuth inválido", token_invalido: "reconecta", offline: "sin red (--offline)",
+    sin_httpx: "sin httpx"
+  };
+  function alGoogle(d) {
+    const chip = $("google-chip");
+    const motivo = cadena(d.motivo, 24);
+    if (motivo === "deshabilitado") { chip.hidden = true; return; } // RAMS_GOOGLE=0: nada que mostrar
+    let texto;
+    if (d.conectado === true) {
+      const partes = [cadena(d.cuenta, 80) || "conectado"];
+      if (d.correo === true) { partes.push("Gmail"); }
+      if (d.drive_completo === true) {
+        partes.push("Drive (completo)");
+      } else if (d.drive_leer === true || d.drive_escribir === true) {
+        const permisos = [];
+        if (d.drive_leer === true) { permisos.push("leer"); }
+        if (d.drive_escribir === true) { permisos.push("archivos propios"); }
+        partes.push("Drive (" + permisos.join(" + ") + ")");
+      }
+      if (motivo === "token_no_guardado") { partes.push("solo esta sesión"); }
+      texto = "Google: " + partes.join(" · ");
+    } else {
+      texto = "Google: " + (MOTIVOS_GOOGLE[motivo] || "desconectado");
+    }
+    poner(chip, texto);
+    chip.setAttribute("title", texto);
+    chip.classList.toggle("ok", d.conectado === true);
+    chip.classList.toggle("aviso", motivo === "token_invalido" || motivo === "cliente_invalido");
+    chip.hidden = false;
+  }
+
   function alAccion(d) {
     const tipo = cadena(d.tipo, 40) || "acción";
     const resultado = cadena(d.resultado, 200);
@@ -1336,6 +1424,11 @@
     if (confianza !== null) { caja.setAttribute("title", "confianza " + coma(acotar(confianza, 0, 1), 2)); }
   }
 
+  // Etiquetas de respaldo de los módulos (si el diagnóstico llega sin nombre). v0.2.2: Google y taller.
+  const NOMBRE_MODULO = {
+    google: "Cuenta de Google", correo: "Correo (Gmail)", drive: "Google Drive", taller: "Taller de scripts"
+  };
+
   function alModulo(d) {
     const clave = cadena(d.clave, 40);
     if (!clave) { return; }
@@ -1343,7 +1436,8 @@
     ui.diags[clave] = d;
     const estado = cadena(d.estado, 20);
     const clase = CLASE_ESTADO[estado] || "";
-    const linea = "[" + estado + "] " + (cadena(d.nombre, 80) || clave) + (d.detalle ? " · " + cadena(d.detalle, 200) : "");
+    const nombre = cadena(d.nombre, 80) || NOMBRE_MODULO[clave] || clave;
+    const linea = "[" + estado + "] " + nombre + (d.detalle ? " · " + cadena(d.detalle, 200) : "");
     if (ui.superposicion) { lineaRestaurar(linea, clase); }
     if (!anterior || anterior.estado !== d.estado || anterior.detalle !== d.detalle) { registrar(linea, clase); }
     if (clave === "broca") { actualizarSenal(); }
@@ -1486,9 +1580,12 @@
     preferenciaAbierto: false,  // recordada en localStorage; se aplica cuando el chat existe
     sinLeer: 0,
     noMolestar: false,          // estado REAL del «no molestar» del usuario (mensaje no_molestar)
+    noMolestarActivo: false,    // cualquier «no molestar» (también el automático): no se abre el panel solo
     travesurasActivas: false,
     pendientes: new Map(),      // id → { li, botones, resolucion }
-    revision: new Map()         // pendientes de antes de reconectar, a la espera de la instantánea
+    revision: new Map(),        // pendientes de antes de reconectar, a la espera de la instantánea
+    tarjetas: new Map(),        // id → estado de la burbuja de una tarjeta aprobable (v0.2.2)
+    revisionTarjetas: new Set() // ids de tarjetas mostradas antes de reconectar, a la espera de la instantánea
   };
 
   function estadoChat(texto) { poner($("rine-estado"), texto); }
@@ -1504,6 +1601,11 @@
     // Solo las confirmaciones vigentes: las que están en revisión siguen bloqueadas hasta que la
     // instantánea de /escritorio confirme que siguen pendientes.
     chat.pendientes.forEach((p) => { p.botones.forEach((b) => { b.disabled = !si; }); });
+    // Tarjetas: sin conexión, bloqueadas hasta que la instantánea las vuelva a traer.
+    chat.tarjetas.forEach((t) => {
+      if (!si && !t.cerrada) { t.esperando = true; fijarResultadoTarjeta(t, "Sin conexión con " + ui.nombreIA + "."); }
+      actualizarBotonesTarjeta(t);
+    });
   }
 
   function actualizarInsignia() {
@@ -1592,17 +1694,34 @@
     hora.textContent = horaChat();
     li.appendChild(hora);
     lista.appendChild(li);
-    while (lista.children.length > MAX_MENSAJES_CHAT) { lista.removeChild(lista.firstChild); }
+    while (lista.children.length > MAX_MENSAJES_CHAT) {
+      const primero = lista.firstChild;
+      chat.tarjetas.forEach((t, id) => { if (t.li === primero) { chat.tarjetas.delete(id); } }); // también cuentan
+      lista.removeChild(primero);
+    }
     if (cerca || de === "yo") { lista.scrollTop = lista.scrollHeight; }
     if (!chat.abierto && de !== "yo") { chat.sinLeer += 1; actualizarInsignia(); }
     return { li: li, burbuja: burbuja };
   }
 
-  function enviarChat(objeto) {
+  // maxBytes (opcional; solo tarjeta_decision = 61 440): si el JSON pasa de ahí no se envía y se avisa.
+  // El resto de mensajes sigue sin tope propio (R.A.M.S. los limita a 8 KiB).
+  function enviarChat(objeto, maxBytes) {
     const socket = chat.ws;
     if (!socket || socket.readyState !== WebSocket.OPEN || !chat.conectado) { return false; }
+    let texto;
     try {
-      socket.send(JSON.stringify(objeto));
+      texto = JSON.stringify(objeto);
+    } catch (e) {
+      console.debug("Mensaje del chat no serializable:", e);
+      return false;
+    }
+    if (maxBytes && new TextEncoder().encode(texto).length > maxBytes) {
+      mensajeChat("sistema", "Es demasiado largo para guardarlo: acórtalo");
+      return false;
+    }
+    try {
+      socket.send(texto);
     } catch (e) {
       console.debug("No se pudo enviar por /escritorio:", e);
       return false;
@@ -1630,15 +1749,27 @@
       chat.revision.set(id, p);
     });
     chat.pendientes.clear();
+    // Tarjetas: igual que las confirmaciones (§12.1). Bloqueadas hasta que la instantánea las traiga.
+    chat.tarjetas.forEach((t, id) => {
+      if (t.cerrada) { return; }
+      t.esperando = true;
+      fijarResultadoTarjeta(t, "Comprobando si sigue vigente…");
+      actualizarBotonesTarjeta(t);
+      chat.revisionTarjetas.add(id);
+    });
   }
 
   function cerrarRevision() {
-    if (chat.revision.size === 0) { return; }
     chat.revision.forEach((p) => {
       p.botones.forEach((b) => { b.disabled = true; });
       poner(p.resolucion, "Ya no está pendiente.");
     });
     chat.revision.clear();
+    chat.revisionTarjetas.forEach((id) => {
+      const t = chat.tarjetas.get(id);
+      if (t && !t.cerrada) { cerrarTarjetaChat(t, { caducada: true }); }
+    });
+    chat.revisionTarjetas.clear();
   }
 
   function revivirPendiente(id) {
@@ -1709,6 +1840,725 @@
     }
   }
 
+  // ------------------------------------------------------------------
+  // Tarjetas aprobables (v0.2.2, docs/V022_CORREO_DRIVE_SCRIPTS.md §12–§13): correo, Drive, scripts
+  // y la salida de un script. Mismas reglas que validarTarjeta de Amadeus Desktop (lib/mapeo.js): los
+  // campos APROBABLES nunca se recortan (si uno no cumple, la tarjeta no se muestra) y los
+  // informativos se sanean. Solo textContent. Se aprueba solo con los botones, ligados al id, a la
+  // huella y a la VERSIÓN mostradas; el 2.º clic de un doble clic nunca cuenta y un botón de aprobar
+  // recién repintado (tras un clic o con otra versión) espera ARMADO_MS, así un doble clic sobre
+  // «Compartir» no completa «Sí, hacerlo público». «Copiar código» usa el portapapeles del navegador
+  // (127.0.0.1 es seguro).
+  // ------------------------------------------------------------------
+
+  // <validar-tarjeta> Bloque PURO (sin DOM): lo ejecuta tests/test_hud_server.py con node.
+  const TARJETA = (() => {
+    const CLASES = ["correo", "drive", "script", "salida"];
+    const BOTONES = ["aprobar", "aprobar_publico", "editar", "guardar", "copiar", "descartar"];
+    const DECISIONES = ["aprobar", "aprobar_publico", "editar", "guardar", "descartar"];
+    const RESULTADOS = ["enviado", "hecho", "ejecutado", "descartado", "caducado", "reemplazado", "denegado", "fallo"];
+    const NIVELES = ["bajo", "medio", "alto", "critico"];
+    const EJECUTABLES = ["bajo", "medio", "alto"];
+    const CATEGORIAS = ["borrado", "sobrescritura", "registro", "servicios", "red", "descarga_ejecucion",
+      "credenciales", "elevacion", "apagado", "seguridad", "persistencia", "ofuscacion", "dinamico",
+      "fuera_de_carpeta", "subproceso", "winapi", "interactivo", "sintaxis", "tamano", "analisis_degradado"];
+    const LENGUAJES = ["powershell", "python", "bash"];
+    const ROLES = ["reader", "commenter", "writer"];
+    const OPERACIONES = ["subir", "papelera", "compartir"];
+    const CANALES = ["terminal", "escritorio", "telegram"];
+    const POR_CLASE = {
+      correo: ["aprobar", "editar", "descartar"], drive: ["aprobar", "aprobar_publico", "descartar"],
+      script: ["aprobar", "guardar", "copiar", "descartar"], salida: ["descartar"]
+    };
+    const RE_ID = /^[0-9a-f]{8}$/;
+    const RE_HUELLA = /^[0-9a-f]{64}$/;
+    const MAX_CODIGO = 24576;          // bytes UTF-8 en R.A.M.S.; aquí .length (que es ≤ bytes)
+    const MAX_CUERPO = 10000;
+    const MAX_SALIDA = 8192;
+    const MAX_HALLAZGOS = 20;
+    const MAX_BYTES_DECISION = 61440;  // 60 KiB (por debajo de los 64 KiB de R.A.M.S. y de movil/)
+    const MAX_NOMBRE = 40;
+    const MAX_VERSION = 2147483647;    // 2^31 - 1 (= escritorio_link.MAX_VERSION_TARJETA)
+    const TOPES_CAMPOS = { para: 2600, cc: 2600, cco: 2600, asunto: 200, cuerpo: 10000, adjuntos: 1000 };
+    // eslint-disable-next-line no-control-regex
+    const RE_CONTROLES_INFO = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g;
+    // eslint-disable-next-line no-control-regex
+    const RE_CONTROLES = /[\u0000-\u001f\u007f]/;
+    // eslint-disable-next-line no-control-regex
+    const RE_CONTROLES_CUERPO = /[\u0000-\u0008\u000b-\u001f\u007f]/;
+    const RE_SUSTITUTO = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+    const INVALIDA = {};
+    const fallar = () => { throw INVALIDA; };
+    const esObjeto = (v) => Boolean(v) && typeof v === "object" && !Array.isArray(v);
+    // Informativo: sin controles (salvo \t, \n y \r) y recortado en unidades UTF-16 (.length).
+    const info = (v, max) => {
+      if (typeof v !== "string") { return ""; }
+      const limpio = v.replace(RE_CONTROLES_INFO, "");
+      return limpio.length > max ? limpio.slice(0, max) : limpio;
+    };
+    // Aprobable: NUNCA se recorta; fuera de tope (o no string) ⇒ la tarjeta entera no vale.
+    const aprobable = (v, max, nulo) => {
+      if ((v === null || v === undefined) && nulo !== false) { return ""; }
+      if (typeof v !== "string" || v.length > max || RE_SUSTITUTO.test(v)) { fallar(); }
+      return v;
+    };
+    const natural = (v, def) => (Number.isInteger(v) && v >= 0 ? v : (def === undefined ? 0 : def));
+    const real = (v, def) => (typeof v === "number" && Number.isFinite(v) ? v : def);
+    const unoDe = (v, lista) => (typeof v === "string" && lista.includes(v) ? v : fallar());
+    const listaInfo = (v, n, max) => (Array.isArray(v)
+      ? v.filter((x) => typeof x === "string").slice(0, n).map((x) => info(x, max)) : []);
+
+    const SECCIONES = {
+      correo(d) {
+        if (!esObjeto(d)) { fallar(); }
+        const s = {};
+        let total = 0;
+        ["para", "cc", "cco"].forEach((clave) => {
+          const v = (d[clave] === null || d[clave] === undefined) ? [] : d[clave];
+          if (!Array.isArray(v)) { fallar(); }
+          s[clave] = v.map((x) => aprobable(x, 254, false));
+          total += v.length;
+        });
+        if (total > 50) { fallar(); }
+        s.asunto = aprobable(d.asunto, 200);
+        s.cuerpo = aprobable(d.cuerpo, MAX_CUERPO);
+        const adjuntos = (d.adjuntos === null || d.adjuntos === undefined) ? [] : d.adjuntos;
+        if (!Array.isArray(adjuntos) || adjuntos.length > 5) { fallar(); }
+        s.adjuntos = adjuntos.map((a) => (esObjeto(a)
+          ? { nombre: aprobable(a.nombre, 255, false), bytes: natural(a.bytes), carpeta: info(a.carpeta, 20) }
+          : fallar()));
+        s.problemas = listaInfo(d.problemas, 10, 160);
+        s.avisos = listaInfo(d.avisos, 5, 160);
+        s.listo = d.listo === true;
+        return s;
+      },
+      drive(d) {
+        if (!esObjeto(d) || (d.paso !== 1 && d.paso !== 2)) { fallar(); }
+        const s = { op: unoDe(d.op, OPERACIONES), paso: d.paso };
+        const a = d.archivo;
+        s.archivo = !esObjeto(a) ? null : {
+          nombre: info(a.nombre, 200), tipo: info(a.tipo, 40), tamano: natural(a.tamano, null),
+          modificado: info(a.modificado, 32), propio: a.propio === true
+        };
+        if (d.local !== null && d.local !== undefined && !esObjeto(d.local)) { fallar(); }
+        s.local = !d.local ? null
+          : { nombre: aprobable(d.local.nombre, 255, false), bytes: natural(d.local.bytes), carpeta: info(d.local.carpeta, 20) };
+        s.carpeta_destino = typeof d.carpeta_destino === "string" ? info(d.carpeta_destino, 200) : null;
+        if (d.compartir !== null && d.compartir !== undefined && !esObjeto(d.compartir)) { fallar(); }
+        s.compartir = !d.compartir ? null : {
+          con: aprobable(d.compartir.con, 254), rol: unoDe(d.compartir.rol, ROLES), publico: d.compartir.publico === true
+        };
+        s.problemas = listaInfo(d.problemas, 10, 160);
+        s.listo = d.listo === true;
+        return s;
+      },
+      script(d) {
+        if (!esObjeto(d)) { fallar(); }
+        const nivel = unoDe(d.nivel, NIVELES);
+        const hallazgos = [];
+        let descartados = 0;
+        (Array.isArray(d.hallazgos) ? d.hallazgos : []).forEach((h) => {
+          if (!esObjeto(h) || !NIVELES.includes(h.nivel) || !CATEGORIAS.includes(h.categoria)) { descartados += 1; return; }
+          hallazgos.push({ nivel: h.nivel, categoria: h.categoria, linea: natural(h.linea, null), detalle: info(h.detalle, 160) });
+        });
+        hallazgos.sort((x, y) => NIVELES.indexOf(y.nivel) - NIVELES.indexOf(x.nivel)); // de más a menos grave
+        if (typeof d.codigo !== "string" || d.codigo.length > MAX_CODIGO || RE_SUSTITUTO.test(d.codigo)) { fallar(); }
+        return {
+          lenguaje: unoDe(d.lenguaje, LENGUAJES), plataforma: unoDe(d.plataforma, ["windows", "linux"]),
+          codigo: d.codigo, explicacion: info(d.explicacion, 600), efectos: listaInfo(d.efectos, 10, 160),
+          requisitos: listaInfo(d.requisitos, 10, 80), nivel: nivel,
+          ejecutable: d.ejecutable === true && EJECUTABLES.includes(nivel),   // lo crítico nunca
+          motivo_no_ejecutable: info(d.motivo_no_ejecutable, 200), metodo: unoDe(d.metodo, ["ast", "heuristico"]),
+          hallazgos: hallazgos.slice(0, MAX_HALLAZGOS),
+          hallazgos_omitidos: natural(d.hallazgos_omitidos) + descartados + Math.max(0, hallazgos.length - MAX_HALLAZGOS),
+          habilidad: info(d.habilidad, MAX_NOMBRE) || null, habilidad_cambiada: d.habilidad_cambiada === true,
+          ejecuciones: natural(d.ejecuciones)
+        };
+      },
+      salida(d) {
+        if (!esObjeto(d) || typeof d.script_id !== "string" || !RE_ID.test(d.script_id)) { fallar(); }
+        return {
+          script_id: d.script_id, lenguaje: unoDe(d.lenguaje, LENGUAJES),
+          codigo_salida: Number.isInteger(d.codigo_salida) ? d.codigo_salida : null,
+          tiempo_agotado: d.tiempo_agotado === true, duracion_s: Math.max(0, real(d.duracion_s, 0)),
+          stdout: info(d.stdout, MAX_SALIDA), stderr: info(d.stderr, MAX_SALIDA), recortada: d.recortada === true,
+          carpeta: info(d.carpeta, 160)
+        };
+      }
+    };
+
+    function validar(d) {
+      if (!esObjeto(d)) { return null; }
+      try {
+        if (typeof d.id !== "string" || !RE_ID.test(d.id) || !CLASES.includes(d.clase)) { fallar(); }
+        if (!Number.isInteger(d.version) || d.version < 1) { fallar(); }
+        if (typeof d.sha256 !== "string" || !RE_HUELLA.test(d.sha256)) { fallar(); }
+        const seccion = SECCIONES[d.clase](d[d.clase]);
+        let permitidos = POR_CLASE[d.clase];
+        if (d.clase === "script" && !seccion.ejecutable) { permitidos = permitidos.filter((b) => b !== "aprobar" && b !== "guardar"); }
+        const botones = [];
+        (Array.isArray(d.botones) ? d.botones : []).forEach((b) => {
+          if (typeof b === "string" && BOTONES.includes(b) && permitidos.includes(b) && !botones.includes(b)) { botones.push(b); }
+        });
+        const t = {
+          id: d.id, clase: d.clase, version: d.version, sha256: d.sha256, titulo: info(d.titulo, 120),
+          resumen: info(d.resumen, 300), aviso: info(d.aviso, 300), botones: botones, caduca_ts: real(d.caduca_ts, null),
+          canal_origen: CANALES.includes(d.canal_origen) ? d.canal_origen : "escritorio",
+          estado: d.clase === "salida" ? "info" : "pendiente"
+        };
+        CLASES.forEach((clase) => { t[clase] = clase === d.clase ? seccion : null; });
+        return t;
+      } catch (e) {
+        if (e === INVALIDA) { return null; }
+        throw e;
+      }
+    }
+
+    function validarCerrada(d) {
+      if (!esObjeto(d) || d.estado !== "cerrada" || typeof d.id !== "string" || !RE_ID.test(d.id)) { return null; }
+      if (!CLASES.includes(d.clase) || !RESULTADOS.includes(d.resultado)) { return null; }
+      return { id: d.id, clase: d.clase, estado: "cerrada", resultado: d.resultado, motivo: info(d.motivo, 200) };
+    }
+
+    // Botón → {id, sha256, decision, version?, nombre?, campos?} o null. Nunca recorta los campos
+    // (aprobables). extra.version = la versión que se VE; obligatoria salvo en «descartar».
+    function validarDecision(id, sha256, decision, extra) {
+      if (typeof id !== "string" || !RE_ID.test(id) || typeof sha256 !== "string" || !RE_HUELLA.test(sha256)) { return null; }
+      if (typeof decision !== "string" || !DECISIONES.includes(decision)) { return null; }
+      const x = esObjeto(extra) ? extra : {};
+      const ausente = (v) => v === undefined || v === null;
+      const out = { id: id, sha256: sha256, decision: decision };
+      if (ausente(x.version)) {
+        if (decision !== "descartar") { return null; }
+      } else if (!Number.isInteger(x.version) || x.version < 1 || x.version > MAX_VERSION) {
+        return null;
+      } else {
+        out.version = x.version;
+      }
+      if (decision === "guardar") {
+        if (typeof x.nombre !== "string") { return null; }
+        const nombre = x.nombre.trim();
+        if (nombre.length < 1 || nombre.length > MAX_NOMBRE || RE_CONTROLES.test(nombre) || RE_SUSTITUTO.test(nombre)) { return null; }
+        out.nombre = nombre;
+      } else if (!ausente(x.nombre)) {
+        return null;
+      }
+      if (decision === "editar") {
+        if (!esObjeto(x.campos)) { return null; }
+        const campos = {};
+        for (const clave of Object.keys(x.campos)) {
+          const valor = x.campos[clave];
+          const tope = Object.prototype.hasOwnProperty.call(TOPES_CAMPOS, clave) ? TOPES_CAMPOS[clave] : 0;
+          if (!tope || typeof valor !== "string" || valor.length > tope) { return null; }
+          if ((clave === "cuerpo" ? RE_CONTROLES_CUERPO : RE_CONTROLES).test(valor)) { return null; }
+          campos[clave] = valor;
+        }
+        out.campos = campos;
+      } else if (!ausente(x.campos)) {
+        return null;
+      }
+      return out;
+    }
+
+    return {
+      validar: validar, validarCerrada: validarCerrada, validarDecision: validarDecision,
+      MAX_BYTES_DECISION: MAX_BYTES_DECISION, TOPES_CAMPOS: TOPES_CAMPOS, MAX_NOMBRE: MAX_NOMBRE,
+      RE_CONTROLES: RE_CONTROLES, RE_CONTROLES_CUERPO: RE_CONTROLES_CUERPO, RE_SUSTITUTO: RE_SUSTITUTO
+    };
+  })();
+  // </validar-tarjeta>
+
+  const ESPERA_TECLADO_MS = 600;   // botones: se ignora la activación por teclado justo tras el foco
+  const ARMADO_MS = 1000;          // tarjeta repintada (otra versión o tras un clic): aprobar espera esto
+  let focoVentanaDesde = performance.now();
+  window.addEventListener("focus", () => { focoVentanaDesde = performance.now(); });
+  const recienEnfocada = () => performance.now() - focoVentanaDesde < ESPERA_TECLADO_MS;
+
+  const NOMBRE_LENGUAJE = { powershell: "PowerShell", python: "Python", bash: "Bash" };
+  const NOMBRE_NIVEL = { bajo: "riesgo bajo", medio: "riesgo medio", alto: "riesgo alto", critico: "riesgo crítico" };
+  const NOMBRE_CARPETA = {
+    descargas: "Descargas", documentos: "Documentos", escritorio: "Escritorio", imagenes: "Imágenes",
+    musica: "Música", videos: "Vídeos"
+  };
+  const NOMBRE_ROL = { reader: "lector", commenter: "comentarista", writer: "editor" };
+  const RESULTADO_TARJETA = {
+    enviado: "Enviado a Gmail", hecho: "Hecho", ejecutado: "Ejecutado", descartado: "Descartado",
+    caducado: "Caducó", reemplazado: "Reemplazado por uno nuevo"
+  };
+  const ETIQUETAS_CAMPOS = { para: "Para", cc: "CC", cco: "CCO", asunto: "Asunto", cuerpo: "Cuerpo", adjuntos: "Adjuntos" };
+
+  function nodoT(tag, clase, texto) {
+    const e = document.createElement(tag);
+    if (clase) { e.className = clase; }
+    if (texto !== undefined) { e.textContent = texto; }
+    return e;
+  }
+  function vaciar(e) { while (e.firstChild) { e.removeChild(e.firstChild); } }
+  function tamanoLegible(bytes) {
+    const n = num(bytes);
+    if (n === null) { return ""; }
+    if (n < 1024) { return n + " B"; }
+    if (n < 1048576) { return coma(n / 1024, 1) + " KB"; }
+    if (n < 1073741824) { return coma(n / 1048576, 1) + " MB"; }
+    return coma(n / 1073741824, 1) + " GB";
+  }
+  const carpetaLegible = (c) => NOMBRE_CARPETA[c] || (typeof c === "string" ? c : "");
+
+  function etiquetaBotonTarjeta(d, boton, t) {
+    if (boton === "aprobar") {
+      if (d.clase === "correo") { return "Enviar"; }
+      if (d.clase === "drive") { return { subir: "Subir", papelera: "Mover a la papelera", compartir: "Compartir" }[d.drive.op]; }
+      if (d.clase === "script") { return d.script.ejecuciones > 0 ? "Ejecutar otra vez" : "Ejecutar"; }
+      return null;
+    }
+    return {
+      aprobar_publico: "Sí, hacerlo público", editar: "Editar", guardar: "Guardar como habilidad",
+      copiar: t.copiado ? "Copiado" : "Copiar código", descartar: d.clase === "salida" ? "Cerrar" : "Descartar"
+    }[boton] || null;
+  }
+
+  function puedeAprobarTarjeta(t) {
+    const d = t.datos;
+    if (d.clase === "correo") { return d.correo.listo; }
+    if (d.clase === "drive") { return d.drive.listo; }
+    if (d.clase === "script") { return d.script.ejecutable && (d.script.nivel !== "alto" || t.riesgoOk); }
+    return false;
+  }
+
+  function fijarResultadoTarjeta(t, texto) {
+    t.textoResultado = texto;
+    if (t.resultado) { poner(t.resultado, texto); t.resultado.hidden = !texto; }
+  }
+
+  const esAprobar = (nombre) => nombre === "aprobar" || nombre === "aprobar_publico";
+  const armandoTarjeta = (t) => performance.now() < t.armadoHasta;
+
+  // Los botones de aprobar no se pueden pulsar durante ARMADO_MS: se acaban de pintar donde quizá
+  // estaba el puntero (p. ej. «Sí, hacerlo público» justo donde estaba «Compartir»).
+  function armarTarjeta(t) {
+    t.armadoHasta = performance.now() + ARMADO_MS;
+    setTimeout(() => { if (!t.cerrada) { actualizarBotonesTarjeta(t); } }, ARMADO_MS + 20);
+  }
+
+  function actualizarBotonesTarjeta(t) {
+    const libre = !t.cerrada && !t.enviando && !t.esperando && chat.conectado;
+    const ofrecidos = t.datos.botones;
+    t.botones.forEach((b) => {
+      const local = b.dataset.local === "1";
+      const nombre = b.dataset.boton;
+      // Un botón que manda una decisión solo vale si la tarjeta la ofrece AHORA (una «en curso», ninguna).
+      const ofrecido = !nombre || ofrecidos.includes(nombre);
+      b.disabled = local ? t.cerrada
+        : (!libre || !ofrecido || (esAprobar(nombre) && (armandoTarjeta(t) || !puedeAprobarTarjeta(t))));
+    });
+    t.entradas.forEach((e) => { e.disabled = !libre; });
+  }
+
+  function botonTarjeta(t, texto, clase, accion, opciones) {
+    const b = nodoT("button", clase, texto);
+    b.type = "button";
+    b.dataset.boton = (opciones && opciones.nombre) || "";
+    b.dataset.local = opciones && opciones.local ? "1" : "0";
+    b.addEventListener("click", (ev) => {
+      if (ev && ev.detail > 1) { return; }                          // 2.º clic de un doble clic: nunca cuenta
+      if (ev && ev.detail === 0 && recienEnfocada()) { return; } // teclado justo tras el foco: se ignora
+      if (esAprobar(b.dataset.boton) && armandoTarjeta(t)) { return; } // recién pintado: aún no
+      accion();
+    });
+    t.botones.push(b);
+    return b;
+  }
+
+  function campoTarjeta(etq, valor) {
+    const fila = nodoT("div", "tarjeta-campo");
+    fila.appendChild(nodoT("span", "etq", etq));
+    fila.appendChild(nodoT("span", "val", valor));
+    return fila;
+  }
+
+  function listaTarjeta(clase, items, titulo) {
+    const caja = nodoT("div", clase);
+    if (titulo) { caja.appendChild(nodoT("p", "tenue", titulo)); }
+    const ul = document.createElement("ul");
+    items.forEach((i) => { ul.appendChild(nodoT("li", "", i)); });
+    caja.appendChild(ul);
+    return caja;
+  }
+
+  function contenidoCorreoHud(c) {
+    const caja = nodoT("div", "contenido");
+    caja.appendChild(campoTarjeta("Para", c.para.join(", ") || "—"));
+    if (c.cc.length) { caja.appendChild(campoTarjeta("CC", c.cc.join(", "))); }
+    if (c.cco.length) { caja.appendChild(campoTarjeta("CCO", c.cco.join(", "))); }
+    caja.appendChild(campoTarjeta("Asunto", c.asunto || "(sin asunto)"));
+    caja.appendChild(nodoT("div", "tarjeta-cuerpo", c.cuerpo));
+    if (c.adjuntos.length) {
+      caja.appendChild(listaTarjeta("adjuntos", c.adjuntos.map((a) => [a.nombre, tamanoLegible(a.bytes),
+        carpetaLegible(a.carpeta)].filter(Boolean).join(" · ")), "Adjuntos"));
+    }
+    if (c.problemas.length) { caja.appendChild(listaTarjeta("problemas", c.problemas)); }
+    if (c.avisos.length) { caja.appendChild(listaTarjeta("avisos-tarjeta", c.avisos)); }
+    return caja;
+  }
+
+  function contenidoDriveHud(dr) {
+    const caja = nodoT("div", "contenido");
+    const nombre = dr.archivo ? dr.archivo.nombre : "";
+    let frase;
+    if (dr.op === "subir") {
+      const l = dr.local || { nombre: "", bytes: 0, carpeta: "" };
+      const detalle = [tamanoLegible(l.bytes), carpetaLegible(l.carpeta)].filter(Boolean).join(", ");
+      frase = "Subir «" + l.nombre + "»" + (detalle ? " (" + detalle + ")" : "") + " a «" + (dr.carpeta_destino || "Mi unidad") + "»";
+    } else if (dr.op === "papelera") {
+      frase = "Mover a la papelera de Drive «" + nombre + "». No se borra para siempre.";
+    } else {
+      const c = dr.compartir || { con: "", rol: "reader", publico: false };
+      frase = c.publico ? "Compartir «" + nombre + "» con cualquiera que tenga el enlace (solo lectura)"
+        : "Compartir «" + nombre + "» con " + c.con + " como " + (NOMBRE_ROL[c.rol] || "lector");
+    }
+    caja.appendChild(nodoT("p", "", frase));
+    if (dr.paso === 2) { caja.appendChild(nodoT("p", "aviso-grande", "Cualquiera con el enlace podrá verlo")); }
+    if (dr.problemas.length) { caja.appendChild(listaTarjeta("problemas", dr.problemas)); }
+    return caja;
+  }
+
+  function contenidoScriptHud(t) {
+    const s = t.datos.script;
+    const caja = nodoT("div", "contenido");
+    if (s.explicacion) { caja.appendChild(nodoT("p", "", s.explicacion)); }
+    if (s.efectos.length) { caja.appendChild(listaTarjeta("efectos", s.efectos, "Qué hará")); }
+    if (s.requisitos.length) { caja.appendChild(listaTarjeta("requisitos", s.requisitos, "Necesita")); }
+    const hallazgos = s.hallazgos.map((h) => [h.linea !== null ? "línea " + h.linea : "", h.categoria, h.nivel, h.detalle]
+      .filter(Boolean).join(" · "));
+    if (s.hallazgos_omitidos > 0) { hallazgos.push("… y " + s.hallazgos_omitidos + " hallazgos más"); }
+    if (hallazgos.length) {
+      caja.appendChild(listaTarjeta("hallazgos", hallazgos, "Análisis " + (s.metodo === "heuristico" ? "heurístico" : "local")));
+    }
+    if (s.habilidad) {
+      caja.appendChild(nodoT("p", "tenue", "Habilidad «" + s.habilidad + "»" +
+        (s.habilidad_cambiada ? ": el código cambió desde que la guardaste; revísalo" : "")));
+    }
+    // El código COMPLETO (nunca se recorta), con números de línea y solo como texto.
+    const pre = nodoT("pre", "codigo");
+    const lineas = s.codigo.split("\n");
+    if (lineas.length > 1 && lineas[lineas.length - 1] === "") { lineas.pop(); }
+    const numeros = nodoT("span", "lineas", lineas.map((_l, i) => String(i + 1)).join("\n"));
+    numeros.setAttribute("aria-hidden", "true");
+    const code = nodoT("code", "", s.codigo);
+    pre.appendChild(numeros);
+    pre.appendChild(code);
+    t.codigoEl = code;
+    caja.appendChild(pre);
+    if (!s.ejecutable) {
+      caja.appendChild(nodoT("p", "motivo", "No se puede ejecutar desde aquí" +
+        (s.motivo_no_ejecutable ? ": " + s.motivo_no_ejecutable : ".")));
+    } else if (s.nivel === "alto" && !t.cerrada) {
+      const etiqueta = nodoT("label", "riesgo");
+      const casilla = document.createElement("input");
+      casilla.type = "checkbox";
+      casilla.checked = t.riesgoOk === true;
+      casilla.addEventListener("change", () => { t.riesgoOk = casilla.checked === true; actualizarBotonesTarjeta(t); });
+      etiqueta.appendChild(casilla);
+      etiqueta.appendChild(nodoT("span", "", "Leí el código y entiendo el riesgo"));
+      caja.appendChild(etiqueta);
+    }
+    return caja;
+  }
+
+  function contenidoSalidaHud(sa) {
+    const caja = nodoT("div", "contenido");
+    caja.appendChild(nodoT("p", "", "Código de salida: " + (sa.codigo_salida === null ? "—" : sa.codigo_salida) +
+      " · " + coma(sa.duracion_s, 1) + " s"));
+    if (sa.tiempo_agotado) { caja.appendChild(nodoT("p", "aviso-tarjeta", "Terminado por tiempo límite")); }
+    if (sa.stdout) { caja.appendChild(nodoT("p", "tenue", "Salida")); caja.appendChild(nodoT("pre", "", sa.stdout)); }
+    if (sa.stderr) { caja.appendChild(nodoT("p", "tenue", "Errores")); caja.appendChild(nodoT("pre", "", sa.stderr)); }
+    if (sa.recortada) { caja.appendChild(nodoT("p", "tenue", "… (salida recortada)")); }
+    if (sa.carpeta) { caja.appendChild(nodoT("p", "tenue", "Carpeta: " + sa.carpeta)); }
+    return caja;
+  }
+
+  // Edición del correo: input y textarea con maxlength = topes de R.A.M.S. (toda decisión cabe en 60 KiB).
+  function formularioCorreoHud(t) {
+    const c = t.datos.correo;
+    const caja = nodoT("div", "contenido edicion");
+    const original = {
+      para: c.para.join(", "), cc: c.cc.join(", "), cco: c.cco.join(", "), asunto: c.asunto, cuerpo: c.cuerpo,
+      adjuntos: c.adjuntos.map((a) => a.nombre).join(", ")
+    };
+    const entradas = {};
+    ["para", "cc", "cco", "asunto", "cuerpo", "adjuntos"].forEach((clave) => {
+      const etiqueta = nodoT("label", "", ETIQUETAS_CAMPOS[clave]);
+      const entrada = document.createElement(clave === "cuerpo" ? "textarea" : "input");
+      if (clave !== "cuerpo") { entrada.type = "text"; } else { entrada.rows = 8; }
+      entrada.setAttribute("maxlength", String(TARJETA.TOPES_CAMPOS[clave]));
+      entrada.value = original[clave];
+      etiqueta.appendChild(entrada);
+      caja.appendChild(etiqueta);
+      entradas[clave] = entrada;
+      t.entradas.push(entrada);
+    });
+    t.edicion = { original: original, entradas: entradas };
+    return caja;
+  }
+
+  function accionesTarjetaHud(t) {
+    const d = t.datos;
+    const caja = nodoT("div", "acciones");
+    if (t.editando) {
+      caja.appendChild(botonTarjeta(t, "Guardar cambios", "aprobar", () => guardarEdicionHud(t), { nombre: "editar" }));
+      caja.appendChild(botonTarjeta(t, "Cancelar", "", () => { t.editando = false; pintarTarjetaHud(t); }, { local: true }));
+      t.cajaAcciones = caja; // «Quitar caracteres no válidos» se añade aquí solo si hace falta
+      return caja;
+    }
+    if (t.nombrando) {
+      const entrada = document.createElement("input");
+      entrada.type = "text";
+      entrada.setAttribute("maxlength", String(TARJETA.MAX_NOMBRE));
+      entrada.setAttribute("aria-label", "Nombre de la habilidad");
+      entrada.placeholder = "Nombre de la habilidad";
+      t.entradas.push(entrada);
+      t.entradaNombre = entrada;
+      caja.appendChild(entrada);
+      caja.appendChild(botonTarjeta(t, "Guardar", "aprobar", () => guardarHabilidadHud(t), { nombre: "guardar" }));
+      caja.appendChild(botonTarjeta(t, "Cancelar", "", () => { t.nombrando = false; pintarTarjetaHud(t); }, { local: true }));
+      return caja;
+    }
+    d.botones.forEach((nombre) => {
+      const texto = etiquetaBotonTarjeta(d, nombre, t);
+      if (!texto) { return; }
+      let accion;
+      if (nombre === "editar") {
+        accion = () => { t.editando = true; pintarTarjetaHud(t); };
+      } else if (nombre === "guardar") {
+        accion = () => { t.nombrando = true; pintarTarjetaHud(t); if (t.entradaNombre) { t.entradaNombre.focus(); } };
+      } else if (nombre === "copiar") {
+        accion = () => copiarCodigoHud(t);
+      } else {
+        accion = () => decidirTarjetaHud(t, nombre);
+      }
+      const clase = (nombre === "aprobar" || nombre === "aprobar_publico") ? "aprobar" : (nombre === "descartar" ? "rechazar" : "");
+      caja.appendChild(botonTarjeta(t, texto, clase, accion, { nombre: nombre, local: nombre === "copiar" }));
+    });
+    return caja;
+  }
+
+  function pintarTarjetaHud(t) {
+    const d = t.datos;
+    t.botones = [];
+    t.entradas = [];
+    t.entradaNombre = null;
+    t.codigoEl = null;
+    t.edicion = null;
+    t.cajaAcciones = null;
+    t.botonLimpiar = null;
+    const b = t.burbuja;
+    vaciar(b);
+    const cabecera = nodoT("div", "tarjeta-cabecera");
+    let tipo = "▶ Resultado del script";
+    if (d.clase === "correo") { tipo = "📧 Correo"; }
+    if (d.clase === "drive") { tipo = "🗂 Drive · " + d.drive.op; }
+    if (d.clase === "script") { tipo = "🧪 Script · " + (NOMBRE_LENGUAJE[d.script.lenguaje] || "script"); }
+    cabecera.appendChild(nodoT("span", "tipo", tipo));
+    if (d.clase === "script") { cabecera.appendChild(nodoT("span", "insignia-nivel " + d.script.nivel, NOMBRE_NIVEL[d.script.nivel])); }
+    b.appendChild(cabecera);
+    if (d.titulo) { b.appendChild(nodoT("p", "", d.titulo)); }
+    if (d.resumen) { b.appendChild(nodoT("p", "tenue", d.resumen)); }
+    if (d.aviso) { b.appendChild(nodoT("p", "aviso-tarjeta", d.aviso)); }
+    if (t.editando && d.clase === "correo") { b.appendChild(formularioCorreoHud(t)); }
+    else if (d.clase === "correo") { b.appendChild(contenidoCorreoHud(d.correo)); }
+    else if (d.clase === "drive") { b.appendChild(contenidoDriveHud(d.drive)); }
+    else if (d.clase === "script") { b.appendChild(contenidoScriptHud(t)); }
+    else { b.appendChild(contenidoSalidaHud(d.salida)); }
+    if (!t.cerrada) { b.appendChild(accionesTarjetaHud(t)); }
+    t.resultado = nodoT("span", "resolucion", t.textoResultado || "");
+    t.resultado.hidden = !t.textoResultado;
+    b.appendChild(t.resultado);
+    actualizarBotonesTarjeta(t);
+  }
+
+  function decidirTarjetaHud(t, decision, extra) {
+    if (t.cerrada || t.enviando || t.esperando) { return; }
+    const d = t.datos;
+    // La versión que se VE: R.A.M.S. ignora el clic si mientras tanto llegó otra (o sigue en curso).
+    const v = TARJETA.validarDecision(d.id, d.sha256, decision, Object.assign({}, extra, { version: d.version }));
+    // Editar y guardar se validan antes (guardarEdicionHud, guardarHabilidadHud): aquí no debería fallar.
+    if (!v) { fijarResultadoTarjeta(t, "No se pudo preparar la decisión: revisa los datos."); return; }
+    if (!enviarChat(Object.assign({ tipo: "tarjeta_decision" }, v), TARJETA.MAX_BYTES_DECISION)) {
+      // Sin conexión, o demasiado larga (enviarChat ya lo dijo en el chat).
+      if (!chat.conectado) { fijarResultadoTarjeta(t, "Sin conexión con " + ui.nombreIA + "."); }
+      return;
+    }
+    t.esperando = true; // bloqueada hasta la versión nueva o el cierre
+    t.ultimaDecision = decision;
+    fijarResultadoTarjeta(t, decision === "aprobar" && d.clase === "script" ? "Ejecutando…"
+      : (decision === "editar" ? "Guardando cambios…" : (decision === "guardar" ? "Guardando la habilidad…" : "Enviando…")));
+    actualizarBotonesTarjeta(t);
+  }
+
+  // Quita los controles de un campo de edición (solo al pulsar «Quitar caracteres no válidos», y a la
+  // vista en el propio campo): en el cuerpo \r\n, \r, \v y \f pasan a \n; en los de una línea, saltos
+  // y tabuladores pasan a un espacio. El resto de controles se quita.
+  function sinControlesHud(clave, valor) {
+    // eslint-disable-next-line no-control-regex
+    if (clave === "cuerpo") { return valor.replace(/\r\n?|[\u000b\u000c]/g, "\n").replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, ""); }
+    // eslint-disable-next-line no-control-regex
+    return valor.replace(/[\t\n\r\u000b\u000c]+/g, " ").replace(/[\u0000-\u001f\u007f]/g, "");
+  }
+
+  function limpiarEdicionHud(t) {
+    if (!t.edicion) { return; }
+    Object.keys(t.edicion.entradas).forEach((clave) => {
+      const entrada = t.edicion.entradas[clave];
+      const despues = sinControlesHud(clave, String(entrada.value));
+      if (despues !== entrada.value) { entrada.value = despues; }
+    });
+    if (t.botonLimpiar) { t.botonLimpiar.hidden = true; }
+    fijarResultadoTarjeta(t, "Quité los caracteres no válidos: revisa el texto y pulsa «Guardar cambios».");
+  }
+
+  function guardarEdicionHud(t) {
+    if (!t.edicion) { return; }
+    const campos = {};
+    // Con problemas en el borrador, los destinatarios y adjuntos van SIEMPRE tal como se ven en el formulario:
+    // lo que R.A.M.S. no pudo resolver (p. ej. un alias desconocido) no sale en él y sigue bloqueando hasta
+    // que se edite su campo; así «Guardar cambios» deja el correo como se ve (sin eso, quedaba atascado).
+    const correo = t.datos.correo;
+    const problemas = !!correo && Array.isArray(correo.problemas) && correo.problemas.length > 0;
+    Object.keys(t.edicion.entradas).forEach((clave) => {
+      const valor = String(t.edicion.entradas[clave].value);
+      const lista = clave === "para" || clave === "cc" || clave === "cco" || clave === "adjuntos";
+      if (valor !== t.edicion.original[clave] || (problemas && lista)) { campos[clave] = valor; }
+    });
+    if (Object.keys(campos).length === 0) { t.editando = false; pintarTarjetaHud(t); return; }
+    if (Object.keys(campos).some((clave) => campos[clave].length > TARJETA.TOPES_CAMPOS[clave])) {
+      fijarResultadoTarjeta(t, "Es demasiado largo para guardarlo: acórtalo.");
+      return;
+    }
+    // Un tabulador en el asunto o un salto de línea de Word (\v) en el cuerpo no pasan la validación
+    // de R.A.M.S.: se dice dónde están y se ofrece quitarlos (nunca se quitan en silencio).
+    const conControles = Object.keys(campos).filter((clave) =>
+      (clave === "cuerpo" ? TARJETA.RE_CONTROLES_CUERPO : TARJETA.RE_CONTROLES).test(campos[clave]));
+    if (conControles.length) {
+      fijarResultadoTarjeta(t, "Hay caracteres invisibles no válidos (tabuladores o saltos de línea pegados) en " +
+        conControles.map((c) => ETIQUETAS_CAMPOS[c]).join(", ") + ". Pulsa «Quitar caracteres no válidos» y revisa antes de guardar.");
+      if (!t.botonLimpiar && t.cajaAcciones) {
+        t.botonLimpiar = botonTarjeta(t, "Quitar caracteres no válidos", "", () => limpiarEdicionHud(t), { local: true });
+        t.cajaAcciones.appendChild(t.botonLimpiar);
+      }
+      if (t.botonLimpiar) { t.botonLimpiar.hidden = false; }
+      actualizarBotonesTarjeta(t);
+      return;
+    }
+    decidirTarjetaHud(t, "editar", { campos: campos });
+  }
+
+  function guardarHabilidadHud(t) {
+    const nombre = String(t.entradaNombre ? t.entradaNombre.value : "").trim();
+    if (!nombre || nombre.length > TARJETA.MAX_NOMBRE) {
+      fijarResultadoTarjeta(t, "Ponle un nombre (máximo " + TARJETA.MAX_NOMBRE + " caracteres).");
+      return;
+    }
+    if (TARJETA.RE_CONTROLES.test(nombre) || TARJETA.RE_SUSTITUTO.test(nombre)) {
+      fijarResultadoTarjeta(t, "El nombre tiene caracteres no válidos (tabuladores o saltos de línea): quítalos.");
+      return;
+    }
+    decidirTarjetaHud(t, "guardar", { nombre: nombre });
+  }
+
+  // «Copiar código»: portapapeles del navegador; si no se puede, se selecciona el código para Ctrl+C.
+  function copiarCodigoHud(t) {
+    const codigo = t.datos.clase === "script" ? t.datos.script.codigo : "";
+    const seleccionar = () => {
+      try {
+        if (t.codigoEl && window.getSelection) { window.getSelection().selectAllChildren(t.codigoEl); }
+      } catch (e) { console.debug("No se pudo seleccionar el código:", e); }
+      fijarResultadoTarjeta(t, "Código seleccionado: cópialo con Ctrl+C.");
+    };
+    const copiado = () => {
+      t.copiado = true;
+      const b = t.botones.find((x) => x.dataset.boton === "copiar");
+      if (b) { poner(b, "Copiado"); }
+    };
+    if (!codigo) { return; }
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      navigator.clipboard.writeText(codigo).then(copiado, seleccionar);
+    } else {
+      seleccionar();
+    }
+  }
+
+  function cerrarTarjetaChat(t, d) {
+    t.cerrada = true;
+    t.enviando = false;
+    t.esperando = false;
+    t.editando = false;
+    t.nombrando = false;
+    t.li.classList.add("cerrada");
+    let texto;
+    if (d.caducada === true) { texto = "Ya no está vigente."; }
+    else if (d.resultado === "denegado" || d.resultado === "fallo") { texto = "No se pudo" + (d.motivo ? ": " + d.motivo : "."); }
+    else if (d.resultado === "descartado" && t.datos.clase === "salida") { texto = "Cerrado."; }
+    else { texto = (RESULTADO_TARJETA[d.resultado] || "Cerrada") + (d.motivo ? " · " + d.motivo : ""); }
+    t.textoResultado = texto;
+    pintarTarjetaHud(t);
+  }
+
+  function alTarjetaChat(d) {
+    if (d.estado === "cerrada") {
+      const c = TARJETA.validarCerrada(d);
+      if (!c) { return; }
+      chat.revisionTarjetas.delete(c.id);
+      const t = chat.tarjetas.get(c.id);
+      if (t && !t.cerrada) { cerrarTarjetaChat(t, c); }
+      return;
+    }
+    const v = TARJETA.validar(d);
+    if (!v) { return; } // un campo aprobable fuera de tope: la tarjeta no se muestra (nunca se recorta)
+    chat.revisionTarjetas.delete(v.id);
+    const actual = chat.tarjetas.get(v.id);
+    if (actual && !actual.cerrada) {
+      if (v.version < actual.datos.version) { return; } // versión vieja: se ignora
+      const misma = v.version === actual.datos.version;
+      const trasClic = actual.ultimaDecision !== null;
+      // La respuesta a «Guardar como habilidad» llega con la misma versión (§14.4): sale del modo nombre.
+      if (actual.ultimaDecision === "guardar") { actual.nombrando = false; }
+      actual.ultimaDecision = null;
+      actual.datos = v;
+      actual.enviando = false;
+      actual.esperando = false;
+      actual.textoResultado = "";
+      // Repintada en respuesta a un clic o con otro contenido: lo que quede bajo el puntero no se puede
+      // aprobar al instante (un doble clic nunca aprueba lo que su primer clic hizo aparecer).
+      if (trasClic || !misma) { armarTarjeta(actual); }
+      if (misma && (actual.editando || actual.nombrando)) { // no se pierde lo que el usuario escribía
+        // Si la tarjeta ya no ofrece guardar (está «en curso»), se dice qué hace R.A.M.S.
+        const sigue = v.botones.includes(actual.editando ? "editar" : "guardar");
+        fijarResultadoTarjeta(actual, sigue ? "" : v.aviso);
+        actualizarBotonesTarjeta(actual);
+        return;
+      }
+      if (!misma) { actual.editando = false; actual.nombrando = false; actual.riesgoOk = false; actual.copiado = false; }
+      pintarTarjetaHud(actual);
+      return;
+    }
+    const m = mensajeChat("tarjeta " + v.clase, "");
+    m.li.dataset.id = v.id;
+    m.li.setAttribute("aria-label", "Tarjeta para aprobar");
+    const t = {
+      li: m.li, burbuja: m.burbuja, datos: v, cerrada: false, enviando: false, esperando: false, editando: false,
+      nombrando: false, riesgoOk: false, copiado: false, textoResultado: "", botones: [], entradas: [],
+      resultado: null, edicion: null, entradaNombre: null, codigoEl: null, ultimaDecision: null,
+      armadoHasta: 0, cajaAcciones: null, botonLimpiar: null
+    };
+    chat.tarjetas.set(v.id, t);
+    // Una 2.ª confirmación de compartir en público nunca se puede pulsar en cuanto aparece.
+    if (v.botones.includes("aprobar_publico")) { armarTarjeta(t); }
+    pintarTarjetaHud(t);
+    if (v.estado === "pendiente" && !chat.abierto && !chat.noMolestar && !chat.noMolestarActivo) {
+      abrirChat(true, false); // una tarjeta para aprobar se ve (salvo con «no molestar»)
+    }
+  }
+
   // «No molestar» del usuario: el botón refleja SIEMPRE el estado que manda R.A.M.S. (mensaje
   // no_molestar de /escritorio, también en la instantánea al conectar), no un estado local.
   function pintarNoMolestar(motivoAutomatico) {
@@ -1723,6 +2573,7 @@
 
   function alNoMolestarChat(d) {
     chat.noMolestar = d.usuario === true;
+    chat.noMolestarActivo = d.activo === true;
     pintarNoMolestar(d.activo === true && !chat.noMolestar ? cadena(d.motivo, 24) : "");
   }
 
@@ -1760,7 +2611,8 @@
       if (texto) { mensajeChat("sistema", texto); }
     }],
     ["travesuras", alTravesuras],
-    ["no_molestar", alNoMolestarChat]
+    ["no_molestar", alNoMolestarChat],
+    ["tarjeta", alTarjetaChat]
   ]);
 
   function procesarChat(crudo) {
@@ -1768,9 +2620,10 @@
     let mensaje;
     try { mensaje = JSON.parse(crudo); } catch (e) { return; }
     if (!mensaje || typeof mensaje !== "object" || typeof mensaje.tipo !== "string") { return; }
-    // La instantánea llega justo tras el «hola» con el permiso vigente primero: el primer mensaje
-    // que no es «permiso» cierra la revisión (siempre llega «no_molestar», §C2.4).
-    if (mensaje.tipo !== "permiso" && mensaje.tipo !== "hola") { cerrarRevision(); }
+    // La instantánea llega justo tras el «hola» con el permiso vigente y las tarjetas primero: el
+    // primer mensaje que no es «hola», «permiso» ni «tarjeta» cierra la revisión (siempre llega
+    // «no_molestar», §C2.4 y §12.1).
+    if (mensaje.tipo !== "permiso" && mensaje.tipo !== "hola" && mensaje.tipo !== "tarjeta") { cerrarRevision(); }
     const manejador = MANEJADORES_CHAT.get(mensaje.tipo);
     if (!manejador) { return; } // «orden» y «estado» son solo para Amadeus Desktop
     const datos = (mensaje.datos && typeof mensaje.datos === "object") ? mensaje.datos : {};
@@ -1913,7 +2766,8 @@
     ["subtitulo", alSubtitulo], ["voz", alVoz], ["boca", alBoca], ["camara", alCamara],
     ["presencia", alPresencia], ["modulo", alModulo], ["apagado", alApagado], ["llamada", alLlamada],
     ["consolidacion", alConsolidacion], ["permiso", alPermiso], ["log", alLog], ["control_ack", alControlAck],
-    ["vision", alVision], ["pantalla", alPantalla], ["accion", alAccion], ["escritorio", alEscritorio]
+    ["vision", alVision], ["pantalla", alPantalla], ["accion", alAccion], ["escritorio", alEscritorio],
+    ["google", alGoogle]
   ]);
 
   // Tras «apagado» se siguen mostrando subtítulos, voz, registro, etc. (la despedida), pero no

@@ -132,6 +132,40 @@ def test_voz_propia_no_usa_tts_del_navegador(settings_prueba: Any) -> None:
     assert [p["tts"] for p in seq["steps"] if p["type"] == "speak"] == [False]
 
 
+def _segmentos_de_prueba() -> list[dict[str, Any]]:
+    return [{"texto": "Hmph.", "exp": "smug", "motion": "idle", "tone": "sarcastico", "voz_propia": True},
+            {"texto": "Bueno, sí.", "exp": "feliz", "motion": "asentir", "tone": "calido", "voz_propia": False}]
+
+
+def test_speak_sin_globo_por_defecto(settings_prueba: Any) -> None:
+    """VTUBER_AI_BURBUJA=0 (por defecto): cada speak lleva ``"bubble": False`` (bool, no se omite)."""
+    assert settings_prueba.vtuber_ai_burbuja is False
+    puente = VTuberAIBridge(settings_prueba.con(vtuber_ai_habilitado=True), None)
+    seq = puente.secuencia_para(_segmentos_de_prueba())
+    hablas = [p for p in seq["steps"] if p["type"] == "speak"]
+    assert len(hablas) == 2 and all(p["bubble"] is False for p in hablas)
+    # Solo los speak llevan bubble: el resto del protocolo no lo conoce.
+    assert all("bubble" not in p for p in seq["steps"] if p["type"] != "speak")
+
+
+def test_speak_con_globo_si_se_pide(settings_prueba: Any) -> None:
+    puente = VTuberAIBridge(settings_prueba.con(vtuber_ai_habilitado=True, vtuber_ai_burbuja=True), None)
+    seq = puente.secuencia_para(_segmentos_de_prueba())
+    assert [p["bubble"] for p in seq["steps"] if p["type"] == "speak"] == [True, True]
+
+
+def test_speak_sin_setting_de_burbuja_no_muestra_globo() -> None:
+    """Defensivo: unos Settings sin ``vtuber_ai_burbuja`` (p. ej. un doble) no activan el globo."""
+
+    class _SettingsMinimos:
+        vtuber_ai_url = "http://127.0.0.1:3939"
+
+    puente = VTuberAIBridge(_SettingsMinimos(), None)  # type: ignore[arg-type]
+    assert puente.burbuja is False
+    seq = puente.secuencia_para(_segmentos_de_prueba()[:1])
+    assert [p["bubble"] for p in seq["steps"] if p["type"] == "speak"] == [False]
+
+
 # ---------------------------------------------------------------------------
 # Con bus y servidor simulado
 # ---------------------------------------------------------------------------
@@ -154,6 +188,24 @@ def test_subtitulos_de_terminal_se_agrupan_en_una_secuencia(settings_prueba: Any
     seq = servidor.comandos[0]
     textos = [p["text"] for p in seq["steps"] if p["type"] == "speak"]
     assert textos == ["Primero esto.", "Y luego esto."]
+    # El JSON que llega al visor lleva bubble explícito (false por defecto: sin globo de texto).
+    assert [p["bubble"] for p in seq["steps"] if p["type"] == "speak"] == [False, False]
+
+
+@pytest.mark.parametrize("burbuja", [False, True])
+def test_bubble_viaja_en_el_post_segun_settings(settings_prueba: Any, bus: Any, correr: Any, burbuja: bool) -> None:
+    servidor = _ServidorFalso()
+
+    async def escenario() -> None:
+        puente = _puente(settings_prueba.con(vtuber_ai_habilitado=True, vtuber_ai_burbuja=burbuja), bus, servidor)
+        await puente.iniciar()
+        bus.publicar("salida.subtitulo", _subtitulo("Con voz propia.", canal="voz"), origen="riko")
+        await asyncio.sleep(0.1)
+        await puente.cerrar()
+
+    correr(escenario())
+    hablas = [p for c in servidor.comandos for p in c["steps"] if p["type"] == "speak"]
+    assert [(p["text"], p["bubble"], p["tts"]) for p in hablas] == [("Con voz propia.", burbuja, False)]
 
 
 def test_despedida_al_cerrar_se_entrega(settings_prueba: Any, bus: Any, correr: Any) -> None:
@@ -580,6 +632,9 @@ def test_settings_vtuber_ai(tmp_path: Any) -> None:
                                  "VTUBER_AI_TTS": "0", "VTUBER_AI_LANG": "es-CO"}, offline=True)
     assert (s.vtuber_ai_habilitado, s.vtuber_ai_url, s.vtuber_ai_tts, s.vtuber_ai_lang) == \
         (True, "http://127.0.0.1:3940", False, "es-CO")
+    assert s.vtuber_ai_burbuja is False                          # por defecto: sin globo de texto
+    con_globo = cargar_settings(entorno={"RAMS_DATA_DIR": str(tmp_path), "VTUBER_AI_BURBUJA": "1"}, offline=True)
+    assert con_globo.vtuber_ai_burbuja is True
     remoto = cargar_settings(entorno={"RAMS_DATA_DIR": str(tmp_path),
                                       "VTUBER_AI_URL": "http://ejemplo.com:3939"}, offline=True)
     assert remoto.vtuber_ai_url == "http://127.0.0.1:3939"

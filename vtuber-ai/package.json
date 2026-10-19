@@ -1,0 +1,12 @@
+{
+  "name": "vtuber-ai-studio",
+  "version": "1.0.0",
+  "description": "Interfaz para que una IA controle un avatar VTuber 3D (VRM) por HTTP o MCP",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "mcp": "node mcp-server.js"
+  },
+  "engines": { "node": ">=18" }
+}

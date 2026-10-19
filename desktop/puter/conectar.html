@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Conectar Puter</title>
+  <link rel="stylesheet" href="puter.css">
+  <script src="conectar.js" defer></script>
+</head>
+<body>
+  <main class="caja">
+    <h1>Conectar Puter</h1>
+    <p>Puter es la <strong>IA de respaldo</strong> de Amadeus: si Gemini se queda sin cuota, sin red
+      o llega al tope del día, ella sigue conversando con un modelo de Puter.</p>
+    <p class="tenue">Inicias sesión con <strong>tu</strong> cuenta de Puter y el uso se descuenta de tu
+      saldo allí. La contraseña la escribes en la ventana de puter.com: Amadeus no la ve.</p>
+    <p id="modelo" class="tenue" hidden></p>
+    <p id="estado" class="estado" role="status" aria-live="polite">Cargando Puter…</p>
+    <div class="botones">
+      <button id="entrar" type="button" disabled>Iniciar sesión en Puter</button>
+      <button id="cerrar" type="button" class="secundario">Cerrar</button>
+    </div>
+  </main>
+</body>
+</html>

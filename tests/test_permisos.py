@@ -637,3 +637,529 @@ def test_resolver_por_id_desde_otro_hilo(ajustes: Settings, correr) -> None:
 
     resultados, decision = correr(principal())
     assert resultados == [True] and decision.aprobada is True
+
+
+# ---------------------------------------------------------------------------
+# v0.2.1: órdenes desde Telegram, apps del menú Inicio y fotos
+# ---------------------------------------------------------------------------
+
+
+class _RelojFalso:
+    def __init__(self, t: float = 1000.0) -> None:
+        self.t = t
+
+    def __call__(self) -> float:
+        return self.t
+
+
+NIVELES = {"steam": ("permitida", "Steam"), "juego": ("descubierta", "Juego"),
+           "windows_powershell": ("sensible", "Windows PowerShell")}
+
+
+def _v021(ajustes: Settings, *, telegram_acciones: bool = True, telegram_fotos: bool = False,
+          nivel_app=None, reloj=None, preguntar=None, bus: BusEventos | None = None) -> CompuertaPermisos:
+    ajustes = ajustes.con(telegram_acciones=telegram_acciones, telegram_fotos=telegram_fotos)
+    return CompuertaPermisos(ajustes, bus, preguntar=preguntar or (lambda _t: None), pids_propios=PIDS_PROPIOS,
+                             nivel_app=nivel_app if nivel_app is not None else NIVELES.get,
+                             reloj=reloj or _RelojFalso())
+
+
+def _por_telegram(tipo: str, args: dict[str, object], origen: str = "usuario") -> AccionPC:
+    return AccionPC(tipo, {**args, "canal": "telegram"}, tipo, origen=origen)
+
+
+def _app(clave: str, **extra: object) -> AccionPC:
+    return AccionPC("lanzar_app", {"alias": clave, "local": True, "nombre": clave, **extra}, f"abrir {clave}")
+
+
+def _foto(fuente: str = "camara", origen: str = "usuario", **extra: object) -> AccionPC:
+    return AccionPC("enviar_foto", {"fuente": fuente, **extra}, "enviar una foto", origen=origen)
+
+
+def test_constantes_v021() -> None:
+    from core.permisos import (ACCIONES_POR_TELEGRAM, FUENTES_FOTO, MAX_FOTOS_HORA, NIVELES_APP,
+                               SAFE_CLAVE_APP_RE, TIPOS_ACCION_EXTRA)
+
+    assert ACCIONES_POR_TELEGRAM == frozenset({"abrir_destino", "buscar_en", "lanzar_app", "media", "enviar_foto"})
+    assert "enviar_foto" in TIPOS_ACCION_EXTRA      # v0.2.2 añade los suyos (test_v022_constantes)
+    assert FUENTES_FOTO == frozenset({"camara", "pantalla"}) and MAX_FOTOS_HORA == 10
+    assert NIVELES_APP == ("permitida", "descubierta", "sensible")
+    assert SAFE_CLAVE_APP_RE.fullmatch("visual_studio_code") and not SAFE_CLAVE_APP_RE.fullmatch("a" * 41)
+
+
+def test_telegram_solo_acciones_de_bajo_riesgo(ajustes: Settings) -> None:
+    compuerta = _v021(ajustes)
+    for tipo, args in (("abrir_destino", {"alias": "youtube"}), ("buscar_en", {"alias": "youtube", "consulta": "lofi"}),
+                       ("media", {"orden": "play_pause"}), ("lanzar_app", {"alias": "terminal"})):
+        decision = compuerta.evaluar(_por_telegram(tipo, args))
+        assert decision.veredicto == "permitida" and decision.aprobada is True, tipo
+    for tipo, args in (("escribir_texto", dict(_escribir().args)),
+                       ("prerrellenar", {"alias": "whatsapp", "texto": "hola"}),
+                       ("cerrar_ventana", dict(_cerrar().args)), ("volumen", {"nivel": 20}),
+                       ("ir_workspace", {"n": 2}), ("enfocar_nexus", {}), ("vistazo", {"motivo": "usuario"}),
+                       ("captura_pantalla", {}), ("travesura_cursor", dict(_travesura().args))):
+        decision = compuerta.evaluar(_por_telegram(tipo, args))
+        assert decision.veredicto == "denegada", tipo
+        assert "Telegram" in decision.motivo, tipo
+    # El origen "telegram" sigue prohibido aunque la acción sea de bajo riesgo.
+    assert compuerta.evaluar(_por_telegram("abrir_destino", {"alias": "youtube"}, origen="telegram")).aprobada is False
+    # Un canal inventado no cuela nada.
+    raro = AccionPC("abrir_destino", {"alias": "youtube", "canal": "hud"}, "abrir")
+    assert compuerta.evaluar(raro).veredicto == "denegada"
+
+
+def test_telegram_sin_acciones_activadas(ajustes: Settings) -> None:
+    compuerta = _v021(ajustes, telegram_acciones=False)
+    decision = compuerta.evaluar(_por_telegram("abrir_destino", {"alias": "youtube"}))
+    assert decision.veredicto == "denegada" and "RAMS_TELEGRAM_ACCIONES" in decision.motivo
+    # Lo mismo desde el PC sí se puede.
+    assert compuerta.evaluar(AccionPC("abrir_destino", {"alias": "youtube", "canal": "terminal"})).aprobada is True
+
+
+def test_apps_locales_por_nivel(ajustes: Settings) -> None:
+    compuerta = _v021(ajustes)
+    assert compuerta.evaluar(_app("steam")).veredicto == "permitida"
+    descubierta = compuerta.evaluar(_app("juego"))
+    assert descubierta.veredicto == "confirmar" and descubierta.destructiva is False and descubierta.aprobada is False
+    assert compuerta.evaluar(_app("windows_powershell")).veredicto == "confirmar"
+    desconocida = compuerta.evaluar(_app("no_existe"))
+    assert desconocida.veredicto == "denegada" and "menú Inicio" in desconocida.motivo
+    for clave in ("", "Steam", "a; rm", "a" * 41, None, 3):
+        assert compuerta.evaluar(_app(clave)).veredicto == "denegada", clave   # type: ignore[arg-type]
+    for origen in ("iniciativa", "llm", "telegram", "nexus"):
+        accion = AccionPC("lanzar_app", {"alias": "steam", "local": True}, "abrir", origen=origen)
+        assert compuerta.evaluar(accion).veredicto == "denegada", origen
+    # Por Telegram: solo las ya permitidas, nunca una confirmación.
+    assert compuerta.evaluar(_app("steam", canal="telegram")).veredicto == "permitida"
+    nueva = compuerta.evaluar(_app("juego", canal="telegram"))
+    assert nueva.veredicto == "denegada" and "aún no está aprobada" in nueva.motivo
+    consola = compuerta.evaluar(_app("windows_powershell", canal="telegram"))
+    assert consola.veredicto == "denegada" and "computador" in consola.motivo
+
+
+def test_apps_locales_sin_indice_o_con_indice_roto(ajustes: Settings) -> None:
+    sin_indice = CompuertaPermisos(ajustes, pids_propios=PIDS_PROPIOS)
+    assert sin_indice.evaluar(_app("steam")).veredicto == "denegada"
+
+    def roto(_clave: str) -> tuple[str, str]:
+        raise RuntimeError("índice roto")
+
+    assert _v021(ajustes, nivel_app=roto).evaluar(_app("steam")).veredicto == "denegada"
+    assert _v021(ajustes, nivel_app=lambda _c: ("superpermitida", "X")).evaluar(_app("steam")).veredicto == "denegada"
+    compuerta = CompuertaPermisos(ajustes, pids_propios=PIDS_PROPIOS)
+    compuerta.set_nivel_app(NIVELES.get)
+    assert compuerta.evaluar(_app("steam")).aprobada is True
+    # Sin "local", lanzar_app sigue siendo la fila de RAMS_APPS de siempre.
+    assert compuerta.evaluar(AccionPC("lanzar_app", {"alias": "steam"})).veredicto == "denegada"
+
+
+def test_app_descubierta_se_confirma_con_su_nombre(ajustes: Settings, correr) -> None:
+    preguntas: list[str] = []
+    compuerta = _v021(ajustes, preguntar=preguntas.append)
+
+    async def principal() -> tuple[DecisionPermiso, DecisionPermiso]:
+        tarea = asyncio.ensure_future(compuerta.autorizar(_app("juego", nombre="texto del usuario")))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        assert compuerta.resolver_por_id(compuerta.pendiente().id, True) is True
+        primera = await tarea
+        tarea = asyncio.ensure_future(compuerta.autorizar(_app("windows_powershell")))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        compuerta.resolver("no")
+        return primera, await tarea
+
+    primera, segunda = correr(principal())
+    assert primera.veredicto == "confirmar" and primera.aprobada is True
+    assert segunda.aprobada is False
+    assert "Abrir «Juego»" in preguntas[0] and "no te lo vuelvo a preguntar" in preguntas[0]
+    assert "texto del usuario" not in preguntas[0]
+    assert "te lo preguntaré cada vez" in preguntas[1]
+
+
+def test_lo_pedido_por_telegram_nunca_espera_confirmacion(ajustes: Settings, correr, monkeypatch) -> None:
+    compuerta = _v021(ajustes)
+    monkeypatch.setattr(compuerta, "evaluar", lambda _a: DecisionPermiso("confirmar", "x", aprobada=False))
+    decision = correr(compuerta.autorizar(_app("juego", canal="telegram")))
+    assert decision.veredicto == "denegada" and decision.aprobada is False
+    assert compuerta.hay_pendiente() is False
+
+
+def test_enviar_foto_reglas(ajustes: Settings) -> None:
+    compuerta = _v021(ajustes)
+    assert compuerta.evaluar(_foto("camara")).aprobada is True
+    assert compuerta.evaluar(_foto("pantalla", canal="escritorio")).aprobada is True
+    assert compuerta.evaluar(_foto("microfono")).veredicto == "denegada"
+    for origen in ("iniciativa", "llm", "telegram", "nexus", ""):
+        assert compuerta.evaluar(_foto(origen=origen)).veredicto == "denegada", origen
+    # Por Telegram exige RAMS_TELEGRAM_FOTOS=1 (aunque RAMS_TELEGRAM_ACCIONES esté apagado).
+    apagadas = compuerta.evaluar(_foto(canal="telegram"))
+    assert apagadas.veredicto == "denegada" and "RAMS_TELEGRAM_FOTOS" in apagadas.motivo
+    encendidas = _v021(ajustes, telegram_acciones=False, telegram_fotos=True)
+    assert encendidas.evaluar(_foto("pantalla", canal="telegram")).aprobada is True
+
+
+def test_enviar_foto_tope_por_hora(ajustes: Settings, correr) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v021(ajustes, reloj=reloj)
+
+    async def principal() -> list[bool]:
+        return [(await compuerta.autorizar(_foto())).aprobada for _ in range(11)]
+
+    resultados = correr(principal())
+    assert resultados == [True] * 10 + [False]
+    assert compuerta.fotos_ultima_hora() == 10
+    assert "10 fotos" in compuerta.evaluar(_foto()).motivo
+    reloj.t += 3600.0
+    assert compuerta.fotos_ultima_hora() == 0
+    assert correr(compuerta.autorizar(_foto())).aprobada is True
+    # evaluar es pura: no gasta el tope.
+    for _ in range(20):
+        compuerta.evaluar(_foto())
+    assert compuerta.fotos_ultima_hora() == 1
+
+
+# ---------------------------------------------------------------------------
+# v0.2.2: Google, correo, Drive, taller y tarjetas aprobables (docs/V022_CORREO_DRIVE_SCRIPTS.md §5.5)
+# ---------------------------------------------------------------------------
+
+H1 = "a" * 64
+H2 = "b" * 64
+TIPOS_NUEVOS = ("conectar_google", "desconectar_google", "enviar_correo", "drive_descargar", "drive_crear_carpeta",
+                "drive_subir", "drive_papelera", "drive_compartir", "ejecutar_script")
+
+
+def _v022(ajustes: Settings, *, reloj: _RelojFalso | None = None, bus: BusEventos | None = None,
+          **cambios: object) -> CompuertaPermisos:
+    base = {"google_habilitado": True, "offline": False, "taller_habilitado": True}
+    base.update(cambios)
+    return CompuertaPermisos(ajustes.con(**base), bus, preguntar=lambda _t: None, pids_propios=PIDS_PROPIOS,
+                             reloj=reloj or _RelojFalso())
+
+
+def _tarjeta_accion(tipo: str, ident: str, sha: str = H1, origen: str = "usuario", **extra: object) -> AccionPC:
+    args: dict[str, object] = {"canal": "escritorio", "tarjeta": ident, "sha256": sha, "aprobacion": "tarjeta"}
+    if tipo == "enviar_correo":
+        args["n_destinatarios"] = 1
+    elif tipo == "drive_compartir":
+        args.update({"rol": "reader", "publico": False, "doble_confirmacion": False})
+    elif tipo == "ejecutar_script":
+        args["nivel"] = "medio"
+    args.update(extra)
+    return AccionPC(tipo, args, "acción con tarjeta", origen=origen)
+
+
+def _local(tipo: str, origen: str = "usuario", **extra: object) -> AccionPC:
+    args: dict[str, object] = {"canal": "terminal"}
+    if tipo == "drive_descargar":
+        args.update({"destino": "descargas", "formato": "pdf"})
+    elif tipo == "drive_crear_carpeta":
+        args["nombre"] = "Facturas 2026"
+    args.update(extra)
+    return AccionPC(tipo, args, "acción de Google", origen=origen)
+
+
+def _registrar(compuerta: CompuertaPermisos, ident: str, tipo: str, huella: str = H1, **kw: object):
+    nueva, reemplazada = compuerta.registrar_tarjeta(ident, tipo_accion=tipo, huella=huella,
+                                                     ttl_s=float(kw.pop("ttl_s", 1800.0)),
+                                                     canal_origen=str(kw.pop("canal_origen", "escritorio")),
+                                                     doble=bool(kw.pop("doble", False)))
+    return nueva, reemplazada
+
+
+def test_v022_constantes() -> None:
+    from core.contracts import TIPOS_ACCION
+    from core.permisos import (ACCIONES_POR_TELEGRAM, CLASE_DE_ACCION, TIPOS_ACCION_EXTRA, TIPOS_ACCION_TARJETA,
+                               TIPOS_INICIATIVA, VENTANA_CORREO_CORTA_S, VENTANA_CORREO_DIA_S)
+
+    assert TIPOS_ACCION_EXTRA == frozenset({"enviar_foto", *TIPOS_NUEVOS})
+    assert TIPOS_ACCION_TARJETA == frozenset({"enviar_correo", "drive_subir", "drive_papelera", "drive_compartir",
+                                              "ejecutar_script"})
+    assert dict(CLASE_DE_ACCION) == {"enviar_correo": "correo", "drive_subir": "drive", "drive_papelera": "drive",
+                                     "drive_compartir": "drive", "ejecutar_script": "script"}
+    assert VENTANA_CORREO_CORTA_S == 600.0 and VENTANA_CORREO_DIA_S == 86400.0
+    # No cambian: los 13 tipos, lo que va por Telegram y lo que va por iniciativa.
+    assert len(TIPOS_ACCION) == 13 and not set(TIPOS_NUEVOS) & set(TIPOS_ACCION)
+    assert ACCIONES_POR_TELEGRAM == frozenset({"abrir_destino", "buscar_en", "lanzar_app", "media", "enviar_foto"})
+    assert TIPOS_INICIATIVA == frozenset({"vistazo", "travesura_cursor"})
+
+
+def test_v022_tipos_nuevos_solo_del_usuario_y_nunca_por_telegram(ajustes: Settings) -> None:
+    compuerta = _v022(ajustes)
+    for tipo in TIPOS_NUEVOS:
+        if tipo in ("enviar_correo", "drive_subir", "drive_papelera", "drive_compartir", "ejecutar_script"):
+            _registrar(compuerta, f"0000000{TIPOS_NUEVOS.index(tipo)}", tipo)
+            base = _tarjeta_accion(tipo, f"0000000{TIPOS_NUEVOS.index(tipo)}")
+        else:
+            base = _local(tipo)
+        for origen in ("llm", "telegram", "iniciativa", "nexus"):
+            accion = AccionPC(tipo, dict(base.args), base.descripcion, origen=origen)
+            assert compuerta.evaluar(accion).veredicto == "denegada", (tipo, origen)
+        remota = AccionPC(tipo, {**base.args, "canal": "telegram"}, base.descripcion)
+        assert compuerta.evaluar(remota).veredicto == "denegada", tipo
+
+
+def test_v022_google_y_drive_locales(ajustes: Settings) -> None:
+    compuerta = _v022(ajustes)
+    assert compuerta.evaluar(_local("conectar_google")).veredicto == "permitida"
+    assert compuerta.evaluar(_local("conectar_google", canal="escritorio")).veredicto == "permitida"
+    assert compuerta.evaluar(_local("drive_descargar")).veredicto == "permitida"
+    assert compuerta.evaluar(_local("drive_descargar", formato=None)).veredicto == "permitida"
+    assert compuerta.evaluar(_local("drive_descargar", destino="C:/Windows")).veredicto == "denegada"
+    assert compuerta.evaluar(_local("drive_descargar", formato="exe")).veredicto == "denegada"
+    assert compuerta.evaluar(_local("drive_crear_carpeta")).veredicto == "permitida"
+    for nombre in ("", "a/b", "a\\b", "x" * 121, "tab\tx", 7):
+        assert compuerta.evaluar(_local("drive_crear_carpeta", nombre=nombre)).veredicto == "denegada", nombre
+    # Sin canal local, denegada.
+    assert compuerta.evaluar(_local("conectar_google", canal=None)).veredicto == "denegada"
+    # desconectar_google: confirmación clásica.
+    desconectar = compuerta.evaluar(_local("desconectar_google"))
+    assert desconectar.veredicto == "confirmar" and desconectar.aprobada is False
+
+
+def test_v022_conectar_google_apagado_u_offline(ajustes: Settings) -> None:
+    for cambios in ({"google_habilitado": False}, {"offline": True}):
+        compuerta = _v022(ajustes, **cambios)
+        decision = compuerta.evaluar(_local("conectar_google"))
+        assert decision.veredicto == "denegada" and "RAMS_GOOGLE" in decision.motivo
+        assert compuerta.evaluar(_local("drive_descargar")).veredicto == "denegada"
+
+
+def test_v022_desconectar_google_usa_la_confirmacion_clasica(ajustes: Settings, correr) -> None:
+    bus = BusEventos()
+    preguntas: list[str] = []
+    compuerta = CompuertaPermisos(ajustes.con(google_habilitado=True, offline=False), bus,
+                                  preguntar=preguntas.append, pids_propios=PIDS_PROPIOS)
+    solicitudes: list[dict[str, object]] = []
+
+    async def principal() -> DecisionPermiso:
+        bus.vincular_loop()
+        bus.suscribir("permiso.solicitado", lambda e: solicitudes.append(dict(e.datos)))
+        tarea = asyncio.ensure_future(compuerta.autorizar(_local("desconectar_google")))
+        while not compuerta.hay_pendiente():
+            await asyncio.sleep(0.001)
+        compuerta.resolver("sí")
+        decision = await tarea
+        await asyncio.sleep(0.01)
+        await bus.cerrar(timeout=0.5)
+        return decision
+
+    decision = correr(principal())
+    assert decision.veredicto == "confirmar" and decision.aprobada is True
+    assert "Desconectar tu cuenta de Google" in preguntas[0]
+    assert solicitudes and solicitudes[0]["tipo"] == "desconectar_google"
+
+
+def test_v022_fila_de_tarjeta(ajustes: Settings, correr) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj)
+    _registrar(compuerta, "aaaa0001", "drive_subir")
+    ok = _tarjeta_accion("drive_subir", "aaaa0001")
+    assert compuerta.evaluar(ok).veredicto == "permitida"
+    casos = {
+        "inexistente": _tarjeta_accion("drive_subir", "ffff0000"),
+        "otro_tipo": _tarjeta_accion("drive_papelera", "aaaa0001"),
+        "otra_huella": _tarjeta_accion("drive_subir", "aaaa0001", sha=H2),
+        "sin_aprobacion": AccionPC("drive_subir", {k: v for k, v in ok.args.items() if k != "aprobacion"}, "x"),
+        "canal_terminal": AccionPC("drive_subir", {**ok.args, "canal": "terminal"}, "x"),
+        "id_malo": _tarjeta_accion("drive_subir", "AAAA0001"),
+        "huella_mala": _tarjeta_accion("drive_subir", "aaaa0001", sha="x" * 64),
+    }
+    for nombre, accion in casos.items():
+        decision = compuerta.evaluar(accion)
+        assert decision.veredicto == "denegada", nombre
+    assert "botón de la tarjeta en el computador" in compuerta.evaluar(casos["canal_terminal"]).motivo
+    assert "cambió" in compuerta.evaluar(casos["otra_huella"]).motivo
+    # Caducada (reloj inyectado).
+    reloj.t += 1800.0
+    assert "ya no está vigente" in compuerta.evaluar(ok).motivo
+    assert compuerta.tarjeta("aaaa0001") is None
+
+
+def test_v022_un_solo_uso_y_evaluar_no_muta(ajustes: Settings, correr) -> None:
+    compuerta = _v022(ajustes)
+    _registrar(compuerta, "aaaa0002", "drive_papelera")
+    accion = _tarjeta_accion("drive_papelera", "aaaa0002")
+    for _ in range(5):
+        assert compuerta.evaluar(accion).veredicto == "permitida"
+    assert compuerta.tarjeta("aaaa0002") is not None
+
+    async def doble_clic() -> list[DecisionPermiso]:
+        return list(await asyncio.gather(compuerta.autorizar(accion), compuerta.autorizar(accion)))
+
+    primera, segunda = correr(doble_clic())
+    assert primera.aprobada is True and segunda.aprobada is False
+    assert compuerta.tarjeta("aaaa0002") is None and compuerta.hay_pendiente() is False
+
+
+def test_v022_registro_reemplazo_y_reapertura(ajustes: Settings) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj)
+    primera, reemplazada = _registrar(compuerta, "c0000001", "enviar_correo")
+    assert primera is not None and primera.version == 1 and primera.clase == "correo" and reemplazada is None
+    assert primera.caduca == reloj.t + 1800.0
+    otra, reemplazada = _registrar(compuerta, "c0000002", "enviar_correo")
+    assert otra.version == 1 and reemplazada is not None and reemplazada.id == "c0000001"
+    assert compuerta.tarjeta("c0000001") is None
+    # Otra clase convive.
+    _registrar(compuerta, "d0000001", "drive_subir")
+    assert {t.id for t in compuerta.tarjetas()} == {"c0000002", "d0000001"}
+    # Reapertura con la misma id (vigente): version+1 y sin reemplazo.
+    reabierta, reemplazada = _registrar(compuerta, "c0000002", "enviar_correo", huella=H2)
+    assert reabierta.version == 2 and reemplazada is None and reabierta.huella == H2
+    # Reapertura tras retirarla (un uso): sigue la numeración.
+    assert compuerta.retirar_tarjeta("c0000002").version == 2
+    reabierta, _ = _registrar(compuerta, "c0000002", "enviar_correo")
+    assert reabierta.version == 3
+    # Formatos inválidos.
+    for kw in ({"ident": "xyz", "tipo": "enviar_correo"}, {"ident": "c0000003", "tipo": "enviar_foto"},
+               {"ident": "c0000003", "tipo": "enviar_correo", "huella": "corta"},
+               {"ident": "c0000003", "tipo": "enviar_correo", "ttl_s": 0.0},
+               {"ident": "c0000003", "tipo": "enviar_correo", "ttl_s": 86401.0},
+               {"ident": "c0000003", "tipo": "enviar_correo", "canal_origen": "nexus"}):
+        ident, tipo = kw.pop("ident"), kw.pop("tipo")
+        assert _registrar(compuerta, ident, tipo, **kw) == (None, None)
+
+
+def test_v022_actualizar_purgar_y_memoria_de_ids(ajustes: Settings) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj)
+    _registrar(compuerta, "c0000001", "enviar_correo")
+    reloj.t += 1000.0
+    editada = compuerta.actualizar_tarjeta("c0000001", H2)
+    assert editada.version == 2 and editada.huella == H2 and editada.caduca == reloj.t + 1800.0
+    assert compuerta.actualizar_tarjeta("ffffffff", H2) is None
+    assert compuerta.actualizar_tarjeta("c0000001", "mala") is None
+    reloj.t += 1800.0
+    vencidas = compuerta.purgar_caducadas()
+    assert [t.id for t in vencidas] == ["c0000001"] and compuerta.tarjetas() == ()
+    # Recuerda como mucho 32 ids retiradas: la más vieja vuelve a empezar en 1.
+    for n in range(33):
+        _registrar(compuerta, f"e{n:07d}", "ejecutar_script")
+        compuerta.retirar_tarjeta(f"e{n:07d}")
+    assert _registrar(compuerta, "e0000000", "ejecutar_script")[0].version == 1
+    assert _registrar(compuerta, "e0000032", "ejecutar_script")[0].version == 2
+
+
+def test_v022_tasa_de_correo(ajustes: Settings, correr) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj)
+
+    def enviar(n: int) -> DecisionPermiso:
+        ident = f"c{n:07d}"
+        _registrar(compuerta, ident, "enviar_correo")
+        return correr(compuerta.autorizar(_tarjeta_accion("enviar_correo", ident)))
+
+    assert [enviar(n).aprobada for n in range(5)] == [True] * 5
+    sexto = enviar(5)
+    assert sexto.aprobada is False and "10 minutos" in sexto.motivo
+    assert compuerta.correos_recientes() == (5, 5)
+    reloj.t += 600.0
+    assert enviar(6).aprobada is True
+    assert compuerta.correos_recientes() == (1, 6)
+    # Destinatarios 0 u 11 (máximo 10 por defecto) → denegado.
+    for n in (0, 11, True, "2"):
+        _registrar(compuerta, "c9999999", "enviar_correo")
+        accion = _tarjeta_accion("enviar_correo", "c9999999", n_destinatarios=n)
+        assert compuerta.evaluar(accion).veredicto == "denegada", n
+
+
+def test_v022_tope_diario_de_correo(ajustes: Settings, correr) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj, correo_max_dia=3)
+    resultados = []
+    for n in range(4):
+        _registrar(compuerta, f"c{n:07d}", "enviar_correo")
+        resultados.append(correr(compuerta.autorizar(_tarjeta_accion("enviar_correo", f"c{n:07d}"))).aprobada)
+        reloj.t += 700.0
+    assert resultados == [True, True, True, False]
+    reloj.t += 86400.0
+    assert compuerta.correos_recientes() == (0, 0)
+
+
+def test_v022_reserva_y_liberacion_del_cupo(ajustes: Settings, correr) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj)
+    _registrar(compuerta, "c0000001", "enviar_correo")
+    assert correr(compuerta.autorizar(_tarjeta_accion("enviar_correo", "c0000001"))).aprobada is True
+    assert compuerta.correos_recientes() == (1, 1)
+    assert compuerta.liberar_envio_correo("c0000001") is True
+    assert compuerta.correos_recientes() == (0, 0)
+    assert compuerta.liberar_envio_correo("c0000001") is False          # una sola vez
+    assert compuerta.liberar_envio_correo("ffffffff") is False          # id desconocida: sin cambios
+    assert compuerta.liberar_envio_correo(None) is False  # type: ignore[arg-type]
+    # Cinco aprobaciones seguidas de fallos deterministas (liberadas) no agotan el cupo: la 6.ª pasa.
+    for n in range(5):
+        _registrar(compuerta, "c0000002", "enviar_correo")       # reapertura tras el fallo
+        assert correr(compuerta.autorizar(_tarjeta_accion("enviar_correo", "c0000002"))).aprobada is True
+        assert compuerta.liberar_envio_correo("c0000002") is True
+    _registrar(compuerta, "c0000002", "enviar_correo")
+    assert correr(compuerta.autorizar(_tarjeta_accion("enviar_correo", "c0000002"))).aprobada is True
+    assert compuerta.correos_recientes() == (1, 1)
+    # Una reserva de más de 24 h ya no se libera (está fuera de la ventana).
+    reloj.t += 86400.0
+    assert compuerta.liberar_envio_correo("c0000002") is False
+
+
+def test_v022_compartir_en_publico(ajustes: Settings, correr) -> None:
+    reloj = _RelojFalso()
+    compuerta = _v022(ajustes, reloj=reloj)
+    _registrar(compuerta, "d0000001", "drive_compartir", doble=True)
+    publico = {"rol": "reader", "publico": True, "doble_confirmacion": True}
+    # Sin el 1.er clic → denegado.
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000001", **publico)).veredicto == "denegada"
+    assert compuerta.marcar_primera_confirmacion("d0000001", H2) is None          # otra huella
+    paso1 = compuerta.marcar_primera_confirmacion("d0000001", H1)
+    assert paso1 is not None and paso1.version == 2 and paso1.doble_ok_hasta == reloj.t + 120.0
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000001", **publico)).veredicto == "permitida"
+    # El 2.º clic sin doble_confirmacion → denegado; con writer → denegado siempre.
+    sin_doble = {**publico, "doble_confirmacion": False}
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000001", **sin_doble)).veredicto == "denegada"
+    editable = compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000001", **{**publico, "rol": "writer"}))
+    assert editable.veredicto == "denegada" and "público y editable" in editable.motivo
+    # Doble vencido (> 120 s) → denegado.
+    reloj.t += 121.0
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000001", **publico)).veredicto == "denegada"
+    # Editar borra el 1.er clic.
+    compuerta.marcar_primera_confirmacion("d0000001", H1)
+    compuerta.actualizar_tarjeta("d0000001", H1)
+    assert compuerta.tarjeta("d0000001").doble_ok_hasta is None
+    # Una tarjeta sin doble no se puede aprobar como pública, ni una doble como privada.
+    _registrar(compuerta, "d0000002", "drive_compartir")
+    assert compuerta.marcar_primera_confirmacion("d0000002", H1) is None
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000002", **publico)).veredicto == "denegada"
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000002")).veredicto == "permitida"
+    assert compuerta.evaluar(_tarjeta_accion("drive_compartir", "d0000002", rol="admin")).veredicto == "denegada"
+
+
+def test_v022_ejecutar_script(ajustes: Settings, correr) -> None:
+    compuerta = _v022(ajustes)
+    _registrar(compuerta, "5c000001", "ejecutar_script")
+    assert compuerta.evaluar(_tarjeta_accion("ejecutar_script", "5c000001")).veredicto == "permitida"
+    for nivel in ("critico", None, "desconocido"):
+        decision = compuerta.evaluar(_tarjeta_accion("ejecutar_script", "5c000001", nivel=nivel))
+        assert decision.veredicto == "denegada", nivel
+    assert "crítico" in compuerta.evaluar(_tarjeta_accion("ejecutar_script", "5c000001", nivel="critico")).motivo
+    apagado = _v022(ajustes, taller_habilitado=False)
+    _registrar(apagado, "5c000001", "ejecutar_script")
+    decision = apagado.evaluar(_tarjeta_accion("ejecutar_script", "5c000001"))
+    assert decision.veredicto == "denegada" and "RAMS_TALLER" in decision.motivo
+
+
+def test_v022_tarjetas_no_publican_permiso_ni_se_resuelven_por_texto(ajustes: Settings, correr) -> None:
+    bus = BusEventos()
+    compuerta = _v022(ajustes, bus=bus)
+    eventos: list[str] = []
+
+    async def principal() -> DecisionPermiso:
+        bus.vincular_loop()
+        bus.suscribir("permiso.solicitado", lambda e: eventos.append(e.nombre))
+        _registrar(compuerta, "aaaa0003", "drive_subir")
+        decision = await compuerta.autorizar(_tarjeta_accion("drive_subir", "aaaa0003"))
+        await asyncio.sleep(0.01)
+        await bus.cerrar(timeout=0.5)
+        return decision
+
+    assert correr(principal()).aprobada is True
+    assert eventos == []
+    assert compuerta.resolver("sí") is False and compuerta.resolver_por_id("aaaa0003", True) is False

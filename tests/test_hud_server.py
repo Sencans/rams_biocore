@@ -440,6 +440,13 @@ def test_reenvio_de_eventos_de_la_tabla(settings_prueba: Settings, bus: BusEvent
                 bus.publicar("log", {"nivel": "AVISO", "modulo": "rams.vts", "mensaje": "sin VTS", "ts": 1.0})
                 registro, _ = await _recibir_hasta(ws, "log")
                 assert registro["mensaje"] == "sin VTS"
+                # v0.2.2: estado de la cuenta de Google (la cuenta ya llega enmascarada).
+                bus.publicar("google.estado", {"conectado": True, "correo": True, "drive_leer": True,
+                                               "drive_escribir": True, "drive_completo": False,
+                                               "cuenta": "ju***@gmail.com", "motivo": ""})
+                google, _ = await _recibir_hasta(ws, "google")
+                assert google == {"conectado": True, "correo": True, "drive_leer": True, "drive_escribir": True,
+                                  "drive_completo": False, "cuenta": "ju***@gmail.com", "motivo": ""}
                 # El HUD no reenvía su propio canal de control ni eventos fuera de la tabla.
                 bus.publicar("usuario.entrada", {"texto": "secreto del usuario", "canal": "terminal"})
                 vistos = await _recoger(ws, 0.3)
@@ -562,6 +569,87 @@ def test_traducir_evento_v02() -> None:
         assert nombre in hud_server.EVENTOS_SUSCRITOS
     for nombre in ("escritorio.chat", "escritorio.sistema"):
         assert nombre not in hud_server.EVENTOS_SUSCRITOS
+
+
+def test_traducir_evento_google_v022() -> None:
+    """§12.5: google.estado → google, saneado (booleanos estrictos, cuenta ≤ 80, motivo corto)."""
+    tipo, datos = traducir_evento("google.estado", {"conectado": 1, "correo": True, "drive_leer": "sí",
+                                                    "drive_escribir": False, "drive_completo": True,
+                                                    "cuenta": "x" * 100, "motivo": "token_invalido",
+                                                    "token": "ya29.NUNCA", "refresh_token": "1//NUNCA"})
+    assert tipo == "google"
+    assert datos == {"conectado": False, "correo": True, "drive_leer": False, "drive_escribir": False,
+                     "drive_completo": True, "cuenta": "x" * 79 + "…", "motivo": "token_invalido"}
+    _tipo, datos = traducir_evento("google.estado", {"cuenta": "", "motivo": "<b>raro</b>"})
+    assert datos["cuenta"] is None and datos["motivo"] == "" and datos["conectado"] is False
+    assert "google.estado" in hud_server.EVENTOS_SUSCRITOS
+    assert hud_server.INSTANTANEA[-1] == ("google.estado", "google")
+    # Las tarjetas y las decisiones son privadas: /ws nunca las traduce ni se suscribe a ellas.
+    for nombre in ("tarjeta.mostrar", "tarjeta.cerrada", "escritorio.tarjeta"):
+        assert nombre not in hud_server.EVENTOS_SUSCRITOS
+        assert traducir_evento(nombre, {"id": "0a1b2c3d", "cuerpo": "x"}) is None
+
+
+def test_ws_google_en_la_instantanea_despues_de_escritorio(settings_prueba: Settings, bus: BusEventos,
+                                                           correr: Any) -> None:
+    """El orden hola → escritorio → instantánea no cambia (el HUD y movil/ dependen de él): google al final."""
+    async def caso() -> None:
+        hud = ServidorHUD(settings_prueba.con(hud_habilitado=True, hud_puerto=0, escritorio_habilitado=True,
+                                              hud_chat=True), bus)
+        bus.publicar("google.estado", {"conectado": False, "correo": False, "drive_leer": False,
+                                       "drive_escribir": False, "drive_completo": False, "cuenta": None,
+                                       "motivo": "sin_conectar"})
+        bus.publicar("homeostasis.estado", _estado(divergencia=1.048596))
+        bus.publicar("sistema.modulo", DiagnosticoModulo("google", "Cuenta de Google", EstadoModulo.EN_ESPERA,
+                                                         "sin conectar").a_dict())
+        await hud.iniciar()
+        try:
+            async with _conectar(hud) as ws:
+                vistos = await _recoger(ws, 0.4)
+                tipos = [m["tipo"] for m in vistos]
+                assert tipos[:2] == ["hola", "escritorio"]
+                assert tipos.index("google") > tipos.index("estado")
+                google = next(m["datos"] for m in vistos if m["tipo"] == "google")
+                assert google["motivo"] == "sin_conectar" and google["conectado"] is False
+                modulo = next(m["datos"] for m in vistos if m["tipo"] == "modulo" and m["datos"]["clave"] == "google")
+                assert modulo["estado"] == "EN ESPERA"
+        finally:
+            await hud.cerrar()
+
+    correr(caso())
+
+
+def test_ws_nunca_reenvia_tarjetas_ni_decisiones(settings_prueba: Settings, bus: BusEventos, correr: Any) -> None:
+    """§12.5: tarjeta.mostrar/cerrada y escritorio.tarjeta llevan contenido privado: nunca por /ws."""
+    marca = "CUERPO-PRIVADO-77"
+
+    async def caso() -> None:
+        hud = ServidorHUD(settings_prueba.con(hud_habilitado=True, hud_puerto=0, escritorio_habilitado=True,
+                                              hud_chat=True), bus)
+        await hud.iniciar()
+        try:
+            async with _conectar(hud) as ws:
+                await _recibir_hasta(ws, "hola")
+                await _recoger(ws, 0.2)
+                bus.publicar("tarjeta.mostrar", {
+                    "id": "0a1b2c3d", "clase": "correo", "version": 1, "sha256": "ab" * 32, "titulo": "Correo",
+                    "resumen": "", "aviso": "", "botones": ["aprobar", "descartar"], "caduca_ts": None,
+                    "canal_origen": "escritorio", "drive": None, "script": None, "salida": None,
+                    "correo": {"para": ["ana@example.com"], "cc": [], "cco": [], "asunto": marca, "cuerpo": marca,
+                               "adjuntos": [], "problemas": [], "avisos": [], "listo": True}})
+                bus.publicar("tarjeta.cerrada", {"id": "0a1b2c3d", "clase": "correo", "resultado": "enviado",
+                                                 "motivo": marca})
+                bus.publicar("escritorio.tarjeta", {"id": "0a1b2c3d", "sha256": "ab" * 32, "decision": "editar",
+                                                    "campos": {"cuerpo": marca}})
+                bus.publicar("log", {"nivel": "INFO", "modulo": "rams.test", "mensaje": "fin", "ts": 1.0})
+                _registro, vistos = await _recibir_hasta(ws, "log")
+                vistos += await _recoger(ws, 0.2)
+                assert not [m for m in vistos if m["tipo"] == "tarjeta"]
+                assert not any(marca in json.dumps(m, ensure_ascii=False) for m in vistos)
+        finally:
+            await hud.cerrar()
+
+    correr(caso())
 
 
 def test_ws_reenvia_vision_pantalla_accion_y_led_por_fuente(settings_prueba: Settings, bus: BusEventos,
@@ -864,6 +952,132 @@ def test_html_chat_rine_e_indicadores_v02() -> None:
 
 
 
+def test_html_tarjetas_y_chip_google_v022() -> None:
+    """§13.5: tarjetas en el panel RINE (solo textContent), tope de 60 KiB al enviar y chip «Google»."""
+    html = RUTA_HTML.read_text(encoding="utf-8")
+    assert "innerHTML" not in html and "outerHTML" not in html and "insertAdjacentHTML" not in html
+    assert "prompt(" not in html
+    for tipo in ("google", "tarjeta"):
+        assert f'["{tipo}", ' in html, tipo
+    for texto in ('id="google-chip"', "// <validar-tarjeta>", "// </validar-tarjeta>", 'tipo: "tarjeta_decision"',
+                  "MAX_BYTES_DECISION = 61440", "new TextEncoder().encode(texto).length > maxBytes",
+                  "Es demasiado largo para guardarlo: acórtalo", "Leí el código y entiendo el riesgo",
+                  "navigator.clipboard.writeText(codigo)", "selectAllChildren", "hallazgos más",
+                  "Cualquiera con el enlace podrá verlo", "Ya no está vigente.", "Sí, hacerlo público",
+                  '"Guardar como habilidad"', '"Copiar código"', "Ejecutar otra vez",
+                  "Cuenta de Google", "Correo (Gmail)", "Google Drive", "Taller de scripts"):
+        assert texto in html, texto
+    # Edición del correo con los topes de R.A.M.S. (§12.3) y el nombre de la habilidad ≤ 40.
+    assert "para: 2600, cc: 2600, cco: 2600, asunto: 200, cuerpo: 10000, adjuntos: 1000" in html
+    assert 'entrada.setAttribute("maxlength", String(TARJETA.TOPES_CAMPOS[clave]))' in html
+    assert 'entrada.setAttribute("maxlength", String(TARJETA.MAX_NOMBRE))' in html
+    # El límite de entrada del chat no cambia y la revisión no se cierra con «tarjeta».
+    assert 'if (typeof crudo !== "string" || crudo.length > 65536) { return; }' in html
+    assert 'mensaje.tipo !== "permiso" && mensaje.tipo !== "hola" && mensaje.tipo !== "tarjeta"' in html
+
+
+_PRUEBA_VALIDACION_NODE = r"""
+"use strict";
+const fs = require("fs");
+const [rutaHtml, rutaMapeo] = process.argv.slice(2);
+const html = fs.readFileSync(rutaHtml, "utf8");
+const bloque = html.slice(html.indexOf("// <validar-tarjeta>"), html.indexOf("// </validar-tarjeta>"));
+const HUD = new Function(bloque + "\nreturn TARJETA;")();
+const mapeo = require(rutaMapeo);
+const entrada = JSON.parse(fs.readFileSync(0, "utf8"));
+const salida = { hud: [], mapeo: [], dec_hud: [], dec_mapeo: [] };
+for (const t of entrada.tarjetas) {
+  salida.hud.push(HUD.validar(t));
+  salida.mapeo.push(mapeo.validarTarjeta(t));
+}
+for (const [id, sha, decision, extra] of entrada.decisiones) {
+  salida.dec_hud.push(HUD.validarDecision(id, sha, decision, extra));
+  salida.dec_mapeo.push(mapeo.validarDecisionTarjeta(id, sha, decision, extra));
+}
+process.stdout.write(JSON.stringify(salida));
+"""
+
+
+def test_validacion_de_tarjetas_coherente_en_python_hud_y_electron(tmp_path: Path) -> None:
+    """Lo que escritorio_link deja salir (también al máximo) lo aceptan intacto el HUD y Electron; un
+    campo aprobable fuera de tope no lo acepta ninguno (nunca se recorta). Se salta sin node."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("sin node")
+    from interface import escritorio_link as el
+
+    huella = "ab" * 32
+    comun = {"version": 1, "sha256": huella, "titulo": "é" * 120, "resumen": "é" * 300, "aviso": "é" * 300,
+             "caduca_ts": 1.0, "canal_origen": "telegram", "correo": None, "drive": None, "script": None, "salida": None}
+    direccion = "a" * 64 + "@" + "b" * 185 + ".com"
+    correo = dict(comun, id="c0a1b2c3", clase="correo", botones=["aprobar", "editar", "descartar"], correo={
+        "para": [direccion] * 30, "cc": [direccion] * 10, "cco": [direccion] * 10, "asunto": "😀" * 100,
+        "cuerpo": "€" * 9_990 + "😀" * 5, "adjuntos": [{"nombre": "€" * 255, "bytes": 1, "carpeta": "documentos"}] * 5,
+        "problemas": ["ñ" * 160] * 10, "avisos": ["ñ" * 160] * 5, "listo": True})
+    codigo = ('"' + chr(92)) * 12_288
+    script = dict(comun, id="5c1a7e00", clase="script", botones=["aprobar", "guardar", "copiar", "descartar"], script={
+        "lenguaje": "python", "plataforma": "linux", "codigo": codigo, "explicacion": "€" * 600,
+        "efectos": ["€" * 160] * 10, "requisitos": ["€" * 80] * 10, "nivel": "alto", "ejecutable": True,
+        "motivo_no_ejecutable": "", "metodo": "heuristico",
+        "hallazgos": [{"nivel": "alto", "categoria": "red", "linea": i, "detalle": "€" * 160} for i in range(25)],
+        "hallazgos_omitidos": 0, "habilidad": "h" * 40, "habilidad_cambiada": True, "ejecuciones": 2})
+    drive = dict(comun, id="d0d0d0d0", clase="drive", botones=["aprobar_publico", "descartar"], drive={
+        "op": "compartir", "paso": 2, "archivo": {"nombre": "x" * 200, "tipo": "pdf", "tamano": None,
+                                                  "modificado": "2026-10-18", "propio": True},
+        "local": None, "carpeta_destino": None, "compartir": {"con": "", "rol": "reader", "publico": True},
+        "problemas": [], "listo": True})
+    salida = dict(comun, id="5a11da00", clase="salida", botones=["descartar"], salida={
+        "script_id": "5c1a7e00", "lenguaje": "python", "codigo_salida": 1, "tiempo_agotado": True, "duracion_s": 2.5,
+        "stdout": "€" * 8192, "stderr": "😀" * 4096, "recortada": True, "carpeta": "é" * 160})
+    saneadas = []
+    for cruda in (correo, script, drive, salida):
+        saneada = el._tarjeta_que_cabe(el._tarjeta_saneada(cruda))
+        assert saneada is not None
+        saneadas.append(saneada)
+    malas = [dict(correo, correo=dict(correo["correo"], cuerpo="a" * 9_999 + "😀")),
+             dict(script, script=dict(script["script"], codigo="x" * 24_577)),
+             dict(correo, correo=dict(correo["correo"], para=["x" * 255]))]
+    for mala in malas:
+        with pytest.raises(el._TarjetaInvalida):
+            el._tarjeta_saneada(mala)
+    campos = {"para": "€" * 2600, "cc": "x", "cco": "", "asunto": "😀" * 100, "cuerpo": "€" * 9_998 + "\n\t",
+              "adjuntos": "a.pdf, b.pdf"}
+    decisiones = [["0a1b2c3d", huella, "editar", {"campos": campos, "version": 1}],
+                  ["0a1b2c3d", huella, "editar", {"campos": {"cuerpo": "😀" * 5_000 + "x"}, "version": 1}],
+                  ["0a1b2c3d", huella, "guardar", {"nombre": "  limpiar  ", "version": 2}],
+                  ["0a1b2c3d", huella, "guardar", {"nombre": "n" * 41, "version": 2}],
+                  ["0a1b2c3d", huella, "aprobar", {"nombre": "x", "version": 1}],
+                  # La versión que se ve: obligatoria salvo en «descartar», entero 1..2³¹−1.
+                  ["0a1b2c3d", huella, "aprobar", {"version": 2 ** 31 - 1}],
+                  ["0a1b2c3d", huella, "aprobar", None],
+                  ["0a1b2c3d", huella, "aprobar_publico", {"version": True}],
+                  ["0a1b2c3d", huella, "aprobar_publico", {"version": 2 ** 31}],
+                  ["0a1b2c3d", huella, "descartar", {"version": 4}],
+                  # Controles que no pasan en ningún lado (el chat los avisa antes de enviar).
+                  ["0a1b2c3d", huella, "editar", {"campos": {"cuerpo": "Hola\x0bAna"}, "version": 1}],
+                  ["0a1b2c3d", huella, "editar", {"campos": {"asunto": "Informe\tQ3"}, "version": 1}],
+                  ["0a1b2c3d", huella, "descartar", None]]
+    script_js = tmp_path / "validar.cjs"
+    script_js.write_text(_PRUEBA_VALIDACION_NODE, encoding="utf-8")
+    mapeo_js = Path(hud_server.__file__).resolve().parents[1] / "desktop" / "lib" / "mapeo.js"
+    entrada = json.dumps({"tarjetas": saneadas + malas, "decisiones": decisiones}, ensure_ascii=False)
+    resultado = subprocess.run([node, str(script_js), str(RUTA_HTML), str(mapeo_js)], input=entrada.encode("utf-8"),
+                               capture_output=True, timeout=60, check=False)
+    assert resultado.returncode == 0, resultado.stderr.decode("utf-8", "replace")[-2000:]
+    salida_js = json.loads(resultado.stdout.decode("utf-8"))
+    for lado in ("hud", "mapeo"):
+        aceptadas = salida_js[lado]
+        for saneada, js in zip(saneadas, aceptadas[:4]):
+            assert js == saneada, (lado, saneada["clase"])    # mismo esquema, nada recortado ni añadido
+        assert aceptadas[4:] == [None, None, None], lado
+    for lado in ("dec_hud", "dec_mapeo"):
+        python = [el._decision_tarjeta_valida({"id": i, "sha256": s, "decision": d, **(x or {})})
+                  for i, s, d, x in decisiones]
+        assert salida_js[lado] == python, lado
+        assert salida_js[lado][0]["campos"] == campos and salida_js[lado][1] is None
+        assert [d is None for d in salida_js[lado][5:]] == [False, True, True, True, False, True, True, False], lado
+
+
 # ---------------------------------------------------------------------------
 # Panel RINE de verdad: el HUD cargado en jsdom (Node) contra un ServidorHUD propio en
 # 127.0.0.1:0. Opcional: se salta si no hay ``node`` o ``jsdom`` (``npm i jsdom`` en una carpeta y
@@ -955,6 +1169,106 @@ async function hasta(cond, ms, nombre) {
 """
 
 
+_HARNESS_JSDOM_TARJETAS = r"""
+"use strict";
+const { JSDOM, VirtualConsole } = require("jsdom");
+const [url] = process.argv.slice(2);
+const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+const errores = [];
+const avisos = [];
+function paso(nombre, datos) {
+  process.stdout.write(JSON.stringify(Object.assign({ paso: nombre }, datos || {})) + "\n");
+}
+async function hasta(cond, ms, nombre) {
+  const fin = Date.now() + ms;
+  while (Date.now() < fin) {
+    try { if (cond()) { return; } } catch (e) { /* aún no */ }
+    await esperar(10);
+  }
+  throw new Error("tiempo agotado: " + nombre);
+}
+(async () => {
+  const consola = new VirtualConsole();
+  consola.on("jsdomError", (e) => errores.push(String(e && e.message)));
+  consola.on("error", (...a) => errores.push(a.map(String).join(" ")));
+  consola.on("warn", (...a) => avisos.push(a.map(String).join(" ")));
+  // jsdom no trae TextEncoder (los navegadores sí): el HUD lo usa para medir tarjeta_decision.
+  const { TextEncoder } = require("util");
+  const dom = await JSDOM.fromURL(url, { runScripts: "dangerously", pretendToBeVisual: true, virtualConsole: consola,
+                                         beforeParse(ventana) { ventana.TextEncoder = TextEncoder; } });
+  const w = dom.window;
+  const d = w.document;
+  const $ = (id) => d.getElementById(id);
+  // Clic de ratón con su `detail` (1 = clic sencillo, 2 = segundo clic de un doble clic).
+  const clic = (b, detail) => b.dispatchEvent(new w.MouseEvent("click", { bubbles: true, cancelable: true, detail }));
+  const tarjeta = (id) => d.querySelector('#rine-lista li[data-id="' + id + '"]');
+  const botones = (id) => Array.from(tarjeta(id).querySelectorAll(".acciones button"));
+  const boton = (id, texto) => botones(id).find((b) => b.textContent === texto);
+  const texto = (id, sel) => ((tarjeta(id).querySelector(sel) || {}).textContent || "");
+  await hasta(() => $("llamada-texto").textContent === "EN LLAMADA", 8000, "en llamada");
+  await hasta(() => $("rine-estado").textContent === "en línea", 8000, "chat en línea");
+  paso("listo");
+
+  // 1) Compartir en público: doble clic sobre «Compartir» (el 2.º clic, ~150 ms después y en el mismo sitio).
+  const D = "d0d0d0d0";
+  const primero = () => botones(D)[0];
+  await hasta(() => primero() && primero().textContent === "Compartir" && !primero().disabled, 8000, "paso 1");
+  clic(primero(), 1);
+  const t0 = Date.now();
+  await hasta(() => botones(D).length === 0, 3000, "en curso");          // R.A.M.S.: «en curso», sin botones
+  paso("clic1", { aviso: texto(D, ".aviso-tarjeta") });
+  await hasta(() => primero() && primero().textContent === "Sí, hacerlo público", 5000, "paso 2");
+  const tPintado = Date.now();
+  const pintado = { deshabilitado: primero().disabled };
+  clic(primero(), 2);
+  await esperar(Math.max(0, 150 - (Date.now() - t0)));
+  const colado = primero();
+  colado.disabled = false;                                // un clic sencillo que se colara: tampoco cuenta
+  clic(colado, 1);
+  colado.disabled = true;                                 // (como estaba)
+  paso("doble", { pintado });
+  await esperar(Math.max(0, 900 - (Date.now() - tPintado)));
+  const aun = primero().disabled;
+  await hasta(() => !primero().disabled, 3000, "armado");
+  const armadoMs = Date.now() - tPintado;
+  clic(primero(), 1);
+  paso("publico", { aun_a_los_900_ms: aun, armado_ms: armadoMs });
+
+  // 2) Correo: un tabulador en el asunto y un salto de línea de Word (\v) en el cuerpo.
+  const C = "0a1b2c3d";
+  await hasta(() => tarjeta(C) && boton(C, "Editar") && !boton(C, "Editar").disabled, 8000, "correo");
+  clic(boton(C, "Editar"), 1);
+  const campos = () => Array.from(tarjeta(C).querySelectorAll(".edicion input, .edicion textarea"));
+  await hasta(() => campos().length === 6, 3000, "edición");
+  campos()[3].value = "Informe\tQ3";
+  campos()[4].value = "Hola\u000bAna";
+  clic(boton(C, "Guardar cambios"), 1);
+  const resolucion = texto(C, ".resolucion");
+  const limpiar = boton(C, "Quitar caracteres no válidos");
+  const ofrecido = Boolean(limpiar && !limpiar.hidden && !limpiar.disabled);
+  const intactos = [campos()[3].value, campos()[4].value];
+  clic(limpiar, 1);
+  const limpios = [campos()[3].value, campos()[4].value];
+  const guardarActivo = !boton(C, "Guardar cambios").disabled;
+  clic(boton(C, "Guardar cambios"), 1);
+  paso("editado", { resolucion, ofrecido, intactos, limpios, guardar_activo: guardarActivo, errores, avisos });
+
+  // 3) Correo con problemas: «Guardar cambios» sin tocar nada manda Para, CC, CCO y adjuntos como se ven.
+  const P = "0e1f2a3b";
+  await hasta(() => tarjeta(P) && boton(P, "Editar") && !boton(P, "Editar").disabled, 8000, "correo con problemas");
+  clic(boton(P, "Editar"), 1);
+  await hasta(() => tarjeta(P).querySelectorAll(".edicion input, .edicion textarea").length === 6, 3000, "edición 2");
+  clic(boton(P, "Guardar cambios"), 1);
+  paso("listas", { errores, avisos });
+  await esperar(500);                                     // que el WebSocket entregue la decisión antes de cerrar
+  w.close();
+})().catch((e) => {
+  paso("fallo", { error: String(e && e.stack || e), errores, avisos });
+  process.exit(1);
+});
+"""
+
+
 def _entorno_jsdom() -> tuple[str, dict[str, str]] | None:
     """``(node, entorno)`` si ``node`` resuelve ``jsdom`` (NODE_PATH: ``RAMS_TEST_NODE_PATH``,
     ``NODE_PATH`` y los ``node_modules`` del proyecto); si no, ``None``."""
@@ -975,10 +1289,10 @@ def _entorno_jsdom() -> tuple[str, dict[str, str]] | None:
 
 
 async def _hud_en_jsdom(hud: ServidorHUD, modo: str, token: str, tmp_path: Path,
-                        node: str, entorno: dict[str, str]) -> tuple[Any, Any]:
+                        node: str, entorno: dict[str, str], harness: str = _HARNESS_JSDOM) -> tuple[Any, Any]:
     """Lanza el HUD en jsdom; devuelve el proceso y ``paso(nombre)`` para leer sus hitos."""
     script = tmp_path / "hud_jsdom.cjs"
-    script.write_text(_HARNESS_JSDOM, encoding="utf-8")
+    script.write_text(harness, encoding="utf-8")
     proceso = await asyncio.create_subprocess_exec(
         node, str(script), str(hud.url), modo, token, cwd=str(tmp_path), env=entorno,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -1128,6 +1442,97 @@ def test_rine_en_jsdom_sin_chat_no_muestra_el_lanzador(settings_prueba: Settings
             proceso, paso = await _hud_en_jsdom(hud, "sin_chat", "-", tmp_path, node, entorno)
             datos = await paso("fin")
             assert datos["lanzador_oculto"] is True and datos["panel_oculto"] is True
+            assert datos["errores"] == [] and datos["avisos"] == []
+        finally:
+            if proceso is not None:
+                await _terminar(proceso)
+            await hud.cerrar()
+
+    correr(caso())
+
+
+def test_rine_en_jsdom_tarjetas_doble_clic_publico_y_controles_al_editar(settings_prueba: Settings, bus: BusEventos,
+                                                                        correr: Any, tmp_path: Path) -> None:
+    """Regresión de la revisión ui (v0.2.2) en el panel RINE de verdad: (1) un doble clic sobre «Compartir»
+    no completa «Sí, hacerlo público» (el 2.º clic no cuenta y el botón espera ~1 s tras pintarse); la
+    decisión lleva la versión que se ve y la tarjeta queda «en curso» mientras main la ejecuta; (2) un
+    tabulador o un \v pegados al editar el correo se avisan («caracteres invisibles no válidos», nunca
+    «demasiado largo» ni «sin conexión») y solo se quitan al pulsar «Quitar caracteres no válidos»."""
+    jsdom = _entorno_jsdom()
+    if jsdom is None:
+        pytest.skip("sin node o sin jsdom (npm i jsdom; RAMS_TEST_NODE_PATH=<carpeta>/node_modules)")
+    node, entorno = jsdom
+    decisiones: list[dict[str, Any]] = []
+    bus.suscribir("escritorio.tarjeta", lambda e: decisiones.append(dict(e.datos)))
+    huella = "ab" * 32
+    comun = {"sha256": huella, "titulo": "t", "resumen": "r", "aviso": "", "caduca_ts": None,
+             "canal_origen": "escritorio", "correo": None, "drive": None, "script": None, "salida": None}
+
+    def drive(paso: int) -> dict[str, Any]:
+        return dict(comun, id="d0d0d0d0", clase="drive", version=paso,
+                    botones=["aprobar", "descartar"] if paso == 1 else ["aprobar_publico", "descartar"],
+                    drive={"op": "compartir", "paso": paso, "archivo": {"nombre": "plan.xlsx", "tipo": "hoja",
+                                                                        "tamano": 1, "modificado": "", "propio": True},
+                           "local": None, "carpeta_destino": None,
+                           "compartir": {"con": "", "rol": "reader", "publico": True}, "problemas": [], "listo": True})
+
+    correo = dict(comun, id="0a1b2c3d", clase="correo", version=1, botones=["aprobar", "editar", "descartar"],
+                  correo={"para": ["ana@example.com"], "cc": [], "cco": [], "asunto": "Informe", "cuerpo": "Hola",
+                          "adjuntos": [], "problemas": [], "avisos": [], "listo": True})
+
+    async def esperar(cond: Any, timeout: float = 5.0) -> None:
+        async with asyncio.timeout(timeout):
+            while not cond():
+                await asyncio.sleep(0.01)
+
+    async def caso() -> None:
+        hud = ServidorHUD(settings_prueba.con(hud_habilitado=True, hud_puerto=0, escritorio_habilitado=True,
+                                              hud_chat=True), bus)
+        await hud.iniciar()
+        proceso = None
+        try:
+            token = json.loads(Path(settings_prueba.escritorio_token_file).read_text(encoding="utf-8"))["token"]
+            proceso, paso = await _hud_en_jsdom(hud, "tarjetas", token, tmp_path, node, entorno,
+                                                _HARNESS_JSDOM_TARJETAS)
+            await paso("listo")
+            bus.publicar("tarjeta.mostrar", drive(1))
+            datos = await paso("clic1")
+            await esperar(lambda: len(decisiones) == 1)
+            assert decisiones == [{"id": "d0d0d0d0", "sha256": huella, "decision": "aprobar", "version": 1}]
+            assert datos["aviso"] == "En curso: espera el resultado."     # el panel la ve «en curso»
+            bus.publicar("tarjeta.mostrar", drive(2))                     # main: paso 2 (versión 2)
+            datos = await paso("doble")
+            assert datos["pintado"]["deshabilitado"] is True
+            await asyncio.sleep(0.3)
+            assert [d["decision"] for d in decisiones] == ["aprobar"]      # el doble clic no confirmó nada más
+            datos = await paso("publico")
+            assert datos["aun_a_los_900_ms"] is True and datos["armado_ms"] >= 900
+            await esperar(lambda: len(decisiones) == 2)
+            assert decisiones[1] == {"id": "d0d0d0d0", "sha256": huella, "decision": "aprobar_publico", "version": 2}
+
+            bus.publicar("tarjeta.mostrar", correo)
+            datos = await paso("editado")
+            assert "caracteres invisibles no válidos" in datos["resolucion"] and "Asunto, Cuerpo" in datos["resolucion"]
+            assert "demasiado largo" not in datos["resolucion"] and "Sin conexión" not in datos["resolucion"]
+            assert datos["ofrecido"] is True
+            assert datos["intactos"] == ["Informe\tQ3", "Hola\x0bAna"]          # nunca se quitan en silencio
+            assert datos["limpios"] == ["Informe Q3", "Hola\nAna"] and datos["guardar_activo"] is True
+            await esperar(lambda: len(decisiones) == 3)
+            assert decisiones[2] == {"id": "0a1b2c3d", "sha256": huella, "decision": "editar", "version": 1,
+                                     "campos": {"asunto": "Informe Q3", "cuerpo": "Hola\nAna"}}
+            assert datos["errores"] == [] and datos["avisos"] == []
+
+            # Con problemas (un alias sin resolver que el formulario no muestra), guardar sin cambios manda las
+            # listas tal como se ven: el borrador queda como se ve en vez de atascado (integración).
+            bus.publicar("tarjeta.mostrar", dict(correo, id="0e1f2a3b", correo=dict(
+                correo["correo"], cco=["yo@example.com"], adjuntos=[{"nombre": "plan.pdf", "bytes": 3,
+                                                                     "carpeta": "documentos"}],
+                problemas=["No conozco a «mi tía Rosa» (Para): escribe su correo"], listo=False)))
+            datos = await paso("listas")
+            await esperar(lambda: len(decisiones) == 4)
+            assert decisiones[3] == {"id": "0e1f2a3b", "sha256": huella, "decision": "editar", "version": 1,
+                                     "campos": {"para": "ana@example.com", "cc": "", "cco": "yo@example.com",
+                                                "adjuntos": "plan.pdf"}}
             assert datos["errores"] == [] and datos["avisos"] == []
         finally:
             if proceso is not None:

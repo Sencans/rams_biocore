@@ -12,8 +12,9 @@ const { spawnSync } = require('node:child_process');
 const raiz = path.join(__dirname, '..');
 const leer = (f) => fs.readFileSync(path.join(raiz, f), 'utf8');
 
-test('sintaxis: node --check de main.js, preloads, chat.js, lib y scripts', () => {
-  const archivos = ['main.js', 'preload-overlay.js', 'preload-chat.js', 'chat.js',
+test('sintaxis: node --check de main.js, preloads, chat.js, páginas de Puter, lib y scripts', () => {
+  const archivos = ['main.js', 'preload-overlay.js', 'preload-chat.js', 'preload-puter.js', 'chat.js',
+    path.join('puter', 'trabajo.js'), path.join('puter', 'conectar.js'),
     ...fs.readdirSync(path.join(raiz, 'lib')).map((f) => path.join('lib', f)),
     ...fs.readdirSync(path.join(raiz, 'scripts')).filter((f) => f.endsWith('.js')).map((f) => path.join('scripts', f))];
   for (const f of archivos) {
@@ -23,7 +24,8 @@ test('sintaxis: node --check de main.js, preloads, chat.js, lib y scripts', () =
 });
 
 test('estático: archivos en UTF-8 sin BOM y con LF', () => {
-  const textos = ['main.js', 'preload-overlay.js', 'preload-chat.js', 'chat.html', 'chat.css', 'chat.js',
+  const textos = ['main.js', 'preload-overlay.js', 'preload-chat.js', 'preload-puter.js', 'chat.html', 'chat.css', 'chat.js',
+    ...fs.readdirSync(path.join(raiz, 'puter')).map((f) => path.join('puter', f)),
     'package.json', 'README.md', 'hyprland.ejemplo.conf', 'hyprland.ejemplo.lua',
     ...fs.readdirSync(path.join(raiz, 'lib')).map((f) => path.join('lib', f)),
     ...fs.readdirSync(path.join(raiz, 'scripts')).map((f) => path.join('scripts', f)),
@@ -38,8 +40,11 @@ test('estático: archivos en UTF-8 sin BOM y con LF', () => {
 
 test('estático: ventanas con contextIsolation, sandbox y sin nodeIntegration', () => {
   const main = leer('main.js');
-  assert.equal((main.match(/contextIsolation: true/g) || []).length, 2);
-  assert.equal((main.match(/sandbox: true/g) || []).length, 2);
+  // overlay, chat, páginas de Puter (preferenciasPuter) y la emergente de inicio de sesión de puter.com
+  assert.equal((main.match(/contextIsolation: true/g) || []).length, 4);
+  assert.equal((main.match(/sandbox: true/g) || []).length, 4);
+  assert.equal((main.match(/new BrowserWindow\(/g) || []).length, 4); // overlay, chat, Puter oculta, Conectar
+  assert.equal((main.match(/webPreferences: preferenciasPuter\(/g) || []).length, 2);
   assert.ok(!/nodeIntegration:\s*true/.test(main));
   assert.ok(!/webSecurity:\s*false/.test(main));
   assert.ok(!/contextIsolation:\s*false/.test(main));
@@ -52,7 +57,7 @@ test('estático: ventanas con contextIsolation, sandbox y sin nodeIntegration', 
 });
 
 test('estático: los preloads no exponen ipcRenderer ni cargan Node', () => {
-  for (const f of ['preload-overlay.js', 'preload-chat.js']) {
+  for (const f of ['preload-overlay.js', 'preload-chat.js', 'preload-puter.js']) {
     const src = leer(f);
     const requires = [...src.matchAll(/require\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]);
     assert.deepEqual(requires, ['electron'], f);
@@ -77,6 +82,34 @@ test('estático: chat.html con CSP estricta y chat.js sin innerHTML', () => {
   assert.ok(!/\.(innerHTML|outerHTML)\s*[+]?=|insertAdjacentHTML\s*\(|document\.write(ln)?\s*\(/.test(js));
   assert.ok(js.includes('.textContent = m.texto'));
   assert.ok(js.includes('ESPERA_ENTER_MS = 600'));
+});
+
+test('estático: tarjetas (v0.2.2) — tope de salida, portapapeles y chat sin prompt()', () => {
+  const main = leer('main.js');
+  assert.ok(main.includes('const MAX_WS_SALIENTE = 8192;'));
+  assert.ok(main.includes('const MAX_WS_SALIENTE_TARJETA = 61440;'));
+  assert.ok(main.includes('const MAX_WS_ENTRANTE = 65536;'));            // la entrada NO cambia
+  // Sin maxBytes, 8 KiB; con él, nunca más de 60 KiB. El relevo de Puter conserva su propio cableado.
+  assert.ok(main.includes('enviarWs: (obj, maxBytes) => enlace.enviar(obj, Math.min(Number.isInteger(maxBytes) && ' +
+    'maxBytes > 0 ? maxBytes : MAX_WS_SALIENTE, MAX_WS_SALIENTE_TARJETA)),'));
+  assert.ok(main.includes('enviarWs: (obj, maxBytes) => enlace.enviar(obj, maxBytes),'));
+  assert.ok(main.includes('enviar(obj, maxBytes = MAX_WS_SALIENTE) {'));
+  // El portapapeles solo recibe el código de una tarjeta de script (nunca texto del renderer).
+  const escrituras = main.match(/clipboard\.\w+\(/g) || [];
+  assert.deepEqual(escrituras, ['clipboard.writeText(']);
+  assert.ok(main.includes('const c = escritorio.codigoDeTarjeta(id);\n    if (c) clipboard.writeText(c);'));
+  for (const canal of ["ipcMain.handle('chat:tarjeta'", "ipcMain.on('chat:copiar'"]) {
+    const ini = main.indexOf(canal);
+    assert.ok(ini > 0, canal);
+    assert.ok(main.slice(ini, ini + 200).includes('desdeChat(e)'), `${canal} sin validar el emisor`);
+  }
+  const chat = leer('chat.js');
+  const codigoChat = chat.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/.*$/gm, '$1'); // sin comentarios
+  assert.ok(!/\bprompt\s*\(/.test(codigoChat) && !/\bconfirm\s*\(/.test(codigoChat) && !/\balert\s*\(/.test(codigoChat));
+  assert.ok(chat.includes("api.copiarCodigo(d.id)"));
+  // CSP del chat sin cambios.
+  assert.ok(leer('chat.html').includes("content=\"default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
+    "connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\""));
 });
 
 test('estático: package.json con electron 44.8.0 fijado y los scripts de §C2.7.9', () => {

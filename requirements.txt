@@ -3,11 +3,11 @@
 #   python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
 numpy>=1.26,<3                       # conectoma LIF y RMS del lip-sync (nunca audioop: no existe en Python 3.13+)
 opencv-python-headless>=4.10,<5      # visión activa sin Qt/GUI (no choca con los plugins Qt de Wayland); incluye Haar
-httpx>=0.27,<1.0                     # Gemini, ElevenLabs, Telegram y Brave (la 1.0 puede romper la API)
+httpx>=0.27,<1.0                     # Gemini, ElevenLabs, Telegram, Brave y las APIs de Google (Gmail, Drive y OAuth); la 1.0 puede romper la API
 python-dotenv>=1.0                   # carga de .env (si falta, config.py usa su parser mínimo)
 edge-tts>=7.0                        # voz de respaldo gratuita (MP3 24 kHz)
 websockets>=14.0                     # VTube Studio, HUD y colaboración Nexus (API websockets.asyncio)
-psutil>=6.0                          # telemetría, procesos de Nexus, detección de hypridle
+psutil>=6.0                          # telemetría, procesos de Nexus, detección de hypridle y reanudar los scripts del taller dentro de su Job Object
 ddgs>=9.0                            # DuckDuckGo: sucesor de duckduckgo-search (renombrado en 2025)
 tzdata>=2024.1                       # base de zonas horarias para zoneinfo (Windows y Linux mínimos/contenedores)
 prompt_toolkit>=3.0.43               # consola: Amadeus imprime sin borrar lo que estás escribiendo

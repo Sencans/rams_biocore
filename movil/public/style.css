@@ -1,0 +1,924 @@
+:root {
+  --bg: #070b14;
+  --pan: rgba(12, 20, 36, 0.90);
+  --bd: #1f3a5f;
+  --txt: #d6e6ff;
+  --txt-d: #6f8bb3;
+  --pri: #5fa8ff;
+  --nixie: #ff8a1f;
+  --kurisu: #8b3a2e;
+  --bata: #f2efea;
+  --corbata: #c0392b;
+  --ok: #39d98a;
+  --aviso: #ffb020;
+  --error: #ff4d4d;
+  --rine: #2f9e5a;
+  --rine-osc: #1b5e36;
+  --f-mono: "Share Tech Mono", ui-monospace, "Cascadia Mono", monospace;
+  --f-sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse at 50% -10%, rgba(95, 168, 255, 0.14), transparent 55%),
+    radial-gradient(ellipse at 15% 110%, rgba(255, 138, 31, 0.08), transparent 50%),
+    var(--bg);
+  color: var(--txt);
+  font: 13px/1.4 var(--f-mono);
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+
+/* ---------- Pantalla de Videollamada (Llamar a Amadeus) ---------- */
+.pantalla-llamada {
+  position: fixed;
+  inset: 0;
+  background: radial-gradient(circle at 50% 35%, rgba(18, 34, 62, 0.94), rgba(5, 8, 17, 0.98) 75%);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  z-index: 90;
+  transition: opacity 0.28s ease;
+}
+
+.pantalla-llamada.oculta {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.llamada-tarjeta {
+  width: 100%;
+  max-width: 360px;
+  background: rgba(11, 19, 34, 0.92);
+  border: 1px solid var(--bd);
+  border-radius: 14px;
+  padding: 24px 20px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  box-shadow: 0 14px 38px rgba(0, 0, 0, 0.65);
+}
+
+.llamada-avatar-aro {
+  width: 78px;
+  height: 78px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 35%, #223b66, #0b1426);
+  border: 2px solid var(--pri);
+  box-shadow: 0 0 22px rgba(95, 168, 255, 0.35);
+  display: grid;
+  place-items: center;
+}
+
+.llamada-avatar-letra {
+  font: 700 34px/1 var(--f-sans);
+  color: var(--bata);
+}
+
+.llamada-titulo {
+  margin: 0;
+  font: 700 22px/1.1 var(--f-sans);
+  letter-spacing: 0.28em;
+  color: var(--bata);
+}
+
+.llamada-sub {
+  margin: 0;
+  font-size: 12px;
+  color: var(--pri);
+}
+
+.btn-llamar-principal {
+  width: 100%;
+  margin-top: 6px;
+  padding: 14px 18px;
+  border-radius: 10px;
+  border: 1px solid var(--ok);
+  background: linear-gradient(180deg, #2f9e5a, #1b6b3a);
+  color: #ffffff;
+  font: 700 16px/1.2 var(--f-sans);
+  letter-spacing: 0.06em;
+  cursor: pointer;
+  box-shadow: 0 6px 20px rgba(47, 158, 90, 0.4);
+}
+
+.btn-llamar-principal:active {
+  transform: scale(0.98);
+}
+
+.llamada-acciones-sec {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+  justify-content: center;
+  margin-top: 4px;
+}
+
+.llamada-nota {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--txt-d);
+  line-height: 1.4;
+}
+
+.app-movil {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+}
+
+/* ---------- Cabecera superior ---------- */
+.barra-sup {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: env(safe-area-inset-top, 6px) 10px 6px;
+  background: rgba(7, 11, 20, 0.94);
+  border-bottom: 2px solid var(--pri);
+  z-index: 20;
+}
+
+.marca-bloque {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.marca-logo {
+  width: 26px;
+  height: 26px;
+  border: 1px solid var(--pri);
+  border-radius: 6px;
+  display: grid;
+  place-items: center;
+  color: var(--bata);
+  font-weight: 700;
+}
+
+.marca-titulo {
+  font: 700 14px/1.1 var(--f-sans);
+  letter-spacing: 0.22em;
+  color: var(--bata);
+}
+
+.marca-sub {
+  font-size: 10px;
+  color: var(--txt-d);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.punto-estado {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--txt-d);
+  display: inline-block;
+}
+
+.punto-estado.ok {
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+}
+
+.punto-estado.error {
+  background: var(--error);
+}
+
+.barra-der {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ind-estado {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--txt-d);
+}
+
+.senal {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 11px;
+}
+
+.senal b {
+  width: 3px;
+  background: #24354f;
+  border-radius: 1px;
+}
+
+.senal b:nth-child(1) { height: 3px; }
+.senal b:nth-child(2) { height: 6px; }
+.senal b:nth-child(3) { height: 8px; }
+.senal b:nth-child(4) { height: 11px; }
+.senal b.on { background: var(--pri); }
+
+.bateria {
+  display: inline-flex;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--txt-d);
+  border-radius: 2px;
+}
+
+.bateria i {
+  width: 3px;
+  height: 7px;
+  background: #24354f;
+}
+
+.bateria i.on {
+  background: var(--ok);
+}
+
+.btn-icono {
+  background: rgba(95, 168, 255, 0.14);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+/* ---------- Contenedor de vistas y Escenario 3D Global ---------- */
+.vistas {
+  flex: 1;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+
+.escena-vrm-global {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: #050811;
+  z-index: 1;
+  transition: height 0.22s ease, opacity 0.2s ease;
+}
+
+.escena-vrm-global.modo-vivo {
+  inset: 0;
+  height: 100%;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.escena-vrm-global.modo-estudio {
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 42%;
+  opacity: 1;
+  pointer-events: auto;
+  border-bottom: 2px solid var(--pri);
+}
+
+.escena-vrm-global.modo-oculto {
+  opacity: 0;
+  pointer-events: none;
+}
+
+#marco-vrm {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
+/* Vista previa PiP de cámara móvil */
+.camara-pip {
+  position: absolute;
+  right: 10px;
+  top: 46px;
+  width: 122px;
+  height: 162px;
+  background: #000;
+  border: 1px solid var(--pri);
+  border-radius: 8px;
+  overflow: hidden;
+  z-index: 16;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.7);
+}
+
+.camara-pip video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.camara-pip-bar {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(7, 11, 20, 0.85);
+  padding: 2px 6px;
+  font-size: 9px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.btn-pip-mini {
+  background: transparent;
+  border: 0;
+  color: var(--bata);
+  font-size: 11px;
+  padding: 1px 4px;
+  cursor: pointer;
+}
+
+.vista {
+  position: absolute;
+  inset: 0;
+  overflow-y: auto;
+  padding: 10px;
+  display: none;
+  flex-direction: column;
+  gap: 10px;
+  z-index: 5;
+}
+
+.vista.activa {
+  display: flex;
+}
+
+#vista-vivo {
+  padding: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+#vista-vtuber {
+  top: 42%;
+  height: 58%;
+  background: rgba(7, 11, 20, 0.96);
+}
+
+#vista-rine,
+#vista-sistema {
+  background: rgba(7, 11, 20, 0.94);
+}
+
+/* ---------- Vista 1: Capa de Videollamada sobre el Visor 3D ---------- */
+.hud-vivo-capa {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+}
+
+.hud-top-bar {
+  padding: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.pildora-hud {
+  pointer-events: auto;
+  background: rgba(7, 11, 20, 0.80);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 9 barras de onda de voz */
+.ondas {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 12px;
+}
+
+.ondas i {
+  width: 2px;
+  height: 3px;
+  background: var(--pri);
+  border-radius: 1px;
+  transition: height 0.08s ease;
+}
+
+.led-camara {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4a5568;
+}
+
+.led-camara.activa {
+  background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
+}
+
+.subtitulo-flotante {
+  pointer-events: auto;
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 94px;
+  background: rgba(7, 11, 20, 0.90);
+  border: 1px solid var(--pri);
+  border-left: 3px solid var(--ok);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--bata);
+  z-index: 12;
+  max-height: 98px;
+  overflow-y: auto;
+}
+
+/* Tarjeta de confirmación de permiso en vivo */
+.tarjeta-permiso-vivo {
+  pointer-events: auto;
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  top: 48px;
+  background: rgba(18, 22, 36, 0.96);
+  border: 2px solid var(--aviso);
+  border-radius: 8px;
+  padding: 10px 12px;
+  z-index: 18;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.75);
+}
+
+.tarjeta-permiso-vivo.destructiva {
+  border-color: var(--error);
+}
+
+.permiso-titulo {
+  margin: 0 0 4px;
+  font-size: 12px;
+  color: var(--aviso);
+  font-weight: 700;
+}
+
+.permiso-borrador {
+  background: rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--bd);
+  padding: 6px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  max-height: 70px;
+  overflow-y: auto;
+  margin: 6px 0;
+}
+
+.permiso-botones {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.btn-aprobar, .btn-rechazar {
+  flex: 1;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.btn-aprobar {
+  background: rgba(57, 217, 138, 0.18);
+  border: 1px solid var(--ok);
+  color: var(--ok);
+}
+
+.btn-rechazar {
+  background: rgba(255, 77, 77, 0.18);
+  border: 1px solid var(--error);
+  color: var(--error);
+}
+
+/* Controles inferiores de la vista en vivo */
+.controles-vivo-inf {
+  pointer-events: auto;
+  background: linear-gradient(to top, rgba(7, 11, 20, 0.94), rgba(7, 11, 20, 0.70));
+  border-top: 1px solid rgba(31, 58, 95, 0.7);
+  padding: 6px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 14;
+}
+
+.btn-restaurar-hud {
+  pointer-events: auto;
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  padding: 6px 11px;
+  background: rgba(7, 11, 20, 0.85);
+  border: 1px solid var(--pri);
+  border-radius: 6px;
+  color: var(--bata);
+  font-size: 11px;
+  z-index: 20;
+  cursor: pointer;
+}
+
+.fila-botones-hud {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.btn-hud {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  background: rgba(18, 30, 52, 0.88);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.btn-hud[aria-pressed="true"], .btn-hud.activo {
+  border-color: var(--pri);
+  background: rgba(95, 168, 255, 0.24);
+  color: var(--bata);
+}
+
+.btn-hud.peligro {
+  border-color: rgba(255, 77, 77, 0.65);
+  background: rgba(255, 77, 77, 0.16);
+  color: #ffb3b3;
+}
+
+.form-rapido {
+  display: flex;
+  gap: 6px;
+}
+
+.input-rapido {
+  flex: 1;
+  background: rgba(5, 9, 18, 0.90);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 7px 10px;
+}
+
+.btn-voz {
+  padding: 7px 11px;
+  background: rgba(95, 168, 255, 0.18);
+  border: 1px solid var(--pri);
+  color: var(--bata);
+  border-radius: 6px;
+  cursor: pointer;
+  font-weight: 700;
+}
+
+.btn-voz.escuchando {
+  background: rgba(255, 77, 77, 0.28);
+  border-color: var(--error);
+  color: var(--bata);
+}
+
+.btn-enviar {
+  padding: 7px 12px;
+  background: rgba(47, 158, 90, 0.25);
+  border: 1px solid var(--rine);
+  color: var(--ok);
+  border-radius: 6px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* ---------- Vista 2: Chat ---------- */
+.cabecera-rine {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: var(--rine-osc);
+  border: 1px solid var(--rine);
+  border-radius: 6px;
+}
+
+.lista-rine {
+  flex: 1;
+  list-style: none;
+  margin: 0;
+  padding: 8px;
+  overflow-y: auto;
+  background: rgba(8, 14, 26, 0.78);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.msg-rine {
+  display: flex;
+  flex-direction: column;
+  max-width: 86%;
+}
+
+.msg-rine.yo {
+  align-self: flex-end;
+}
+
+.msg-rine.ella, .msg-rine.permiso {
+  align-self: flex-start;
+}
+
+.msg-rine.sistema {
+  align-self: center;
+  max-width: 95%;
+}
+
+.burbuja-rine {
+  padding: 8px 10px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.msg-rine.yo .burbuja-rine {
+  background: #9be7b0;
+  color: #0b2414;
+}
+
+.msg-rine.ella .burbuja-rine {
+  background: var(--bata);
+  color: #1a1a1a;
+}
+
+.msg-rine.sistema .burbuja-rine {
+  background: rgba(95, 168, 255, 0.12);
+  border: 1px dashed var(--bd);
+  color: var(--txt-d);
+  font-size: 11px;
+}
+
+.msg-rine.permiso .burbuja-rine {
+  background: rgba(255, 176, 32, 0.14);
+  border: 1px solid var(--aviso);
+  color: var(--txt);
+}
+
+.hora-rine {
+  font-size: 10px;
+  color: var(--txt-d);
+  margin-top: 2px;
+}
+
+/* ---------- Vista 3 y 4: Tarjetas, Estudio 3D y Sistema ---------- */
+.panel-tarjeta {
+  background: var(--pan);
+  border: 1px solid var(--bd);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.panel-tarjeta h2 {
+  margin: 0 0 8px;
+  font: 600 12px/1.2 var(--f-sans);
+  letter-spacing: 0.14em;
+  color: var(--bata);
+  border-bottom: 1px dashed var(--bd);
+  padding-bottom: 5px;
+  text-transform: uppercase;
+}
+
+.chips-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.chip-btn {
+  padding: 6px 10px;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--bd);
+  border-radius: 5px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.chip-btn.activo, .chip-btn:active {
+  border-color: var(--pri);
+  background: rgba(95, 168, 255, 0.22);
+}
+
+.fila-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.fila-control label {
+  min-width: 72px;
+  font-size: 11px;
+  color: var(--txt-d);
+}
+
+.fila-control label.chk-linea {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--txt);
+  cursor: pointer;
+}
+
+.fila-control input[type="range"],
+.fila-control select,
+.fila-control input[type="text"] {
+  flex: 1;
+  background: #050811;
+  border: 1px solid var(--bd);
+  padding: 5px 8px;
+  border-radius: 4px;
+}
+
+.consola-json {
+  width: 100%;
+  margin-top: 6px;
+  background: #050811;
+  border: 1px solid var(--bd);
+  border-radius: 5px;
+  padding: 7px 8px;
+  font: 11px/1.35 var(--f-mono);
+  color: var(--txt);
+  resize: vertical;
+}
+
+.cruceta-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 52px);
+  gap: 6px;
+  justify-content: center;
+  margin: 6px 0;
+}
+
+/* Barras del conectoma */
+.metrica-fila {
+  margin-bottom: 7px;
+}
+
+.metrica-cab {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  margin-bottom: 2px;
+}
+
+.barra-fondo {
+  height: 7px;
+  background: rgba(255, 255, 255, 0.07);
+  border: 1px solid var(--bd);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.barra-relleno {
+  height: 100%;
+  width: 0%;
+  background: linear-gradient(90deg, var(--pri), var(--ok));
+  transition: width 0.25s ease;
+}
+
+.rejilla-telemetria {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 8px;
+}
+
+.caja-dato {
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid var(--bd);
+  border-radius: 5px;
+  padding: 6px 8px;
+}
+
+.caja-dato-titulo {
+  font-size: 10px;
+  color: var(--txt-d);
+}
+
+.caja-dato-valor {
+  font-size: 13px;
+  color: var(--bata);
+  margin-top: 2px;
+}
+
+.lista-simple {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 11px;
+}
+
+.lista-simple li {
+  padding: 4px 0;
+  border-bottom: 1px solid rgba(31, 58, 95, 0.45);
+}
+
+/* ---------- Barra de navegación inferior móvil ---------- */
+.nav-inf {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  background: rgba(7, 11, 20, 0.96);
+  border-top: 1px solid var(--bd);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  z-index: 25;
+}
+
+.tab-nav {
+  padding: 9px 4px;
+  background: transparent;
+  border: 0;
+  border-top: 2px solid transparent;
+  color: var(--txt-d);
+  font-size: 11px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.tab-nav.activa {
+  color: var(--bata);
+  border-top-color: var(--pri);
+  background: rgba(95, 168, 255, 0.08);
+}
+
+.insignia-tab {
+  background: var(--rine);
+  color: #fff;
+  border-radius: 10px;
+  padding: 0 5px;
+  font-size: 10px;
+  margin-left: 4px;
+}
+
+/* ---------- Modal de enlace con R.A.M.S. ---------- */
+.modal-fondo {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.80);
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  z-index: 100;
+}
+
+.modal-caja {
+  width: 100%;
+  max-width: 400px;
+  background: #0b1322;
+  border: 1px solid var(--pri);
+  border-radius: 8px;
+  padding: 14px;
+}
