@@ -4488,3 +4488,197 @@ def test_v022_google_estado_actualiza_capacidades_y_avisa(settings_prueba: Setti
     assert r["herramientas"][0]["google_conectado"] is True and r["herramientas"][0]["taller"] is True
     assert r["herramientas"][-1]["google_conectado"] is False and r["herramientas"][-1]["correo"] is False
     assert "Tu permiso de Google caducó o se revocó" in r["salida"]
+
+
+# ---------------------------------------------------------------------------
+# Perfil heredado de Google Takeout (core/takeout_ingestor.py)
+# ---------------------------------------------------------------------------
+
+PERFIL_TAKEOUT_PRUEBA: dict[str, Any] = {
+    "version": 2, "tipo": "perfil_takeout", "generado": "2026-10-19T12:00:00+00:00", "nombre_pila": "Yoprueba",
+    "intereses": [{"tema": "programación y desarrollo", "peso": 1.0}, {"tema": "música", "peso": 0.5}],
+    "plataformas": [{"dominio": "github.com", "visitas": 30, "dias": 9, "peso": 0.3}],
+    "ritmo": {"navegacion": {"eventos": 200, "hora_pico": 22, "franja": "noche", "dia_pico": "domingo"}},
+}
+
+
+def _guardar_takeout(settings: Settings, perfil: dict[str, Any] | None = None) -> Path:
+    from core.takeout_ingestor import guardar_perfil
+
+    guardar_perfil(perfil if perfil is not None else PERFIL_TAKEOUT_PRUEBA, settings.perfil_takeout_path)
+    return settings.perfil_takeout_path
+
+
+async def _hechos_takeout(orq: Any) -> list[str]:
+    return [r.contenido for r in await orq.memoria.listar_recuerdos(50, tipo="heredado") if r.categoria == "takeout"]
+
+
+def _espiar_salida_comando(orq: Any) -> list[tuple[str, str]]:
+    salidas: list[tuple[str, str]] = []
+    original = orq._salida_comando
+
+    async def espia(texto: str, canal: str) -> None:
+        salidas.append((canal, texto))
+        await original(texto, canal)
+
+    orq._salida_comando = espia
+    return salidas
+
+
+def test_perfil_takeout_se_carga_al_arrancar_sin_duplicar(settings_prueba: Settings) -> None:
+    _guardar_takeout(settings_prueba)
+
+    async def principal() -> list[tuple[list[str], str | None, str, str]]:
+        vueltas = []
+        for imprimir in (False, True):
+            orq, salida = _orquestador(settings_prueba.con(conectoma_fuente="stub"))
+            try:
+                await orq.iniciar(lanzar_tareas=False, imprimir_arranque=imprimir)
+                vueltas.append((await _hechos_takeout(orq), orq.broca.perfil_takeout,
+                                orq.broca.construir_system_prompt(), salida.getvalue()))
+            finally:
+                await orq.apagar()
+        return vueltas
+
+    (hechos, resumen, prompt, _), (hechos_2, _, _, impreso) = asyncio.run(principal())
+    assert 3 <= len(hechos) <= 6 and sorted(hechos_2) == sorted(hechos)        # rearrancar no duplica
+    assert "Intereses de Lab Mem 001 según su actividad en Google: programación y desarrollo, música." in hechos
+    assert resumen is not None and "github.com" in resumen and "Yoprueba" not in resumen
+    assert "Hábitos digitales (Google Takeout, datos agregados): Por su actividad en Google" in prompt
+    assert "Yoprueba" not in prompt
+    assert "perfil de Google heredado: perfil_takeout.json (2026-10-19)" in impreso
+
+
+def test_perfil_takeout_no_se_usa_si_esta_apagado(settings_prueba: Settings) -> None:
+    """Con RAMS_PERFIL_TAKEOUT_EN_PROMPT=0 nada del perfil llega al LLM: ni el resumen ni los recuerdos
+    heredados (memoria.buscar los mete en memoria_relevante de cada turno). Los importados en un
+    arranque anterior con la bandera encendida se borran."""
+    _guardar_takeout(settings_prueba)
+    ajustes = settings_prueba.con(perfil_takeout_en_prompt=False)
+
+    async def principal() -> dict[str, Any]:
+        r: dict[str, Any] = {}
+        for clave, conf in (("encendido", settings_prueba), ("apagado", ajustes)):
+            orq, salida = _orquestador(conf.con(conectoma_fuente="stub"))
+            try:
+                await orq.iniciar(lanzar_tareas=False, imprimir_arranque=True)
+                r[clave] = (await _hechos_takeout(orq), orq.broca.perfil_takeout, orq.broca.construir_system_prompt(),
+                            await orq.memoria.buscar("qué sitios web uso más", 5), salida.getvalue())
+            finally:
+                await orq.apagar()
+        return r
+
+    r = asyncio.run(principal())
+    assert len(r["encendido"][0]) >= 3 and any(x.categoria == "takeout" for x in r["encendido"][3])
+    hechos, resumen, prompt, recuerdos, impreso = r["apagado"]
+    assert hechos == [] and resumen is None and "Hábitos digitales" not in prompt
+    assert not any(x.categoria == "takeout" for x in recuerdos)     # tampoco como recuerdo relevante
+    assert "sin usar (RAMS_PERFIL_TAKEOUT_EN_PROMPT=0)" in impreso
+
+
+def test_perfil_takeout_v1_no_se_usa(settings_prueba: Settings) -> None:
+    _guardar_takeout(settings_prueba, {**PERFIL_TAKEOUT_PRUEBA, "version": 1})
+
+    async def principal() -> tuple[list[str], str | None, str]:
+        orq, salida = _orquestador(settings_prueba.con(conectoma_fuente="stub"))
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=True)
+            return await _hechos_takeout(orq), orq.broca.perfil_takeout, salida.getvalue()
+        finally:
+            await orq.apagar()
+
+    hechos, resumen, impreso = asyncio.run(principal())
+    assert hechos == [] and resumen is None                         # filtros antiguos: hay que regenerarlo
+    assert "sin usar (versión antigua: regenéralo)" in impreso
+
+
+def test_olvidar_perfil_takeout_con_confirmacion(settings_prueba: Settings, monkeypatch: pytest.MonkeyPatch) -> None:
+    ruta = _guardar_takeout(settings_prueba)
+
+    async def principal() -> dict[str, Any]:
+        orq, consola = _orquestador(settings_prueba)
+        try:
+            await orq.iniciar(lanzar_tareas=False, imprimir_arranque=False)
+            contextos = _espiar_broca(monkeypatch, orq)
+            salidas = _espiar_salida_comando(orq)
+            r: dict[str, Any] = {}
+            # Por Telegram nunca (ni queda pendiente).
+            r["telegram"] = await orq.procesar_entrada("olvida mi perfil de Google", canal="telegram")
+            r["pendiente_tg"] = orq._olvido_takeout
+            # Pregunta; cualquier otro mensaje la anula y sigue su curso normal (Broca).
+            await orq.procesar_entrada("¿Olvida mi perfil de Google Takeout, por favor?")
+            r["pendiente"] = dict(orq._olvido_takeout or {})
+            await orq.procesar_entrada("mejor cuéntame un chiste")
+            r["tras_otro"] = (orq._olvido_takeout, ruta.exists(), len(contextos))
+            await orq.procesar_entrada("sí")                       # sin pregunta vigente: un turno más
+            r["si_suelto"] = (ruta.exists(), len(contextos))
+            # Pregunta caducada (60 s): el «sí» ya no vale.
+            await orq.procesar_entrada("/olvidar_takeout")
+            reloj = orq._reloj
+            orq._reloj = lambda: reloj() + 61.0
+            await orq.procesar_entrada("sí")
+            orq._reloj = reloj
+            r["caducada"] = ruta.exists()
+            # «no» cancela; en el chat de escritorio un «sí» escrito no confirma (§C2.4) y el «sí» de
+            # otro canal tampoco vale.
+            await orq.procesar_entrada("bórrame el perfil de Google", canal="escritorio")
+            await orq.procesar_entrada("no", canal="escritorio")
+            await orq.procesar_entrada("quita mi takeout", canal="escritorio")
+            await orq.procesar_entrada("sí", canal="escritorio")
+            r["si_escritorio"] = (ruta.exists(), orq._olvido_takeout)
+            await orq.procesar_entrada("quita mi takeout", canal="escritorio")
+            await orq.procesar_entrada("sí", canal="terminal")
+            r["cancelada"] = ruta.exists()
+            # Confirmación por comando desde el chat de escritorio.
+            antes = len(contextos)
+            await orq.procesar_entrada("/olvidar_takeout", canal="escritorio")
+            await orq.procesar_entrada("/olvidar_takeout confirmar", canal="escritorio")
+            r["por_comando"] = (ruta.exists(), orq.broca.perfil_takeout, await _hechos_takeout(orq),
+                                len(contextos) - antes)
+            # Otra vez con el perfil de vuelta (y exclusiones de --quitar), ahora con «Sí» en la terminal.
+            from core.takeout_ingestor import Exclusiones, guardar_exclusiones, ruta_exclusiones
+
+            _guardar_takeout(settings_prueba)
+            exclusiones = Exclusiones()
+            exclusiones.agregar("anime")
+            guardar_exclusiones(exclusiones, ruta_exclusiones(ruta))
+            await orq._cargar_perfil_takeout()
+            r["recargado"] = (orq.broca.perfil_takeout is not None, len(await _hechos_takeout(orq)))
+            await orq.procesar_entrada("olvida mi perfil de google")
+            await orq.procesar_entrada("Sí.")
+            r["por_si"] = (ruta.exists(), orq.broca.perfil_takeout, await _hechos_takeout(orq))
+            r["exclusiones"] = ruta_exclusiones(ruta).exists()
+            await orq.procesar_entrada("/olvidar_takeout")         # ya no queda nada
+            await orq.procesar_entrada("/ayuda")
+            await orq.procesar_entrada("/ayuda", canal="telegram")
+            r["salidas"] = salidas
+            r["consola"] = consola.getvalue()
+            return r
+        finally:
+            await orq.apagar()
+
+    r = asyncio.run(principal())
+    salidas = r["salidas"]
+    assert r["telegram"] is None and r["pendiente_tg"] is None
+    assert ("telegram", MENSAJE_SOLO_LOCAL) in salidas
+    assert r["pendiente"]["canal"] == "terminal"
+    assert any(t.startswith("¿Olvido tu perfil heredado de Google? Borraré perfil_takeout.json") for _, t in salidas)
+    pendiente, existe, n_contextos = r["tras_otro"]
+    assert pendiente is None and existe and n_contextos >= 1
+    assert r["si_suelto"] == (True, n_contextos + 1)
+    assert r["caducada"] is True and r["cancelada"] is True and r["si_escritorio"] == (True, None)
+    assert ("escritorio", "Vale: conservo tu perfil de Google.") in salidas
+    assert any(c == "escritorio" and "Escribe «/olvidar_takeout confirmar»" in t for c, t in salidas)
+    assert any(c == "terminal" and "Responde «sí» en los próximos 60 s" in t for c, t in salidas)
+    assert r["por_comando"] == (False, None, [], 0)                 # sin Broca en los turnos de olvido
+    assert r["recargado"][0] is True and r["recargado"][1] >= 3
+    assert r["por_si"] == (False, None, [])
+    assert sum(t.startswith("Listo: olvidé tu perfil de Google Takeout") for _, t in salidas) == 2
+    # Las exclusiones se conservan (para que los temas quitados no vuelvan al regenerar) y se avisa.
+    assert r["exclusiones"] is True
+    assert sum("Conservo la lista de temas que pediste quitar (takeout_exclusiones.json" in t for _, t in salidas) == 1
+    assert ("terminal", "No tengo ningún perfil de Google Takeout que olvidar.") in salidas
+    ayuda_local = [t for c, t in salidas if c == "terminal" and t.startswith("Comandos disponibles")][-1]
+    ayuda_tg = [t for c, t in salidas if c == "telegram" and t.startswith("Comandos disponibles")][-1]
+    assert "/olvidar_takeout" in ayuda_local and "/olvidar_takeout" not in ayuda_tg
+    assert "Yoprueba" not in r["consola"]

@@ -146,6 +146,7 @@ from core.intenciones import (
     completar_programar,
     detectar_evento_social,
     enrutar,
+    normalizar,
     quiere_cancelar,
 )
 
@@ -370,6 +371,23 @@ _CAMPOS_AUDITORIA_V022: Final = frozenset({
 _CODIGOS_SCRIPT_CORRIDO: Final = frozenset({"ejecutado", "error_salida", "tiempo_agotado", "politica"})
 MENSAJE_ABRE_CHAT: Final = "Abre el chat de Amadeus Desktop o el del HUD para aprobarlo."
 
+# --- Perfil heredado de Google Takeout (core/takeout_ingestor.py) ----------------------------------
+TTL_OLVIDO_TAKEOUT_S: Final = 60.0            # «¿olvido tu perfil de Google?» espera el «sí» 60 s
+COMANDO_OLVIDAR_TAKEOUT: Final = "/olvidar_takeout"
+# Comandos que atiende main antes del enrutador (no están en intenciones.COMANDOS): solo canales locales.
+_COMANDOS_MAIN: Final = frozenset({COMANDO_OLVIDAR_TAKEOUT})
+# Sobre el texto normalizado (sin tildes ni ¿¡, sin puntuación final): «olvida mi perfil de Google»,
+# «bórrame el perfil de Google Takeout», «quita mi takeout», «/olvidar_takeout».
+_RE_OLVIDAR_TAKEOUT: Final = re.compile(
+    r"^(?:(?:oye|amadeus|kurisu|por favor|porfa)[ ,]+)*"
+    r"(?:olvida|olvidate de|borra|borrame|elimina|eliminame|quita|quitame) (?:mi|el|tu) "
+    r"(?:perfil (?:heredado )?(?:de |del )?(?:google(?: takeout)?|takeout)|takeout)(?: heredado)?"
+    r"(?:,? por favor)?$")
+_RE_CONFIRMA_OLVIDO_TAKEOUT: Final = re.compile(r"^/olvidar_takeout (?:confirmar|si|s)$")
+# El «sí» que confirma (mismas palabras que la compuerta, permisos.RESPUESTAS_SI, normalizadas).
+_SI_OLVIDO_TAKEOUT: Final = frozenset({"s", "si", "y", "yes", "procede", "dale"})
+_NO_OLVIDO_TAKEOUT: Final = frozenset({"n", "no", "cancela", "cancelar", "mejor no", "no gracias"})
+
 _MESES: Final = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre",
                  "octubre", "noviembre", "diciembre")
 _DIAS: Final = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
@@ -398,6 +416,7 @@ _DESCRIPCION_COMANDOS: Final = {
     "/google": ("/google [estado|conectar|desconectar]", "cuenta de Google (Gmail y Drive)"),
     "/script": ("/script <tarea>", "taller: escribe un script para revisar y aprobar"),
     "/habilidades": ("/habilidades", "scripts guardados como habilidades"),
+    COMANDO_OLVIDAR_TAKEOUT: (COMANDO_OLVIDAR_TAKEOUT, "olvida tu perfil heredado de Google Takeout (pide confirmar)"),
 }
 
 _CATEGORIAS_OBLIGATORIAS: Final = (
@@ -1277,6 +1296,10 @@ class Orquestador:
         # --- v0.2.2 (docs/V022_CORREO_DRIVE_SCRIPTS.md §14) ---
         self._clientes_escritorio = 0                    # escritorio.conectado.clientes (Desktop, RINE, móvil)
         self._oferta_taller: dict[str, Any] | None = None   # {"tarea", "canal", "ts"}
+        # Perfil heredado de Google Takeout: fecha del perfil cargado y el «¿lo olvido?» pendiente.
+        self._takeout_generado: str | None = None
+        self._takeout_sin_usar: str | None = None           # motivo si el perfil existe pero no se usa
+        self._olvido_takeout: dict[str, Any] | None = None  # {"canal", "ts"}
         self._lock_tarjetas = asyncio.Lock()             # serializa las decisiones de las tarjetas
         self._tarjetas_info: dict[str, dict[str, Any]] = {}       # tarjetas "salida": id → {"datos", "caduca"}
         self._tarjetas_publicadas: dict[str, dict[str, Any]] = {}  # id → último tarjeta.mostrar (sin logs)
@@ -1579,8 +1602,9 @@ class Orquestador:
             except (TypeError, ValueError):
                 self._fragmentos_inicio = None
 
-        # 5. Perfil heredado de WhatsApp.
+        # 5. Perfil heredado de WhatsApp y, si existe, el de Google Takeout.
         await self._cargar_perfil()
+        await self._cargar_perfil_takeout()
 
         # 6. Conectoma (__init__ barato; iniciar() va en paralelo con los diagnósticos).
         clase_conectoma = _importar_obligatorio("core.sincan_connectome", "SincanConnectome")
@@ -1701,6 +1725,153 @@ class Orquestador:
                 self.broca.set_perfil_resumen(wsp.resumen_perfil(perfil))
         except Exception as exc:
             log.warning("No se pudo integrar el perfil heredado: %s", type(exc).__name__)
+
+    async def _cargar_perfil_takeout(self) -> None:
+        """Paso 5b: perfil de Google Takeout → recuerdo heredado (idempotente) y su resumen a Broca.
+
+        Solo con ``perfil_takeout_en_prompt`` y un perfil vigente (v2+). Si no, el perfil **no se
+        usa**: ni resumen en el prompt ni recuerdos heredados (que viajarían igual al LLM como
+        recuerdos relevantes de cada turno); los que se hubieran importado antes se borran."""
+        ruta = getattr(self.settings, "perfil_takeout_path", None)
+        if not isinstance(ruta, Path):
+            return
+        try:
+            existe = ruta.is_file()
+        except OSError as exc:
+            log.debug("No se pudo comprobar el perfil de Takeout (%s)", type(exc).__name__)
+            existe = False
+        if not existe:
+            return
+        try:
+            takeout = importlib.import_module("core.takeout_ingestor")
+            perfil = takeout.cargar_perfil_takeout(ruta)
+        except Exception as exc:
+            log.warning("No se pudo cargar el perfil de Google Takeout: %s", type(exc).__name__)
+            return
+        if not perfil:
+            return
+        generado = perfil.get("generado")
+        self._takeout_generado = generado[:10] if isinstance(generado, str) else "sin fecha"
+        vigente = bool(takeout.perfil_vigente(perfil))
+        activo = bool(getattr(self.settings, "perfil_takeout_en_prompt", True))
+        self._takeout_sin_usar = (None if vigente and activo
+                                  else "RAMS_PERFIL_TAKEOUT_EN_PROMPT=0" if vigente
+                                  else "versión antigua: regenéralo")
+        try:
+            if self._takeout_sin_usar is None:
+                insertados = await self.memoria.importar_perfil_takeout(perfil)
+                if insertados:
+                    log.info("Perfil de Google Takeout importado: %d hechos", insertados)
+                self.broca.set_perfil_takeout(takeout.resumen_perfil_takeout(perfil))
+                return
+            if not vigente:
+                log.warning("El perfil de Google Takeout es de una versión anterior, con filtros de privacidad "
+                            "más débiles: no se usa. Regenéralo con python -m core.takeout_ingestor")
+            else:
+                log.info("RAMS_PERFIL_TAKEOUT_EN_PROMPT=0: el perfil de Google Takeout no se usa (ni resumen ni "
+                         "recuerdos heredados)")
+            await self.memoria.olvidar_perfil_takeout()      # los recuerdos importados antes también viajarían
+            self.broca.set_perfil_takeout(None)
+        except Exception as exc:
+            log.warning("No se pudo integrar el perfil de Google Takeout: %s", type(exc).__name__)
+
+    # --- perfil de Google Takeout: «olvida mi perfil de Google» (solo local, con confirmación) ------
+
+    @staticmethod
+    def _norm_olvido(texto: str) -> str:
+        return re.sub(r"[\s.!?…]+$", "", normalizar(texto)).strip()
+
+    async def _turno_olvido_takeout(self, texto: str, canal: str) -> bool:
+        """``True`` si el turno era el pedido de olvidar el perfil de Takeout o su confirmación.
+
+        - «olvida mi perfil de Google» o ``/olvidar_takeout`` en un canal local: pregunta y deja
+          pendiente la confirmación (60 s, mismo canal). Por Telegram: solo desde el computador.
+        - Con la pregunta vigente, en el mismo canal, ``/olvidar_takeout confirmar`` (o, solo en la
+          terminal, un «sí» exacto: el chat de escritorio nunca confirma con un «sí» escrito,
+          COMPANION §C2.4) borra el archivo, los recuerdos heredados y el resumen del prompt; un
+          «no» lo cancela y cualquier otro mensaje la anula (y sigue su curso normal).
+        - No es una ``AccionPC`` ni pasa por la compuerta: no toca el PC, solo datos propios de
+          Amadeus (como ``/olvidar <id>``), y el perfil se puede regenerar desde los zips.
+        """
+        if canal not in CANALES_LOCALES and canal != "telegram":
+            return False
+        norm = self._norm_olvido(texto)
+        pendiente, self._olvido_takeout = self._olvido_takeout, None
+        if pendiente is not None and canal in CANALES_LOCALES and pendiente.get("canal") == canal:
+            try:
+                vigente = self._reloj() - float(pendiente.get("ts", float("-inf"))) <= TTL_OLVIDO_TAKEOUT_S
+            except (TypeError, ValueError):
+                vigente = False
+            confirma = (_RE_CONFIRMA_OLVIDO_TAKEOUT.match(norm) is not None
+                        or (canal == "terminal" and norm in _SI_OLVIDO_TAKEOUT))
+            if vigente and confirma:
+                await self._salida_comando(await self._olvidar_takeout(), canal)
+                return True
+            if vigente and norm in _NO_OLVIDO_TAKEOUT:
+                await self._salida_comando("Vale: conservo tu perfil de Google.", canal)
+                return True
+            log.debug("Confirmación de olvidar el perfil de Takeout anulada (vigente=%s)", vigente)
+        es_comando = norm == COMANDO_OLVIDAR_TAKEOUT or norm.startswith(COMANDO_OLVIDAR_TAKEOUT + " ")
+        if not (es_comando or _RE_OLVIDAR_TAKEOUT.match(norm)):
+            return False
+        if canal not in CANALES_LOCALES:
+            await self._salida_comando(MENSAJE_SOLO_LOCAL, canal)
+            return True
+        ruta = getattr(self.settings, "perfil_takeout_path", None)
+        try:
+            hay_archivo = isinstance(ruta, Path) and ruta.is_file()
+        except OSError:
+            hay_archivo = False
+        if not hay_archivo and self._takeout_generado is None and getattr(self.broca, "perfil_takeout", None) is None:
+            await self._salida_comando("No tengo ningún perfil de Google Takeout que olvidar.", canal)
+            return True
+        self._olvido_takeout = {"canal": canal, "ts": self._reloj()}
+        nombre = ruta.name if isinstance(ruta, Path) else "perfil_takeout.json"
+        como = ("Responde «sí»" if canal == "terminal"
+                else f"Escribe «{COMANDO_OLVIDAR_TAKEOUT} confirmar» (aquí un «sí» escrito no confirma)")
+        await self._salida_comando(
+            f"¿Olvido tu perfil heredado de Google? Borraré {nombre}, sus recuerdos heredados y su resumen "
+            f"del prompt. {como} en los próximos {int(TTL_OLVIDO_TAKEOUT_S)} s para confirmarlo "
+            "(cualquier otra cosa lo cancela).", canal)
+        return True
+
+    async def _olvidar_takeout(self) -> str:
+        """Borra el perfil de Takeout (archivo, recuerdos heredados y resumen de Broca). Nunca lanza."""
+        ruta = getattr(self.settings, "perfil_takeout_path", None)
+        archivo_ok = True
+        if isinstance(ruta, Path):
+            try:
+                ruta.unlink(missing_ok=True)
+            except OSError as exc:
+                archivo_ok = False
+                log.warning("No se pudo borrar el perfil de Takeout (%s)", type(exc).__name__)
+        borrados = 0
+        try:
+            borrados = int(await self.memoria.olvidar_perfil_takeout() or 0)
+        except Exception as exc:
+            log.warning("No se pudieron olvidar los recuerdos del perfil de Takeout (%s)", type(exc).__name__)
+        try:
+            self.broca.set_perfil_takeout(None)
+        except Exception as exc:
+            log.warning("No se pudo quitar el perfil de Takeout del prompt (%s)", type(exc).__name__)
+        self._takeout_generado = None
+        self._takeout_sin_usar = None
+        if not archivo_ok:
+            return (f"Olvidé {borrados} recuerdos heredados de tu perfil de Google y lo quité del prompt, pero no "
+                    "pude borrar el archivo: bórralo tú (data/john/perfil_takeout.json).")
+        # Las exclusiones (--quitar) viven aparte y se conservan: si regenera el perfil, los temas que
+        # pidió quitar no vuelven. Se le dice dónde están por si tampoco las quiere.
+        exclusiones = ""
+        if isinstance(ruta, Path):
+            try:
+                archivo_exc = importlib.import_module("core.takeout_ingestor").ruta_exclusiones(ruta)
+                if archivo_exc.is_file():
+                    exclusiones = (f" Conservo la lista de temas que pediste quitar ({archivo_exc.name}, ofuscada) "
+                                   "para que no vuelvan si lo regeneras; bórrala tú si tampoco la quieres.")
+            except Exception as exc:
+                log.debug("No se pudo comprobar las exclusiones del perfil de Takeout (%s)", type(exc).__name__)
+        return (f"Listo: olvidé tu perfil de Google Takeout ({borrados} recuerdos heredados) y ya no está en "
+                "el prompt. Si quieres volver a dármelo, ejecuta python -m core.takeout_ingestor." + exclusiones)
 
     async def _medir(self, fabrica: Callable[[], Awaitable[Any]], timeout: float) -> tuple[Any, float]:
         """Ejecuta un diagnóstico con plazo y devuelve (resultado o excepción, segundos desde el inicio)."""
@@ -1933,6 +2104,11 @@ class Orquestador:
         else:
             heredado = "ninguno (ejecuta python -m core.wsp_ingestor)"
         c.imprimir(f"         último registro heredado: {heredado}", "gris")
+        if self._takeout_generado:
+            nombre_takeout = getattr(self.settings.perfil_takeout_path, "name", "perfil_takeout.json")
+            sin_usar = f" · sin usar ({self._takeout_sin_usar})" if self._takeout_sin_usar else ""
+            c.imprimir(f"         perfil de Google heredado: {nombre_takeout} ({self._takeout_generado}){sin_usar}",
+                       "gris")
         kv = estadisticas.get("ultimo_kv") if isinstance(estadisticas, Mapping) else None
         if kv:
             kv_ts = estadisticas.get("ultimo_kv_ts")
@@ -3163,6 +3339,11 @@ class Orquestador:
             await self.memoria.marcar_llamadas_contestadas(desde_ts=ahora_ts - 7200)
         # Los payloads del bus nunca llevan secretos (§5): se publica el texto ya redactado.
         self.bus.publicar("usuario.entrada", {"texto": texto_seguro, "canal": canal}, origen="main")
+
+        # 1b. Perfil de Google Takeout: «olvida mi perfil de Google» / /olvidar_takeout (solo local) y su
+        # «sí» (mismo canal, ≤ 60 s). Lo atiende main sin Broca ni memoria de turnos.
+        if await self._turno_olvido_takeout(texto, canal):
+            return None
 
         # 2. Intención (sin LLM) y comandos. v0.2: sinónimos de RAMS_DESTINOS y lanzar_app
         # (RAMS_APPS) solo en Linux. v0.2.1: apps del menú Inicio en Windows y, por Telegram, las
@@ -5644,7 +5825,8 @@ class Orquestador:
             permitidos = COMANDOS if canal in CANALES_LOCALES else COMANDOS_POR_CANAL.get(canal, frozenset())
             lineas = ["Comandos disponibles:"]
             for clave, (uso, descripcion) in _DESCRIPCION_COMANDOS.items():
-                if clave in permitidos and clave != "/devolver_llamada":
+                propio_local = clave in _COMANDOS_MAIN and canal in CANALES_LOCALES
+                if (clave in permitidos or propio_local) and clave != "/devolver_llamada":
                     lineas.append(f"  {uso:<20} {descripcion}")
             await self._salida_comando("\n".join(lineas), canal)
         elif comando == "/salir":

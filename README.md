@@ -278,6 +278,7 @@ Cuando la cámara se enciende verás `● CÁMARA ACTIVA` en rojo y, al soltarla
 | `/memoria [consulta]` | Lista o busca fragmentos de memoria (`#id [vivido/heredado] contenido`) |
 | `/recordar <texto>` | Guarda un fragmento |
 | `/olvidar <id>` | Borra un fragmento (Amadeus aceptó ser borrada; tú también puedes borrar) |
+| `/olvidar_takeout` | Olvida el perfil heredado de Google Takeout (sección 6.1; pide confirmar, solo en el computador) |
 | `/agenda` | Recordatorios y cápsulas del tiempo pendientes |
 | `/camara on\|off` | Interruptor de la cámara en caliente (solo si `RAMS_CAMERA=1`) |
 | `/silencio` | Activa o silencia la voz |
@@ -335,6 +336,55 @@ Qué se guarda (`data/john/perfil_conductual.json`, permisos 600): solo **agrega
 mensajes, nombres de participantes (ni el tuyo), nombres de personas mencionadas, teléfonos,
 correos ni URLs. El chat crudo nunca se envía al LLM. Con `RAMS_PERFIL_EN_PROMPT=0` el resumen del
 perfil tampoco entra en el prompt de Gemini (se sigue usando solo en local).
+
+### 6.1 Perfil de Google Takeout (recuerdo heredado de hábitos digitales)
+
+Con tu [Google Takeout](https://takeout.google.com) Amadeus aprende qué te interesa, qué sitios usas,
+a qué horas estás activo y cómo escribes tus correos, sin guardar nada literal:
+
+1. Descarga los `.zip` del Takeout (Chrome, Gmail, Google Fotos, Drive, Gemini, Cuenta de Google…).
+   No hace falta descomprimirlos: el ingestor lee **dentro** de los zips, en streaming.
+2. Genera el perfil (los zips duplicados, como los `(1)`, se ignoran solos; si falta una parte, avisa):
+   ```bash
+   python -m core.takeout_ingestor ~/Descargas/takeout-*.zip
+   ```
+   Al terminar imprime **solo** el resumen que verá Amadeus, los recuerdos heredados que guardará en
+   su memoria y estadísticas agregadas. Revísalo:
+   - `--mostrar` añade el detalle (intereses, palabras clave, sitios, servicios, extensiones…);
+     sin zips, muestra el perfil ya guardado.
+   - `--quitar "anime,ejemplo.com"` quita temas, palabras o dominios (del perfil guardado o al
+     generarlo; un término también quita el dominio que lo lleve pegado). Las exclusiones se guardan
+     aparte, en `takeout_exclusiones.json`, ofuscadas con una clave local (HMAC; no es cifrado frente
+     a quien tenga toda la carpeta `data/`), y se respetan al regenerar.
+   - `--incluir-sensibles` incluye salud, sexualidad, religión, política, finanzas personales y
+     temas legales, que por defecto se **filtran** con un léxico curado. El léxico no es exhaustivo:
+     por eso hay que revisar el resumen.
+   - Si el perfil guardado tiene fuentes que los zips nuevos no traen (p. ej. solo pasaste las partes
+     de Drive), no lo sobrescribe; `--reemplazar` lo fuerza.
+3. Reinicia R.A.M.S.: con `RAMS_PERFIL_TAKEOUT_EN_PROMPT=1` (defecto) el perfil se importa una sola
+   vez como recuerdo heredado (sin duplicarse en cada arranque) y su resumen entra en el prompt. Ojo:
+   esos recuerdos también pueden ir al LLM como «recuerdos relevantes» de un turno. Con `0` no se usa
+   **nada** del perfil (ni resumen ni recuerdos; los importados antes se borran). Un perfil generado
+   con una versión anterior del ingestor (v1) no se usa: regenéralo.
+4. Para olvidarlo: «olvida mi perfil de Google» o `/olvidar_takeout` (solo en el computador). En la
+   terminal se confirma con «sí»; en el chat de escritorio, con `/olvidar_takeout confirmar`. La
+   lista de temas quitados (`takeout_exclusiones.json`) se conserva; bórrala tú si no la quieres.
+
+Qué se guarda (`data/john/perfil_takeout.json`, permisos 600): intereses por categorías; palabras
+clave con frecuencia mínima, **solo** de un vocabulario cerrado (el léxico de intereses y temas
+neutros: nunca un nombre, un apodo, un usuario ni un lugar sacado de un título); sitios por dominio
+(`youtube.com`, nunca URLs ni rutas) de una lista de sitios conocidos (los demás solo se cuentan);
+horarios de navegación, correo enviado y fotos (en tu zona horaria); el estilo de **tus** correos
+enviados (con ≥ 20 correos de ≥ 20 palabras, sin citas ni firma, y la confianza marcada); los
+servicios conocidos que te escriben (por dominio, nunca personas); tus extensiones de Chrome
+(conocidas o con un nombre de palabras corrientes), los nombres de tus Gems (igual) y tu nombre de
+pila (este nunca entra en el resumen). Qué **no** se lee ni se guarda: autocompletar («Direcciones y
+más»), contactos, diccionario, historial de cambios de la cuenta, ubicaciones (tampoco los títulos de
+Google Maps o Waze), caras ni descripciones de fotos, el contenido de ningún archivo de Drive, los
+títulos de Docs, Drive, webmails y repositorios, correos de otros, Spam, Papelera ni borradores,
+direcciones, teléfonos (tampoco con guiones o puntos), nombres de terceros ni títulos literales. Los
+nombres de quienes aparecen en tus correos solo se usan en memoria, durante la ingesta, para
+excluirlos. Todo es local: el ingestor no usa red ni LLM.
 
 ## 7. Hyprland
 
@@ -821,13 +871,16 @@ los fragmentos que consolidó mientras no estabas.
 - **Qué sale de tu PC** (solo con red y con la clave correspondiente; `--offline` lo corta todo):
   - **Gemini:** tu mensaje, los turnos recientes, los recuerdos relevantes, el estado del
     conectoma, la telemetría o los resultados web del turno y, con `RAMS_PERFIL_EN_PROMPT=1`, el
-    resumen de tu perfil de WhatsApp (nunca el chat crudo). Si pides «mira mi pantalla», la
+    resumen de tu perfil de WhatsApp (nunca el chat crudo); con `RAMS_PERFIL_TAKEOUT_EN_PROMPT=1`,
+    el resumen agregado de tu perfil de Google Takeout y sus recuerdos heredados cuando son
+    relevantes (sección 6.1; nunca los zips, tu nombre ni nada literal). Si pides «mira mi pantalla», la
     captura de pantalla de ese turno. Nunca fotogramas de la cámara. Con
     `RAMS_TELEGRAM_TRANSCRIBIR=1`, el audio de las notas de voz que le mandas por Telegram (solo
     para transcribirlas; no se guarda en disco ni en los logs).
   - **Puter** (solo si conectaste tu cuenta en Amadeus Desktop y Gemini no pudo, o con
     `RAMS_PUTER_PRIMERO=1`): lo mismo que Gemini en ese turno (system prompt, turnos recientes,
-    recuerdos, contexto y, con `RAMS_PERFIL_EN_PROMPT=1`, el resumen del perfil), que Puter pasa al
+    recuerdos, contexto y, con `RAMS_PERFIL_EN_PROMPT=1` / `RAMS_PERFIL_TAKEOUT_EN_PROMPT=1`, los
+    resúmenes de los perfiles), que Puter pasa al
     proveedor del modelo elegido. **Nunca** imágenes: la captura de «mira mi pantalla» no viaja a
     Puter. Los prompts y las respuestas no se registran en los logs, y el token de `/escritorio`
     nunca llega a la ventana de Puter. `RAMS_PUTER=0` o `PUTER_MAX_CALLS_DAY=0` lo cortan.

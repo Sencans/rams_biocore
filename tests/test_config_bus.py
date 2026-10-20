@@ -2171,3 +2171,43 @@ def test_sin_efectos_pc_v022_shells_y_limites(correr) -> None:
     resultado = subprocess.run([sys.executable, "-c", "print('ok')"], capture_output=True, text=True,
                                timeout=60, check=False)
     assert resultado.returncode == 0 and resultado.stdout.strip() == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Perfil heredado de Google Takeout (core/takeout_ingestor.py)
+# ---------------------------------------------------------------------------
+
+
+def test_perfil_takeout_defectos_y_entorno(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    s = cargar_settings(entorno={})
+    assert s.perfil_takeout_path == s.memoria_dir / "perfil_takeout.json"
+    assert s.perfil_takeout_path.parent == s.perfil_path.parent
+    assert s.perfil_takeout_en_prompt is True
+    otro = tmp_path / "otro" / "takeout.json"
+    s = cargar_settings(entorno={"RAMS_DATA_DIR": str(tmp_path / "d"), "RAMS_PERFIL_TAKEOUT_EN_PROMPT": "0",
+                                 "RAMS_PERFIL_TAKEOUT_PATH": str(otro)})
+    assert s.perfil_takeout_en_prompt is False and s.perfil_takeout_path == otro
+    assert cargar_settings(entorno={"RAMS_DATA_DIR": str(tmp_path / "d")}).perfil_takeout_path == \
+        tmp_path / "d" / "john" / "perfil_takeout.json"
+    with caplog.at_level(logging.WARNING, logger="rams.config"):
+        s = cargar_settings(entorno={"RAMS_PERFIL_TAKEOUT_EN_PROMPT": "talvez-secreto"})
+    assert s.perfil_takeout_en_prompt is True
+    avisos = _avisos_config(caplog)
+    assert any("RAMS_PERFIL_TAKEOUT_EN_PROMPT" in r.getMessage() for r in avisos)
+    assert all("talvez-secreto" not in r.getMessage() for r in avisos)
+    assert config._settings_por_defecto(tmp_path, offline=True).perfil_takeout_path == \
+        tmp_path / "data" / "john" / "perfil_takeout.json"
+
+
+def test_env_example_documenta_el_perfil_takeout(caplog: pytest.LogCaptureFixture) -> None:
+    ruta = RAIZ_PROYECTO / ".env.example"
+    lineas = ruta.read_bytes().decode("utf-8").split("\n")
+    indices = [i for i, linea in enumerate(lineas) if linea.startswith("RAMS_PERFIL_TAKEOUT_EN_PROMPT=")]
+    assert len(indices) == 1 and lineas[indices[0]] == "RAMS_PERFIL_TAKEOUT_EN_PROMPT=1"
+    assert lineas[indices[0] - 1].startswith("# ")                    # comentario en español justo encima
+    assert indices[0] > lineas.index("RAMS_PERFIL_EN_PROMPT=1")        # junto al perfil de WhatsApp
+    assert not any(linea.startswith("RAMS_PERFIL_TAKEOUT_PATH") for linea in lineas)   # avanzada: no se lista
+    with caplog.at_level(logging.DEBUG, logger="rams.config"):
+        s = cargar_settings(entorno=leer_env_archivo(ruta))
+    assert _avisos_config(caplog) == []
+    assert s.perfil_takeout_en_prompt is True

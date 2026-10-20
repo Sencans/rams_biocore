@@ -99,6 +99,7 @@ _RE_NOMBRE_AUTOR: Final = re.compile(r"[^\W_]+")          # tokens (letras o dí
 _RE_MENCION: Final = re.compile(r"@(\w+)")
 _RE_ESPACIOS: Final = re.compile(r"\s+")
 _RE_DIGITOS_LARGOS: Final = re.compile(r"\d{7,}")
+_RE_SEPARADOR_DIGITOS: Final = re.compile(r"(?<=\d)[\s.\-()/]+(?=\d)")
 _RE_CORREO: Final = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 _RE_URL: Final = re.compile(r"(?i)\b(?:https?://|www\.)\S+")
 # Limpieza previa a la tokenización (§9.6): de una URL o un correo no deben quedar palabras sueltas.
@@ -556,7 +557,7 @@ def _real(valor: Any) -> float | None:
         return None
     try:
         numero = float(valor)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: un entero enorme en un perfil roto
         return None
     return numero if math.isfinite(numero) else None
 
@@ -1392,7 +1393,9 @@ def _item(valor: Any, maximo: int = 40) -> str:
         return ""
     texto = _RE_CONTROL.sub("", valor).replace("«", "").replace("»", "").replace("<", "").replace(">", "")
     texto = _RE_ESPACIOS.sub(" ", texto).strip()
-    if not texto or _RE_DIGITOS_LARGOS.search(texto) or "@" in texto or _RE_URL.search(texto):
+    # Los separadores entre dígitos no esconden un teléfono ni una cédula (300-123-4567, 1.036.123.456).
+    if (not texto or _RE_DIGITOS_LARGOS.search(_RE_SEPARADOR_DIGITOS.sub("", texto)) or "@" in texto
+            or _RE_URL.search(texto)):
         return ""
     return texto[:maximo].strip()
 

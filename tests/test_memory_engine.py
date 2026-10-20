@@ -509,3 +509,114 @@ def test_hechos_desde_perfil_siempre_al_menos_tres() -> None:
     assert completo[0] == "Muletillas de Okabe: «de una», «parce»."
     assert "Usa emojis en el 18 % de sus mensajes." in completo
     assert "Temas frecuentes: código, música." in completo
+
+
+# ---------------------------------------------------------------------------
+# Perfil heredado de Google Takeout (core/takeout_ingestor.py)
+# ---------------------------------------------------------------------------
+
+PERFIL_TAKEOUT = {
+    "version": 2,
+    "tipo": "perfil_takeout",
+    "generado": "2026-10-19T12:00:00+00:00",
+    "nombre_pila": "Yoprueba",
+    "intereses": [{"tema": "programación y desarrollo", "peso": 1.0}, {"tema": "música", "peso": 0.4}],
+    "plataformas": [{"dominio": "youtube.com", "visitas": 40}, {"dominio": "https://malo.example/x"},
+                    {"dominio": "github.com", "visitas": 12}],
+    "palabras_clave": [{"palabra": "tutorial", "freq": 6}, {"palabra": "a@b.co", "freq": 9}],
+    "ritmo": {"navegacion": {"eventos": 120, "hora_pico": 22, "franja": "noche", "dia_pico": "domingo"}},
+    "correo": {"estilo": {"suficiente": True, "mensajes": 12, "confianza": "baja", "longitud_mediana_palabras": 12,
+                          "tratamiento": "tú", "saludos": ["Hola"]},
+               "servicios": [{"dominio": "github.com", "mensajes": 9}]},
+    "fotos": {"eventos": 25, "hora_pico": 22, "dia_pico": "viernes"},
+}
+
+
+def test_hechos_desde_takeout_sin_datos_personales() -> None:
+    hechos = memory_engine.hechos_desde_takeout(PERFIL_TAKEOUT, "Lab Mem 001")
+    assert 3 <= len(hechos) <= 6
+    assert hechos[0] == "Intereses de Lab Mem 001 según su actividad en Google: programación y desarrollo, música."
+    assert "Sitios web que más usa Lab Mem 001: youtube.com, github.com." in hechos
+    assert "Lab Mem 001 navega sobre todo hacia las 22 h (franja nocturna); su día más activo es el domingo." in hechos
+    assert ("En sus correos Lab Mem 001 escribe mensajes breves (~12 palabras), tutea y saluda con «Hola» "
+            "(pocos correos).") in hechos
+    texto = " ".join(hechos)
+    assert "Yoprueba" not in texto and "http" not in texto and "@" not in texto
+    minimos = memory_engine.hechos_desde_takeout({"generado": "2026-10-19T12:00:00+00:00"}, "Okabe")
+    assert minimos[0] == "Recuerdo heredado: perfil de Google Takeout de Okabe generado el 2026-10-19."
+    assert len(minimos) == 3
+
+
+def test_importar_y_olvidar_perfil_takeout(settings_prueba: Settings, correr) -> None:
+    async def principal() -> dict[str, object]:
+        mem = MemoryEngine(settings_prueba)
+        await mem.abrir()
+        r: dict[str, object] = {}
+        r["wsp"] = await mem.importar_perfil(PERFIL_MINIMO)
+        r["primero"] = await mem.importar_perfil_takeout(PERFIL_TAKEOUT)
+        r["segundo"] = await mem.importar_perfil_takeout(dict(PERFIL_TAKEOUT))   # mismo perfil: nada nuevo
+        r["heredados"] = await mem.listar_recuerdos(50, tipo="heredado")
+        # Un perfil de WhatsApp nuevo nunca borra los hechos de Takeout (ni al revés).
+        r["wsp2"] = await mem.importar_perfil({**PERFIL_MINIMO, "generado": "2026-10-20T00:00:00+00:00"})
+        r["tras_wsp2"] = [x.categoria for x in await mem.listar_recuerdos(50, tipo="heredado")]
+        r["nuevo"] = await mem.importar_perfil_takeout({**PERFIL_TAKEOUT, "intereses": [{"tema": "anime"}]})
+        r["olvidados"] = await mem.olvidar_perfil_takeout()
+        r["tras_olvido"] = [x.categoria for x in await mem.listar_recuerdos(50, tipo="heredado")]
+        r["hash"] = await mem.meta_get("takeout_hash")
+        r["otra_vez"] = await mem.importar_perfil_takeout(PERFIL_TAKEOUT)     # sin huella: se importa de nuevo
+        await mem.cerrar()
+        r["cerrada"] = await mem.olvidar_perfil_takeout()                    # nunca lanza
+        return r
+
+    r = correr(principal())
+    assert 3 <= r["primero"] <= 6 and r["segundo"] == 0
+    takeout = [x for x in r["heredados"] if x.categoria == memory_engine.CATEGORIA_TAKEOUT]
+    assert len(takeout) == r["primero"] and all(x.tipo == "heredado" for x in takeout)
+    assert len([x for x in r["heredados"] if x.categoria == "perfil"]) == r["wsp"]
+    assert r["tras_wsp2"].count(memory_engine.CATEGORIA_TAKEOUT) == r["primero"]
+    assert r["nuevo"] >= 3
+    assert r["olvidados"] == r["nuevo"]                 # el perfil nuevo reemplazó a los hechos anteriores
+    assert memory_engine.CATEGORIA_TAKEOUT not in r["tras_olvido"] and "perfil" in r["tras_olvido"]
+    assert r["hash"] is None and r["otra_vez"] == r["primero"]
+    assert r["cerrada"] == 0
+
+
+def test_importar_perfil_takeout_invalido(settings_prueba: Settings, correr) -> None:
+    async def principal() -> tuple[int, int]:
+        mem = MemoryEngine(settings_prueba)
+        await mem.abrir()
+        a = await mem.importar_perfil_takeout(["no", "es", "un", "perfil"])   # type: ignore[arg-type]
+        b = await mem.importar_perfil_takeout({"raro": object()})
+        await mem.cerrar()
+        return a, b
+
+    a, b = correr(principal())
+    assert a == 0 and b >= 3          # un objeto raro se serializa con str(): solo hechos genéricos
+
+
+def test_perfil_takeout_roto_con_numeros_enormes_nunca_lanza(settings_prueba: Settings, correr) -> None:
+    """Un entero gigante (perfil manipulado) no tumba ni los hechos ni la importación (OverflowError)."""
+    roto = {**PERFIL_TAKEOUT, "correo": {"estilo": {"suficiente": True, "longitud_mediana_palabras": 10**400}},
+            "ritmo": {"navegacion": {"eventos": 10**400, "hora_pico": 22}}, "fotos": {"eventos": 10**400}}
+    assert memory_engine._real(10**400) is None
+    hechos = memory_engine.hechos_desde_takeout(roto, "Okabe")
+    assert 3 <= len(hechos) <= 6 and not any("palabras" in h for h in hechos)
+
+    async def principal() -> int:
+        mem = MemoryEngine(settings_prueba)
+        await mem.abrir()
+        try:
+            return await mem.importar_perfil_takeout(roto)
+        finally:
+            await mem.cerrar()
+
+    assert correr(principal()) >= 3
+
+
+def test_item_perfil_descarta_numeros_con_separadores() -> None:
+    for texto in ("Cel 300 123 4567", "CC 1.036.123.456", "300-123-4567", "(300) 123-4567"):
+        assert memory_engine._item_perfil(texto) == "", texto
+    assert memory_engine._item_perfil("python 3.12") == "python 3.12"
+    perfil = {**PERFIL_TAKEOUT, "palabras_clave": [{"palabra": "bot 300-123-4567"}, {"palabra": "python"}]}
+    assert "Palabras frecuentes en lo que Okabe lee y guarda: python." in memory_engine.hechos_desde_takeout(
+        perfil, "Okabe")

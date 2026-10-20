@@ -62,6 +62,8 @@ __all__ = [
     "normalizar_texto",
     "extracto_salieri",
     "hechos_desde_perfil",
+    "hechos_desde_takeout",
+    "CATEGORIA_TAKEOUT",
     "SCHEMA_VERSION",
 ]
 
@@ -103,6 +105,9 @@ TIMEOUT_CIERRE_S: Final = 5.0
 
 IMPORTANCIA_CONSOLIDACION: Final = 0.6
 IMPORTANCIA_HEREDADO: Final = 0.4
+# Recuerdos heredados del perfil de Google Takeout (core/takeout_ingestor.py): su propia categoría,
+# para que importar o borrar uno de los dos perfiles heredados nunca toque al otro.
+CATEGORIA_TAKEOUT: Final = "takeout"
 
 # Claves de meta que solo escribe el propio motor (meta_set las rechaza).
 _META_INTERNAS: Final = frozenset({"schema_version", "kv_contador"})
@@ -120,6 +125,7 @@ _RE_ESPACIOS: Final = re.compile(r"\s+")
 _RE_PALABRA: Final = re.compile(r"\w+")
 _RE_CONTROL: Final = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _RE_DIGITOS_LARGOS: Final = re.compile(r"\d{7,}")
+_RE_SEPARADOR_DIGITOS: Final = re.compile(r"(?<=\d)[\s.\-()/]+(?=\d)")
 _RE_FECHA_ISO: Final = re.compile(r"^\d{4}-\d{2}-\d{2}")
 _APERTURAS: Final = "¿¡«\"'(“‘[-—*_"
 
@@ -285,7 +291,7 @@ def _real(valor: Any, defecto: float | None = None) -> float | None:
         return defecto
     try:
         numero = float(valor)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # OverflowError: un entero enorme en un perfil roto
         return defecto
     return numero if math.isfinite(numero) else defecto
 
@@ -358,9 +364,17 @@ def _item_perfil(valor: Any, maximo: int = 40) -> str:
         return ""
     texto = _RE_CONTROL.sub("", valor).replace("«", "").replace("»", "").replace("\n", " ")
     texto = _RE_ESPACIOS.sub(" ", texto).strip()
-    if not texto or _RE_DIGITOS_LARGOS.search(texto) or "@" in texto or "http" in texto.lower():
+    # Los separadores entre dígitos no esconden un teléfono ni una cédula (300-123-4567, 1.036.123.456).
+    if (not texto or _RE_DIGITOS_LARGOS.search(_RE_SEPARADOR_DIGITOS.sub("", texto)) or "@" in texto
+            or "http" in texto.lower()):
         return ""
     return texto[:maximo].strip()
+
+
+def _fecha_perfil(valor: Any) -> str:
+    """``AAAA-MM-DD`` del campo ``generado`` de un perfil, o ``""`` (una fecha ISO no es un número largo)."""
+    texto = str(valor or "")[:10] if isinstance(valor, str) else ""
+    return texto if _RE_FECHA_ISO.match(texto) and len(texto) == 10 else ""
 
 
 def _lista_perfil(valores: Any, clave: str | None, maximo: int) -> list[str]:
@@ -459,12 +473,97 @@ def hechos_desde_perfil(perfil: Mapping[str, Any], usuario: str) -> list[str]:
         hechos.append(f"Perfil construido a partir de {n_propios} mensajes propios.")
 
     # Relleno genérico: siempre al menos 3 hechos.
-    fecha = _item_perfil(str(perfil.get("generado") or "")[:10], 10)
+    fecha = _fecha_perfil(perfil.get("generado"))
     genericos = [
         f"Recuerdo heredado: perfil conductual de {usuario}"
         + (f" generado el {fecha}." if fecha and _RE_FECHA_ISO.match(fecha) else "."),
         f"El perfil heredado de {usuario} tiene pocos datos; el resto lo aprenderé en las sesiones.",
         f"Conozco a {usuario} por datos heredados, no por haberlo vivido.",
+    ]
+    for generico in genericos:
+        if len(hechos) >= 3:
+            break
+        hechos.append(generico)
+
+    unicos: list[str] = []
+    for hecho in hechos:
+        if hecho not in unicos:
+            unicos.append(hecho[:MAX_RECUERDO])
+    return unicos[:6]
+
+
+_DIAS_TAKEOUT: Final = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo")
+_DIAS_TAKEOUT_PLURAL: Final = ("lunes", "martes", "miércoles", "jueves", "viernes", "sábados", "domingos")
+
+
+def _ritmo_takeout(ritmo: Any) -> tuple[int, str, str] | None:
+    """``(hora_pico, franja, día_pico)`` de un ritmo del perfil de Takeout con ≥ 20 eventos."""
+    if not isinstance(ritmo, Mapping) or _entero(ritmo.get("eventos"), 0) < 20:
+        return None
+    hora = ritmo.get("hora_pico")
+    if not isinstance(hora, int) or isinstance(hora, bool) or not 0 <= hora <= 23:
+        return None
+    franja = ritmo.get("franja") if ritmo.get("franja") in _FRANJAS_TEXTO else _franja_de_hora(hora)
+    dia = ritmo.get("dia_pico") if ritmo.get("dia_pico") in _DIAS_TAKEOUT else ""
+    return hora, str(franja), str(dia)
+
+
+def hechos_desde_takeout(perfil: Mapping[str, Any], usuario: str) -> list[str]:
+    """Redacta entre 3 y 6 hechos heredados a partir de ``perfil_takeout.json``.
+
+    Solo usa agregados (categorías, dominios, horarios y estilo): nunca el nombre de pila ni
+    nada que parezca un dato de contacto (``_item_perfil`` descarta URLs, correos y números).
+    """
+    hechos: list[str] = []
+    intereses = _lista_perfil(perfil.get("intereses"), "tema", 5)
+    if intereses:
+        hechos.append(f"Intereses de {usuario} según su actividad en Google: " + ", ".join(intereses) + ".")
+    plataformas = _lista_perfil(perfil.get("plataformas"), "dominio", 5)
+    if plataformas:
+        hechos.append(f"Sitios web que más usa {usuario}: " + ", ".join(plataformas) + ".")
+    ritmo = perfil.get("ritmo") if isinstance(perfil.get("ritmo"), Mapping) else {}
+    navegacion = _ritmo_takeout(ritmo.get("navegacion"))
+    if navegacion:
+        hora, franja, dia = navegacion
+        hechos.append(f"{usuario} navega sobre todo hacia las {hora} h ({_FRANJAS_TEXTO[franja]})"
+                      + (f"; su día más activo es el {dia}." if dia else "."))
+    correo = perfil.get("correo") if isinstance(perfil.get("correo"), Mapping) else {}
+    estilo = correo.get("estilo") if isinstance(correo.get("estilo"), Mapping) else {}
+    longitud = _real(estilo.get("longitud_mediana_palabras"))
+    if estilo.get("suficiente") is True and longitud is not None and 0 < longitud <= 10_000:
+        tamano = "breves" if longitud <= 40 else "de longitud media" if longitud <= 120 else "largos"
+        palabras = max(1, round(longitud))
+        frase = (f"En sus correos {usuario} escribe mensajes {tamano} "
+                 f"(~{palabras} {'palabra' if palabras == 1 else 'palabras'})")
+        trato = {"usted": "trata de usted", "tú": "tutea", "mixto": "alterna tú y usted"}.get(
+            str(estilo.get("tratamiento")), "")
+        saludos = _lista_perfil(estilo.get("saludos"), None, 1)
+        partes = [p for p in (trato, f"saluda con «{saludos[0]}»" if saludos else "") if p]
+        if partes:
+            frase += ", " + " y ".join(partes)
+        if estilo.get("confianza") == "baja":
+            frase += " (pocos correos)"
+        hechos.append(frase + ".")
+    palabras = _lista_perfil(perfil.get("palabras_clave"), "palabra", 6)
+    if palabras:
+        hechos.append(f"Palabras frecuentes en lo que {usuario} lee y guarda: " + ", ".join(palabras) + ".")
+    servicios = _lista_perfil(correo.get("servicios"), "dominio", 4)
+    if servicios:
+        hechos.append(f"Servicios que más le escriben a {usuario}: " + ", ".join(servicios) + ".")
+    fotos = perfil.get("fotos") if isinstance(perfil.get("fotos"), Mapping) else {}
+    ritmo_fotos = _ritmo_takeout(fotos)
+    if ritmo_fotos:
+        hora, _, dia = ritmo_fotos
+        dia_plural = _DIAS_TAKEOUT_PLURAL[_DIAS_TAKEOUT.index(dia)] if dia else ""
+        hechos.append(f"{usuario} toma más fotos {'los ' + dia_plural + ' ' if dia_plural else ''}"
+                      f"hacia las {hora} h.")
+
+    fecha = _fecha_perfil(perfil.get("generado"))
+    genericos = [
+        f"Recuerdo heredado: perfil de Google Takeout de {usuario}"
+        + (f" generado el {fecha}." if fecha and _RE_FECHA_ISO.match(fecha) else "."),
+        f"El perfil de Google de {usuario} tiene pocos datos; el resto lo aprenderé en las sesiones.",
+        f"Conozco los hábitos digitales de {usuario} por datos heredados, no por haberlos vivido.",
     ]
     for generico in genericos:
         if len(hechos) >= 3:
@@ -1086,6 +1185,72 @@ class MemoryEngine:
         else:
             log.debug("Perfil heredado sin cambios")
         return insertados
+
+    # ------------------------------------------------------------------ perfil de Google Takeout
+
+    def _s_importar_takeout(self, huella: str, hechos: list[str], generado: str | None) -> int:
+        def operar(con: sqlite3.Connection) -> int:
+            fila = con.execute("SELECT valor FROM meta WHERE clave = 'takeout_hash'").fetchone()
+            if fila is not None and fila[0] == huella:
+                return 0
+            con.execute("DELETE FROM recuerdos WHERE tipo = 'heredado' AND categoria = ?", (CATEGORIA_TAKEOUT,))
+            insertados = 0
+            for hecho in hechos:
+                _, nuevo = self._s_recordar_en(con, hecho, CATEGORIA_TAKEOUT, "heredado", IMPORTANCIA_HEREDADO, None)
+                insertados += int(nuevo)
+            con.execute("INSERT INTO meta(clave, valor) VALUES ('takeout_hash', ?) "
+                        "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor", (huella,))
+            if generado:
+                con.execute("INSERT INTO meta(clave, valor) VALUES ('takeout_generado', ?) "
+                            "ON CONFLICT(clave) DO UPDATE SET valor = excluded.valor", (generado,))
+            return insertados
+        return self._tx(operar)
+
+    async def importar_perfil_takeout(self, perfil: Mapping[str, Any]) -> int:
+        """Convierte el perfil de Google Takeout en 3–6 hechos **heredados** (categoría ``takeout``).
+
+        Idempotente por ``meta.takeout_hash``: con el mismo perfil no inserta nada (no se duplica en
+        cada arranque); con uno nuevo reemplaza los hechos anteriores. Nunca toca los del perfil de
+        WhatsApp (categoría ``perfil``). Devuelve cuántos hechos insertó (0 si no cambió o si falla).
+        """
+        if not isinstance(perfil, Mapping):
+            log.warning("Perfil de Takeout inválido (no es un objeto JSON); no se importa")
+            return 0
+        try:
+            huella = hashlib.sha1(
+                json.dumps(dict(perfil), sort_keys=True, default=str).encode("utf-8")).hexdigest()
+            hechos = hechos_desde_takeout(perfil, self.settings.trato_usuario)
+        except (TypeError, ValueError, OverflowError, RecursionError) as exc:   # perfil roto: nunca lanza
+            log.warning("No se pudo leer el perfil de Takeout: %s", type(exc).__name__)
+            return 0
+        generado = perfil.get("generado")
+        generado_txt = _limpiar(generado, 40) if isinstance(generado, str) else None
+        insertados = await self._ejecutar("importar el perfil de Takeout", 0, self._s_importar_takeout,
+                                          huella, hechos, generado_txt)
+        if insertados:
+            log.info("Recuerdo heredado actualizado: %d hechos del perfil de Google Takeout", insertados)
+        else:
+            log.debug("Perfil de Takeout sin cambios")
+        return insertados
+
+    def _s_olvidar_takeout(self) -> int:
+        def operar(con: sqlite3.Connection) -> int:
+            cursor = con.execute("DELETE FROM recuerdos WHERE tipo = 'heredado' AND categoria = ?",
+                                 (CATEGORIA_TAKEOUT,))
+            con.execute("DELETE FROM meta WHERE clave IN ('takeout_hash', 'takeout_generado')")
+            return max(0, int(cursor.rowcount or 0))
+        return self._tx(operar)
+
+    async def olvidar_perfil_takeout(self) -> int:
+        """Borra los hechos heredados del perfil de Takeout y su huella. Devuelve cuántos borró
+        (0 si no había o si falla; nunca lanza). El perfil de WhatsApp no se toca. Lo usan
+        «olvida mi perfil de Google» y el arranque con ``RAMS_PERFIL_TAKEOUT_EN_PROMPT=0``."""
+        borrados = await self._ejecutar("olvidar el perfil de Takeout", 0, self._s_olvidar_takeout)
+        if borrados:
+            log.info("Recuerdos heredados del perfil de Google Takeout borrados (%d hechos)", borrados)
+        else:
+            log.debug("No había recuerdos heredados del perfil de Google Takeout")
+        return borrados
 
     # ------------------------------------------------------------------ Salieri
 

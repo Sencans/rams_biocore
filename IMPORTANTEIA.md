@@ -7,7 +7,7 @@
 >
 > **Antes de nada lee IMPORTANTEIA.md** (este archivo) entero. Es la guía obligatoria de los dos repos.
 >
-> Revisado contra el código real el 2026-10-17 y ampliado con la v0.2.2 (correo, Drive y taller de scripts) el 2026-10-19.
+> Revisado contra el código real el 2026-10-17 y ampliado con la v0.2.2 (correo, Drive y taller de scripts) y con el perfil de Google Takeout el 2026-10-19.
 > - Si el código y este archivo no coinciden en **datos** (nombres, líneas, cifras), manda el código. Avisa al usuario de la diferencia.
 > - Si el código parece **violar una regla de seguridad o privacidad** de la sección 4.5, **NO** lo tomes como precedente: avisa al usuario y no lo extiendas.
 
@@ -102,6 +102,7 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
 | `core/flywire_loader.py` | Herramienta offline de datos FlyWire. No se usa en tiempo real |
 | `core/memory_engine.py` | Memoria SQLite FTS5, Salieri, agenda, bitácora y llamadas |
 | `core/wsp_ingestor.py` | CLI que genera el perfil conductual a partir de chats de WhatsApp |
+| `core/takeout_ingestor.py` | CLI que genera el perfil agregado de Google Takeout (`perfil_takeout.json`) leyendo **dentro** de los zips, sin red ni LLM; reutiliza el estilo y las muletillas de `wsp_ingestor`. Reglas en la sección 4.5, regla 15 |
 | `core/intenciones.py` | Enrutador local (sin LLM, sin E/S). Aquí nacen las `AccionPC` que pide el usuario (main y aura crean o completan otras: sección 4.5, regla 1) |
 | `core/permisos.py` | `CompuertaPermisos`: única compuerta para acciones sobre el PC |
 | `core/presence.py` | Presente o ausente (7 reglas) |
@@ -113,13 +114,13 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
 | `lobes/control_pc.py` | Efector: abrir, buscar, prerrellenar, escribir, media, apps del menú Inicio y cursor |
 | `lobes/aura_vision_pc.py` | Vistazo de cámara, captura con grim, telemetría y Hyprland. Compone `NexusLink` (definido en `lobes/nexus_link.py`) como `self.nexus`, si está disponible |
 | `lobes/vision_continua.py` | Cámara y pantalla continuas, en local y opt-in |
-| `lobes/capturas.py` | JPEG bajo pedido, solo en memoria. **Nuevo, sin seguimiento en git** |
+| `lobes/capturas.py` | JPEG bajo pedido, solo en memoria |
 | `lobes/web_researcher.py` | Búsqueda con Brave y respaldo ddgs |
-| `lobes/google_cuenta.py` | v0.2.2: OAuth de app de escritorio (PKCE, loopback `127.0.0.1`), token privado (DPAPI en Windows) y cliente REST de Google. **Nuevo, sin seguimiento** |
-| `lobes/correo.py` | v0.2.2: borradores de Gmail (destinatarios, adjuntos, anti-secretos) y envío solo con su tarjeta. **Nuevo, sin seguimiento** |
-| `lobes/drive.py` | v0.2.2: buscar, descargar, exportar, leer, carpetas, subir, papelera y compartir (sin ningún `DELETE`). **Nuevo, sin seguimiento** |
-| `lobes/taller_scripts.py` | v0.2.2: taller de scripts (propuestas, análisis de riesgo, ejecución confinada y habilidades). **Nuevo, sin seguimiento** |
-| `lobes/taller_analizar.ps1` | v0.2.2: analizador AST de PowerShell (solo ASCII; nunca ejecuta el script analizado). **Nuevo, sin seguimiento** |
+| `lobes/google_cuenta.py` | v0.2.2: OAuth de app de escritorio (PKCE, loopback `127.0.0.1`), token privado (DPAPI en Windows) y cliente REST de Google |
+| `lobes/correo.py` | v0.2.2: borradores de Gmail (destinatarios, adjuntos, anti-secretos) y envío solo con su tarjeta |
+| `lobes/drive.py` | v0.2.2: buscar, descargar, exportar, leer, carpetas, subir, papelera y compartir (sin ningún `DELETE`) |
+| `lobes/taller_scripts.py` | v0.2.2: taller de scripts (propuestas, análisis de riesgo, ejecución confinada y habilidades) |
+| `lobes/taller_analizar.ps1` | v0.2.2: analizador AST de PowerShell (solo ASCII; nunca ejecuta el script analizado) |
 | `lobes/vtube_bridge.py` | VTube Studio (ws :8001) |
 | `lobes/nexus_link.py` | Percepción de Nexus IDE |
 | `lobes/nexus_mcp_bridge.py` | Servidor MCP por stdio. Solo stdlib, no importa nada del proyecto |
@@ -131,7 +132,7 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
 | `persona/frases.json` | Banco de frases del modo no verbal (69 categorías + `megumin`; la v0.2.2 añadió `taller_ofrece`, `tarjeta_lista` y `google_navegador`) |
 | `persona/temas_curiosidad.json` | Temas curados para la curiosidad web |
 | `desktop/main.js` | Proceso principal de Electron: único dueño del WS y del token |
-| `desktop/preload-overlay.js`, `preload-chat.js`, `preload-puter.js` | APIs `amadeusDesktop` v3, `amadeusChat` v1 y `amadeusPuter` v1 (solo `contextBridge`). `preload-puter.js` es **nuevo, sin seguimiento** |
+| `desktop/preload-overlay.js`, `preload-chat.js`, `preload-puter.js` | APIs `amadeusDesktop` v3, `amadeusChat` v1 y `amadeusPuter` v1 (solo `contextBridge`). |
 | `desktop/chat.html`, `chat.js`, `chat.css` | Ventana de chat |
 | `desktop/lib/mapeo.js` | Tabla de mapeo WS ↔ IPC (módulo puro) |
 | `desktop/lib/token.js` | Lee y valida el archivo de token de R.A.M.S. |
@@ -139,19 +140,19 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
 | `desktop/lib/csp.js` | CSP del overlay |
 | `desktop/lib/config.js` | Variables de entorno de Electron y atajos |
 | `desktop/lib/cli.js` | Órdenes `--amadeus=...` de la segunda instancia |
-| `desktop/lib/puter.js`, `puter-sitio.js`, `desktop/puter/` | Relevo y páginas de Puter. **Nuevos, sin seguimiento** |
+| `desktop/lib/puter.js`, `puter-sitio.js`, `desktop/puter/` | Relevo y páginas de Puter |
 | `desktop/scripts/` | Lanzadores (`.cmd`, `.sh`, `.desktop`), `verificar-smoke.js` y `generar-icono.js` |
 | `desktop/hyprland.ejemplo.lua` / `.conf` | Reglas de ejemplo para Hyprland 0.55+ / 0.53–0.54 |
 | `desktop/test/` | Tests de Node (`node --test`) |
 | `docs/ARQUITECTURA.md` | Spec v0.1: §4 contratos, §5 eventos, §6 arranque, §7 presencia, §8 No-LLM, §9 seguridad, §10 por archivo, §12 tests |
 | `docs/COMPANION.md` | Spec v0.2 y v0.2.1: §C2.1–§C2.16 contratos, §C4 pruebas |
-| `docs/V022_CORREO_DRIVE_SCRIPTS.md` | Spec **normativa** de la v0.2.2 (correo, Drive y taller): §0 principio, §4–§5 intenciones y compuerta, §6–§9 módulos, §11–§12 eventos y protocolo de tarjetas, §14 main, §15 seguridad, §17 guía de Google Cloud para el usuario. **Nuevo, sin seguimiento** |
+| `docs/V022_CORREO_DRIVE_SCRIPTS.md` | Spec **normativa** de la v0.2.2 (correo, Drive y taller): §0 principio, §4–§5 intenciones y compuerta, §6–§9 módulos, §11–§12 eventos y protocolo de tarjetas, §14 main, §15 seguridad, §17 guía de Google Cloud para el usuario |
 | `tests/` | Casi un `test_<modulo>.py` por módulo. Excepciones: `test_config_bus.py` (config, bus y contracts), `test_nexus.py` (nexus_link, nexus_mcp_bridge y control_server) y `test_connectome.py` (sincan_connectome y flywire_loader). `conftest.py` bloquea la red, los subprocesos peligrosos y las entradas de teclado y ratón, pero **no** la cámara ni la captura de pantalla |
-| `.env.example` | 100 variables documentadas con su valor por defecto (la v0.2.2 añadió las de Google, correo, Drive y taller), más ejemplos comentados, sin secretos. `config.py` admite además variables avanzadas no listadas (rutas `RAMS_*_DIR`/`*_PATH`, `RAMS_CTL_*`, `RAMS_TELEGRAM_POLL`, `RAMS_OFFLINE`, `GEMINI_TIMEOUT_S`, `GEMINI_MAX_OUTPUT_TOKENS`, `RAMS_GOOGLE_TOKEN`, `RAMS_TALLER_DIR`…) |
+| `.env.example` | 101 variables documentadas con su valor por defecto (la v0.2.2 añadió las de Google, correo, Drive y taller; el perfil de Takeout, `RAMS_PERFIL_TAKEOUT_EN_PROMPT`), más ejemplos comentados, sin secretos. `config.py` admite además variables avanzadas no listadas (rutas `RAMS_*_DIR`/`*_PATH`, `RAMS_CTL_*`, `RAMS_TELEGRAM_POLL`, `RAMS_OFFLINE`, `GEMINI_TIMEOUT_S`, `GEMINI_MAX_OUTPUT_TOKENS`, `RAMS_GOOGLE_TOKEN`, `RAMS_TALLER_DIR`…) |
 | `requirements.txt` / `requirements-dev.txt` | Dependencias / `pytest>=8.0` |
 | `pytest.ini` | `pythonpath = .`, `testpaths = tests`, `addopts = -q` |
 | `.env` | **PRIVADO.** Claves. No abrir |
-| `data/` | **PRIVADO.** Memoria, perfil de WhatsApp, logs, auditoría y estado del conectoma. No abrir |
+| `data/` | **PRIVADO.** Memoria, perfiles heredados (WhatsApp y Google Takeout), logs, auditoría y estado del conectoma. No abrir |
 
 ### `C:\proyectos\vtuber-ai`
 
@@ -206,7 +207,8 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
 
 | Qué | Por qué |
 |---|---|
-| `.env`, `data/`, `chats/`, `ctl_token`, `%LOCALAPPDATA%\rams\escritorio.json`, partición `persist:puter` | Secretos y datos privados (memoria, perfil de WhatsApp, logs, auditoría, sesión de Puter). Ni leer, ni imprimir, ni versionar |
+| `.env`, `data/`, `chats/`, `ctl_token`, `%LOCALAPPDATA%\rams\escritorio.json`, partición `persist:puter` | Secretos y datos privados (memoria, perfiles de WhatsApp y de Google Takeout, logs, auditoría, sesión de Puter). Ni leer, ni imprimir, ni versionar |
+| Los zips de Google Takeout del usuario (p. ej. `Descargas\takeout-*.zip`) | Datos personales en bruto (correo, fotos, historial, Drive). Solo los lee `core/takeout_ingestor.py` cuando el usuario lo pide; nunca los abras, descomprimas ni copies tú (sección 4.5, regla 15) |
 | `vtuber-ai/models/*.vrm` | `Kurisu-4210657567129258326.vrm` viene de VRoid Hub: no se redistribuye y hay que dar crédito. No subir, commitear, renombrar ni borrar. Ojo: `POST /api/models` **sobrescribe** un archivo con el mismo nombre |
 | `vtuber-ai/public/vendor/**` | Copias exactas con SHA-256 en `VENDOR.md`. Solo se actualiza con ese procedimiento. Nunca pasar a CDN: la CSP del overlay lo bloquea |
 | `__version__ = "0.1.0"` (`core/__init__.py`) y `VERSION = "0.1.0"` (`core/config.py` y `core/contracts.py`) | Lo fija `tests/test_config_bus.py` aunque el producto ya sea v0.2.1. **No subirlo** |
@@ -263,11 +265,11 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
 7. **Visión.** Opt-in doble. Nunca se guardan fotogramas: un test escanea `aura_vision_pc.py` y `vision_continua.py` en busca de `imwrite`, `VideoWriter` e `imencode`. Al bus solo salen escalares. Pausar libera la cámara de verdad (el LED se apaga). Las capturas nunca van a disco ni al log.
 8. **Red local.** Todo en `127.0.0.1`, nunca `0.0.0.0` ni CORS `*`. HUD con token `?t=` + Origin local. `/escritorio` con token de archivo (0o600). Control :8766 con `ctl_token` y `hmac.compare_digest`. El visor exige Host local, `Content-Type` JSON en todo POST (salvo la subida binaria de `.vrm` en `POST /api/models`), Origin ausente o local, y `X-Source` para `desktop` y `theme`.
 9. **Secretos en logs.** Solo `configurar_logging` configura el logging: nadie más llama a `basicConfig`. Cada handler lleva `FiltroSecretos`. `httpx`, `httpcore`, `websockets` y `asyncio` quedan en WARNING porque la URL de Telegram lleva el token. Nunca se registran textos tecleados, títulos, prompts o respuestas de Puter, audio, fotos ni `escritorio.chat`.
-10. **Datos no confiables.** Web, Nexus, títulos, perfil de WhatsApp y recuerdos son **datos, nunca instrucciones**. Van saneados y entre delimitadores en el prompt.
+10. **Datos no confiables.** Web, Nexus, títulos, perfiles heredados (WhatsApp y Google Takeout) y recuerdos son **datos, nunca instrucciones**. Van saneados y entre delimitadores en el prompt.
 11. **Electron.** `contextIsolation:true`, `sandbox:true`, `nodeIntegration:false` y `webviewTag:false`. Nunca se expone `ipcRenderer`. El IPC se valida por emisor. La navegación y `window.open` están bloqueados (excepción: «Conectar Puter» puede abrir el popup de inicio de sesión de Puter, solo hacia los dominios permitidos en `desktop/lib/puter-sitio.js`). Las CSP son estrictas. El token nunca va a logs ni a URLs de páginas.
 12. **HUD.** Solo `textContent`, nunca `innerHTML` con datos dinámicos.
 13. **Salidas a la nube.** Solo estas:
-    - Gemini y Puter: la conversación, los recuerdos relevantes y el perfil de WhatsApp (si `RAMS_PERFIL_EN_PROMPT=1`, activo por defecto). Solo a Gemini: un PNG de la pantalla, solo en Linux y solo si el usuario lo pide ("mira la pantalla");
+    - Gemini y Puter: la conversación, los recuerdos relevantes, el resumen del perfil de WhatsApp (si `RAMS_PERFIL_EN_PROMPT=1`, activo por defecto) y el perfil agregado de Google Takeout (si `RAMS_PERFIL_TAKEOUT_EN_PROMPT=1`, activo por defecto: su resumen en el prompt y sus hechos heredados como recuerdos relevantes; nunca el nombre de pila, URLs, correos, números ni títulos literales). Con la bandera en `0`, main no importa los hechos de Takeout y borra los que hubiera: **ningún** dato del perfil sale (los recuerdos heredados de la memoria también viajan en `memoria_relevante`; no lo olvides si añades otro perfil). Solo a Gemini: un PNG de la pantalla, solo en Linux y solo si el usuario lo pide ("mira la pantalla");
     - Telegram: texto, notas de voz y fotos (estas, solo con `RAMS_TELEGRAM_FOTOS=1`);
     - ElevenLabs: el texto que se convierte en voz;
     - Brave y ddgs: las consultas de búsqueda.
@@ -286,6 +288,16 @@ El **LLM (Área de Broca)** solo **pone en palabras** lo que ya se decidió. Su 
     - `conftest.py` **no** bloquea la cámara (`cv2.VideoCapture`) ni la captura de pantalla (`mss`): usa dobles o `monkeypatch`, nunca la cámara ni la pantalla de verdad.
     - vtuber-ai: `createServer({ port: 0, host: '127.0.0.1', env: {}, modelsDir: mkdtempSync(...) })`. Sin `modelsDir`, usa `models/` real y una subida sobrescribiría el `.vrm` de Kurisu.
     - Para revisar el entorno, lista solo **nombres** de variables (PowerShell: `Get-ChildItem Env: | Select-Object Name`), nunca valores: pueden contener claves.
+15. **Perfil de Google Takeout (`core/takeout_ingestor.py`).** Decisiones de privacidad acordadas con el usuario; no se relajan:
+    - **Todo local:** sin red ni LLM. Se lee **dentro** de los zips (`zipfile`, en streaming; el mbox, línea a línea) y nunca se descomprime nada a disco. Los zips duplicados (misma ruta o mismo directorio central, como los `(1)`) se ignoran y se avisa de las partes que faltan.
+    - **Nunca se abren:** `Direcciones y más.json` (autocompletar), Contactos, `Diccionario.csv`, `*.ChangeHistory.html`, la configuración y el dispositivo de Chrome, las direcciones bloqueadas del correo, las acciones programadas de Gemini, los medios de Fotos y **ningún** archivo de Drive (tampoco zips anidados: de Drive solo se usa el índice del zip). `tests/test_takeout_ingestor.py` lo vigila espiando `ZipFile.open`.
+    - **Solo agregados del propio usuario:** intereses por categorías de un léxico curado; palabras clave **solo de un vocabulario cerrado** (los términos del léxico de intereses y `_VOCAB_TEMAS`; frases como «inteligencia artificial» cuentan enteras, plurales y alias se unen), con frecuencia mínima (≥ 3 títulos en ≥ 2 días, ≥ 3 favoritos o ≥ 3 nombres de Drive, o ≥ 3 documentos en ≥ 2 fuentes): una palabra fuera del vocabulario nunca califica, así que un nombre, apodo, *handle* o lugar en minúscula no puede colarse; dominios registrables (nunca URLs, rutas ni parámetros; `alguien.github.io` → `github.io`) que **solo se nombran** si están en `_DOMINIOS_CONOCIDOS` y no son sensibles (los demás se cuentan en `sitios_sin_nombrar` / `servicios_sin_nombrar`), ordenados por días de uso y sin `google.com` ni infraestructura (anuncios, acortadores, inicio de sesión); ritmo por fuente en `Settings.zona_horaria`; estilo **solo** de los correos enviados a terceros (`Enviado` + `From` de la cuenta; sin citas, reenvíos ni firma; ≥ 20 correos de ≥ 20 palabras propias; confianza «baja» < 50, «media» < 150); servicios que le escriben por dominio (solo remitentes con señales de envío masivo; nunca dominios de correo personal); extensiones conocidas por id o con un nombre de palabras del vocabulario (≤ 2 dígitos); Gems **solo** de campos etiquetados («Nombre: …»), con el mismo vocabulario; de Fotos, solo `photoTakenTime`; de la Cuenta de Google, solo «Given Name» (se usa para excluirlo y nunca entra en el resumen).
+    - **Nombres de las cabeceras del correo:** los tokens de los nombres y direcciones de remitentes que no son servicios, de los destinatarios y del `From` propio (el apellido del usuario) se juntan **solo en memoria** durante la ingesta y excluyen palabras clave, extensiones, Gems y dominios; nunca se guardan. `From`/`To` se parsean sobre el valor crudo (RFC 2047 después) y la categoría de Gmail sigue una prioridad fija (determinista).
+    - **Nunca:** Spam, Papelera, borradores, cuerpos ajenos, búsquedas, chats de IA o forjas de código (`dueño/repo`) como palabras (solo cuentan para categorías), títulos de correo, webmails (Roundcube, Horde… en dominio propio), mensajería, perfiles sociales, Docs/Drive/Sheets y archivos en la nube, Google Maps, Waze y demás mapas, `geoData`, `people`, `description`, fotos en la papelera o de álbumes compartidos, direcciones, lugares genéricos (`_TOPONIMOS`), teléfonos y cédulas (también con guiones, puntos o espacios), números largos ni nombres de terceros. `_verificar_privacidad` es una segunda barrera sobre el perfil entero.
+    - **Categorías especiales** (salud, incluida la mental y la reproductiva, sexualidad, religión, política, finanzas personales y crédito, apuestas y legal/trámites, incluidos los dominios `.gov`/`.gob`): filtradas por defecto con palabras, raíces (`_PREFIJOS_SENSIBLES`) y frases; las palabras ambiguas («demanda», «herencia», «política», «doctor») solo cuentan en frase, y los dominios se comparan por etiqueta, no por subcadena corta (`essex`, `occidental`, `petrobras` no son sensibles). Solo `--incluir-sensibles` las incluye. **El léxico no es exhaustivo**: la CLI lo avisa y el usuario revisa el resumen.
+    - **Control del usuario:** la CLI imprime solo el resumen, los recuerdos heredados que se guardarán y estadísticas agregadas para que lo revise; `--quitar` borra temas (también un término pegado dentro de un dominio) y se respeta al regenerar: las exclusiones viven **aparte**, en `takeout_exclusiones.json`, como HMAC con una clave local aleatoria (ofuscación, no cifrado: no prometas más), y olvidar el perfil las conserva (se le avisa). La CLI no sobrescribe un perfil con más fuentes que el nuevo (salvo `--reemplazar`) ni guarda uno sin ninguna fuente «ok». «olvida mi perfil de Google» / `/olvidar_takeout` lo olvida todo (solo canales locales; «sí» en la terminal, `/olvidar_takeout confirmar` en el chat de escritorio, 60 s). No es una `AccionPC`: no toca el PC, solo datos de Amadeus.
+    - **Versiones:** `VERSION_PERFIL_TAKEOUT = 2`. main solo usa perfiles `>= VERSION_MINIMA_EN_USO` (`perfil_vigente`): un v1 se generó con filtros más débiles; se lee con `--mostrar` (y sus exclusiones se migran), pero no entra en el prompt ni en la memoria hasta regenerarlo.
+    - **Pruebas:** zips sintéticos construidos en el test (`tmp_path`). **Nunca** ejecutes el ingestor sobre los zips reales del usuario ni leas `data/john/perfil_takeout.json`: eso lo hace el usuario (o quien él autorice) con la CLI.
 
 ---
 
@@ -364,7 +376,7 @@ La presencia solo la escribe **main** (`registrar_rostro`); la visión solo la l
 
 ### 5.5 Orden de arranque y apagado
 
-- **Arranque (`Orquestador.iniciar`):** DPI, bus, HUD (antes que nadie), ControlPC, **Broca** (+ Puter), **Memoria**, perfil de WhatsApp, **Conectoma**, **Compuerta**, opcionales (aura, vtube, web, **v0.2.2:** cuenta de Google, correo, Drive y taller, vtuber_ai, corteza), **Presencia**, visión continua, **riko**, servidor de control, suscripciones y diagnósticos en paralelo (la cuenta de Google antes que correo y Drive). Al final, `broca.set_herramientas(…)`.
+- **Arranque (`Orquestador.iniciar`):** DPI, bus, HUD (antes que nadie), ControlPC, **Broca** (+ Puter), **Memoria**, perfil de WhatsApp, perfil de Google Takeout (si existe `data/john/perfil_takeout.json`), **Conectoma**, **Compuerta**, opcionales (aura, vtube, web, **v0.2.2:** cuenta de Google, correo, Drive y taller, vtuber_ai, corteza), **Presencia**, visión continua, **riko**, servidor de control, suscripciones y diagnósticos en paralelo (la cuenta de Google antes que correo y Drive). Al final, `broca.set_herramientas(…)`.
   - En **negrita**, los P0: si fallan, lanzan `RuntimeError`.
   - Los opcionales que fallan quedan en `None` con estado OFF. Los cuatro de la v0.2.2 se construyen **siempre** (aunque estén apagados: su diagnóstico dice OFF y el motivo).
 - **Apagado:** idempotente, con un presupuesto total de 15 s. Cierra en este orden: vtube, corteza, avatar3d, visión, control_pc, **taller** (mata el script en curso), hud (borra el token), control, aura, riko, web, **drive, correo, google** (cancela una conexión en curso; no revoca), broca, conectoma y memoria. Las tarjetas viven solo en memoria: se pierden.
@@ -385,6 +397,7 @@ La presencia solo la escribe **main** (`registrar_rostro`); la visión solo la l
 | **Cambiar el visor** | Comandos y validación solo en `vtuber-ai/lib/protocol.js`. Si cambian nombres o campos, actualiza `lobes/vtuber_ai_bridge.py`. Toda rotación de huesos pasa por el mapa `out` de `app.js` (arreglo VRM 0.x: niega x y z cuando `metaVersion === '0'`). Tras editar `public/*.js` reinicia `server.js` (los visores se recargan solos por la huella `build`) | `cd vtuber-ai; npm.cmd test` + `test_vtuber_ai_bridge.py` |
 | **Cambiar Electron** | Respeta la sección 4.5, regla 11. Un cambio en el protocolo `/escritorio` toca `interface/escritorio_link.py`, `desktop/main.js`, `desktop/lib/mapeo.js` (tabla en su cabecera), `desktop/lib/puter.js` (mensajes de Puter, §C2.15), `interface/amadeus_hud.html` (chat RINE) y `docs/COMPANION.md` §C2.4. No cambies los títulos de ventana | `cd desktop; npm.cmd test` + `npm.cmd run smoke` + `test_escritorio_link.py` + `test_hud_server.py` |
 | **Cambiar el modelo de Gemini** (o la cadena de respaldo) | 1) Primero, pide al usuario que cambie `GEMINI_MODEL` / `GEMINI_FALLBACK_MODELS` en **su** `.env` (tú no lo lees) y que revise que no estén en las variables de entorno de Windows, que ganan al `.env`. `.env.example` trae `GEMINI_MODEL` sin comentar, así que el `.env` real casi seguro lo fija y cambiar el defecto del código no tendría efecto. 2) Solo si quiere cambiar el **defecto** del código, toca a la vez: `core/config.py` (`Settings` y `_cargar_settings`), `lobes/broca_llm.py` (el respaldo `["gemini-3.8-flash"]` de la cadena y la compatibilidad de `thinking_level` en `_generation_config`), `.env.example` y los tests. El nombre debe cumplir `config._RE_MODELO`. No subas `GEMINI_MAX_CALLS_DAY` (300). `PUTER_MODEL` es otro contrato (sección 4.4) | `test_config_bus.py` (defectos), `test_broca_llm.py` (`_generation_config`, `CADENA_LITE` y tests de la cadena) |
+| **Cambiar el perfil de Google Takeout** (fuentes, umbrales, léxicos, esquema o resumen) | 1) `core/takeout_ingestor.py`, respetando la sección 4.5, regla 15 (si una fuente nueva lee algo que no está en la lista de lo permitido, **pregunta** al usuario). 2) Esquema JSON estable y versionado: si cambias la forma, sube `VERSION_PERFIL_TAKEOUT` y mantén legibles los perfiles anteriores. 3) Consumidores: `core/memory_engine.py` (`hechos_desde_takeout`, `importar_perfil_takeout` y `olvidar_perfil_takeout`, categoría `takeout`), `lobes/broca_llm.py` (`set_perfil_takeout`, dentro de `<perfil_usuario>`, nunca en modo público) y `main.py` (`_cargar_perfil_takeout`, `_turno_olvido_takeout`, `/olvidar_takeout`). 4) `resumen_perfil_takeout` ≤ 900 caracteres y sin datos personales. 5) Un término nuevo de `_INTERESES`/`_VOCAB_TEMAS` se vuelve palabra clave posible: nunca añadas nombres de persona, lugares ni palabras ambiguas | `test_takeout_ingestor.py` (zips sintéticos: exclusiones, secretos ausentes, nombres de terceros y lugares, léxico sensible, números con separadores, dedupe, fuente rota, zona horaria, estilo solo de enviados, CLI), `test_memory_engine.py`, `test_broca_llm.py`, `test_main.py` y `test_config_bus.py` |
 
 ### Receta de un módulo nuevo (`lobes/`)
 
@@ -458,9 +471,9 @@ Flags de `main.py`: `--offline`, `--selftest`, `--sin-hud`, `--sin-camara`, `--s
 
 ### 7.2 Probar (seguro con los servicios en vivo)
 
-| Qué | Windows (PowerShell) | Linux | Resultado esperado (medido el 19-10-2026, v0.2.2 sin commit) |
+| Qué | Windows (PowerShell) | Linux | Resultado esperado (medido el 19-10-2026, perfil de Takeout sin commit) |
 |---|---|---|---|
-| Tests Python | `cd C:\proyectos\rams_biocore; .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider` | `.venv/bin/python -m pytest -p no:cacheprovider` | 2101 pasan, 5 saltados (2106 en total; ~4 min; integración de la v0.2.2, 19-10-2026). Los saltos son normales: `test_connectome.py:364` necesita `RAMS_TESTS_LENTOS=1` y los 4 tests de `test_hud_server.py` en jsdom (L1343, L1434 ×2, L1463) necesitan node + jsdom (con `RAMS_TEST_NODE_PATH=<carpeta>/node_modules` quedan 2105 pasan, 1 saltado). Añade `-rs` para ver por qué se saltan. **Aviso:** la v0.2.2 la implementaron varios grupos en paralelo, así que estos totales pueden cambiar en cuanto otro grupo añada tests: si no coinciden, manda lo que diga pytest |
+| Tests Python | `cd C:\proyectos\rams_biocore; .\.venv\Scripts\python.exe -m pytest -p no:cacheprovider` | `.venv/bin/python -m pytest -p no:cacheprovider` | 2156 pasan, 5 saltados (2161 en total; ~4 min; con el perfil de Google Takeout endurecido, 19-10-2026). Los saltos son normales: `test_connectome.py:364` necesita `RAMS_TESTS_LENTOS=1` y los 4 tests de `test_hud_server.py` en jsdom (L1343, L1434 ×2, L1463) necesitan node + jsdom (con `RAMS_TEST_NODE_PATH=<carpeta>/node_modules` quedan 2160 pasan, 1 saltado). Añade `-rs` para ver por qué se saltan. **Aviso:** la v0.2.2 la implementaron varios grupos en paralelo, así que estos totales pueden cambiar en cuanto otro grupo añada tests: si no coinciden, manda lo que diga pytest |
 | Un archivo | `... -m pytest tests/test_permisos.py -p no:cacheprovider` | igual | |
 | Selftest | `.\.venv\Scripts\python.exe main.py --selftest` | `.venv/bin/python main.py --selftest` | "Resultado: todo en orden." (12 OK). No usa red, cámara ni audio, y no toca `data/` |
 | Compatibilidad 3.11 | `vermin -t=3.11- --no-tips --violations main.py core lobes interface` | igual | Mínimo 3.11, limpio |
@@ -507,29 +520,21 @@ Con ahorro de batería, con los tres servicios vivos o con suites en paralelo, e
 |---|---|---|
 | v0.1 (agente + conectoma) | Hecha | `1d35496` |
 | Puente del avatar 3D | Hecho | `5833840` |
-| v0.2 "Amadeus Companion" (escritorio, chat, voz, visión local, control del PC) | Hecha | `1c26e68` (último commit) |
-| v0.2.1 + respaldo Puter | Hecha, **SIN COMMIT** | — |
-| v0.2.2 "Correo, Drive y taller de scripts" (`docs/V022_CORREO_DRIVE_SCRIPTS.md`) | Implementada por grupos (base, google, taller, orquestacion, ui) el 2026-10-18/19, **SIN COMMIT** y sin probar todavía contra Google real (§20 de la spec) | — |
+| v0.2 "Amadeus Companion" (escritorio, chat, voz, visión local, control del PC) | Hecha | `1c26e68` |
+| v0.2.1 + respaldo Puter | Hecha | `2097e5a` |
+| v0.2.2 "Correo, Drive y taller de scripts" (`docs/V022_CORREO_DRIVE_SCRIPTS.md`) | Hecha (implementada por grupos el 2026-10-18/19); sin probar todavía contra Google real (§20 de la spec) | `2097e5a` (último commit) |
+| Perfil heredado de Google Takeout (`core/takeout_ingestor.py`, sección 4.5, regla 15) | Implementado el 2026-10-19 y endurecido tras la revisión de privacidad el mismo día (perfil v2: vocabulario cerrado, sitios conocidos, mapas/webmail/Docs ignorados, léxico sensible ampliado, exclusiones aparte), **SIN COMMIT**. El usuario entregó su Takeout; el ingestor aún no se había ejecutado sobre sus zips reales al escribir esto | — |
 | v0.3 "Llamada en vivo" | **Solo diseñada, NO implementada** | — |
 
-- Los dos repos están en la rama `main`, con git local y sin remoto. rams_biocore tiene 3 commits y vtuber-ai tiene 2 (`b0530af`, `b466e95`).
+- Los dos repos están en la rama `main`, con git local y sin remoto. rams_biocore tiene 4 commits y vtuber-ai tiene 3 (`b0530af`, `b466e95`, `c6e11c3`).
 - `VERSION` sigue en `"0.1.0"` a propósito (sección 4.3).
 
 ### 8.2 Trabajo sin commit (no lo pierdas)
 
-- **rams_biocore:**
-  - Respaldo Puter: `desktop/lib/puter.js`, `puter-sitio.js`, `preload-puter.js`, `desktop/puter/`, sus tests e `interface/escritorio_link.py`.
-  - Tanda v0.2.1: sin burbuja (`VTUBER_AI_BURBUJA=0` por defecto), apps del menú Inicio de Windows en `control_pc.py`, Telegram con fotos (`lobes/capturas.py`, nuevo) y notas de voz (transcripción con Broca).
-  - Cambios en `core/config.py`, `intenciones.py`, `permisos.py`, `main.py`, `lobes/*`, `persona/*`, `docs/*`, `tests/*` y `desktop/*`, además de `.env.example`, `README.md` y `desktop/README.md` (modificados).
-  - Nuevos sin seguimiento: `lobes/capturas.py`, `tests/test_capturas.py`, `desktop/lib/puter.js`, `desktop/lib/puter-sitio.js`, `desktop/preload-puter.js`, `desktop/puter/`, `desktop/test/puter.test.js`, `desktop/test/puter-paginas.test.js` y este `IMPORTANTEIA.md`.
-  - **Tanda v0.2.2** (correo, Drive y taller de scripts; spec `docs/V022_CORREO_DRIVE_SCRIPTS.md`, también sin seguimiento):
-    - nuevos: `lobes/google_cuenta.py`, `lobes/correo.py`, `lobes/drive.py`, `lobes/taller_scripts.py`, `lobes/taller_analizar.ps1` y sus tests (`tests/test_google_cuenta.py`, `test_correo.py`, `test_drive.py`, `test_taller_scripts.py`);
-    - modificados otra vez: `core/config.py`, `core/contracts.py`, `core/intenciones.py`, `core/permisos.py`, `main.py`, `lobes/broca_llm.py`, `persona/frases.json` (3 categorías nuevas), `interface/*`, `desktop/*`, `.env.example`, `requirements.txt` (solo comentarios), `README.md` (§8.6), `docs/COMPANION.md` (remisiones), este archivo y los tests de todos ellos.
-    - Activarlo es opt-in (`RAMS_GOOGLE=1`, `RAMS_TALLER=1`); la guía de Google Cloud para el usuario está en la spec §17.
+- **rams_biocore** (sobre `2097e5a`):
+  - **Perfil de Google Takeout:** nuevos `core/takeout_ingestor.py` y `tests/test_takeout_ingestor.py`; modificados `core/config.py` (`perfil_takeout_path`, `perfil_takeout_en_prompt`), `core/memory_engine.py`, `core/wsp_ingestor.py` (`_item` y `_real`: números con separadores y `OverflowError`), `lobes/broca_llm.py`, `main.py`, `.env.example` (`RAMS_PERFIL_TAKEOUT_EN_PROMPT`), `README.md` (§6.1), este archivo y los tests de todos ellos.
   - **Trabajo ajeno que no se toca:** `movil/` (app Android hecha por otra IA del usuario) y `tests/test_movil.py`; la copia vieja `rams_biocore/vtuber-ai/`. Si un test suyo falla, se informa, no se "arregla".
-- **vtuber-ai:**
-  - Arreglo de VRM 0.x (`public/app.js`), subida de modelos `POST /api/models`, recarga por huella `build`, `speak.bubble` (`test/speak_bubble.test.js`, nuevo) y el tema solo para el modelo de ejemplo.
-  - Cambios en `.gitignore` (excluye `models/*.vrm`), `README.md`, `lib/mcp.js`, `lib/protocol.js`, `public/amadeus_theme.js`, `server.js` y `test/server.test.js`.
+- **vtuber-ai:** sin cambios pendientes al 2026-10-19 (último commit `c6e11c3`).
 - Antes de tocar nada, mira el estado real con `git status` (solo lectura).
 
 ### 8.3 v0.3 "Llamada en vivo" (solo diseño)

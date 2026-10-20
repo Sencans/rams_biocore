@@ -131,6 +131,8 @@ __all__ = [
     # v0.2.2: generación aislada (scripts, correos, resúmenes) y herramientas en las capacidades
     "MAX_TOKENS_SCRIPT", "MAX_TOKENS_CORREO", "MAX_TOKENS_RESUMEN", "PROMPT_SCRIPT", "PROMPT_CORREO",
     "PROMPT_RESUMEN_DOCUMENTO", "ESQUEMA_CORREO", "esquema_script", "CLAVES_HERRAMIENTAS",
+    # Perfil heredado de Google Takeout (resumen agregado dentro de <perfil_usuario>)
+    "MAX_PERFIL_TAKEOUT",
 ]
 
 log = logging.getLogger("rams.broca")
@@ -184,6 +186,8 @@ HISTORIAL_MAX_TURNOS: Final = 12
 HISTORIAL_MAX_CARACTERES: Final = 6000
 HISTORIAL_MAX_POR_MENSAJE: Final = 2000
 MAX_ENTRADA_USUARIO: Final = 8000
+# Tope del resumen del perfil de Google Takeout en el prompt (el ingestor lo deja en ≤ 900).
+MAX_PERFIL_TAKEOUT: Final = 1000
 MAX_TEXTO_RESUMIR: Final = 24000
 PALABRAS_BITACORA: Final = 120
 PROB_TSUNDERE_BASE: Final = 0.25
@@ -1187,6 +1191,8 @@ def _capacidades_local(settings: Settings, plataforma: str, trato: str,
     lineas.append("- Buscar en internet («busca …»), recordatorios («recuérdame mañana a las 8 llamar al banco»), "
                   "anotar y consultar tu memoria («recuerda que …», «qué recuerdas de …») y el estado del "
                   "computador («reporte del sistema»).")
+    lineas.append(f"- Olvidar el perfil heredado de Google Takeout («olvida mi perfil de Google»; el sistema le "
+                  f"pide confirmarlo a {trato}).")
     if plataforma.startswith("linux"):
         lineas.append("- Música y volumen («pausa», «siguiente canción», «volumen al 30») y cerrar la ventana "
                       "activa («cierra esta ventana», con confirmación).")
@@ -1420,6 +1426,7 @@ class BrocaLLM:
         self._desactivado = False
         self._sin_modelos_hasta: float | None = None  # enfriamiento tras 404 en toda la cadena
         self._perfil_resumen: str | None = None
+        self._perfil_takeout: str | None = None   # resumen del perfil de Google Takeout (agregados)
         self.set_perfil_resumen(perfil_resumen)
         # Estado de la sesión (§10.18).
         self._apodos: Counter[str] = Counter()
@@ -1721,6 +1728,28 @@ class BrocaLLM:
         limpio = _sanear(texto).strip() if texto else ""
         self._perfil_resumen = limpio or None
         self._prompts = {}
+
+    def set_perfil_takeout(self, texto: str | None) -> None:
+        """Fija (o borra) el resumen del perfil de Google Takeout y reconstruye los system prompts.
+
+        Va dentro de ``<perfil_usuario>`` (DATOS, saneado y con tope), detrás del de WhatsApp, y
+        nunca en modo público. main solo lo llama con ``RAMS_PERFIL_TAKEOUT_EN_PROMPT=1``.
+        """
+        limpio = _sanear(texto, MAX_PERFIL_TAKEOUT).strip() if texto else ""
+        self._perfil_takeout = limpio or None
+        self._prompts = {}
+
+    @property
+    def perfil_takeout(self) -> str | None:
+        """Resumen del perfil de Google Takeout que entra en el prompt (``None`` si no hay)."""
+        return self._perfil_takeout
+
+    def _texto_perfil_usuario(self) -> str:
+        """Valor de ``$perfil_usuario``: el perfil de WhatsApp y, debajo, los hábitos de Google."""
+        partes = [self._perfil_resumen or ""]
+        if self._perfil_takeout:
+            partes.append(f"Hábitos digitales (Google Takeout, datos agregados): {self._perfil_takeout}")
+        return "\n".join(p for p in partes if p) or "Sin perfil heredado todavía."
 
     def set_herramientas(self, estado: Mapping[str, bool] | None) -> None:
         """Herramientas v0.2.2 para el bloque de capacidades (§10.5). Claves: ``google`` (habilitado),
@@ -2283,8 +2312,9 @@ class BrocaLLM:
     def construir_system_prompt(self, *, publico: bool = False, canal: str = "local") -> str:
         """System prompt de persona (Anexo B.1); estático por sesión, modo y canal (cacheable).
 
-        Las variantes se construyen una vez y se reconstruyen solo con :meth:`set_perfil_resumen`.
-        En modo público no lleva el perfil del usuario. v0.2.1: termina con el bloque
+        Las variantes se construyen una vez y se reconstruyen solo con :meth:`set_perfil_resumen`
+        o :meth:`set_perfil_takeout`. En modo público no lleva el perfil del usuario (ni el de
+        WhatsApp ni el de Google Takeout). v0.2.1: termina con el bloque
         ``CAPACIDADES REALES`` del ``canal`` (:func:`capacidades_reales`; ``terminal`` y
         ``escritorio`` cuentan como ``local``; en modo público, siempre el de ``nexus``).
         """
@@ -2298,7 +2328,7 @@ class BrocaLLM:
             perfil = "No disponible en este contexto."
             modo_publico = string.Template(PARRAFO_MODO_PUBLICO).safe_substitute(nombre_usuario=trato)
         else:
-            perfil = self._perfil_resumen or "Sin perfil heredado todavía."
+            perfil = self._texto_perfil_usuario()
             modo_publico = ""
         valores = {
             "nombre_ia": _attr(self.settings.nombre_ia, 40) or "Amadeus",

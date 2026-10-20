@@ -278,6 +278,8 @@ class Settings:
     memoria_dir: Path = BASE_DIR_DEFECTO / "data" / "john"
     db_path: Path = BASE_DIR_DEFECTO / "data" / "john" / "rams_memory.db"
     perfil_path: Path = BASE_DIR_DEFECTO / "data" / "john" / "perfil_conductual.json"
+    # Perfil agregado de Google Takeout (core/takeout_ingestor.py). Avanzada: RAMS_PERFIL_TAKEOUT_PATH.
+    perfil_takeout_path: Path = BASE_DIR_DEFECTO / "data" / "john" / "perfil_takeout.json"
     persona_dir: Path = BASE_DIR_DEFECTO / "persona"
     log_dir: Path = BASE_DIR_DEFECTO / "data" / "logs"
     nombre_ia: str = "Amadeus"
@@ -354,6 +356,8 @@ class Settings:
     conectoma_escala_tiempo: float = 1.0
     flywire_dir: Path = BASE_DIR_DEFECTO / "data" / "flywire"
     perfil_en_prompt: bool = True
+    # 1 = el resumen del perfil de Google Takeout entra en el prompt (mismo criterio que perfil_en_prompt).
+    perfil_takeout_en_prompt: bool = True
     max_proactivos_dia: int = 3
     max_interrupciones_hora: int = 4
     silencio_inicio: str = "23:00"
@@ -1149,7 +1153,8 @@ def _settings_por_defecto(base: Path, *, offline: bool) -> Settings:
     memoria = data / "john"
     return Settings(
         base_dir=base, data_dir=data, memoria_dir=memoria, db_path=memoria / "rams_memory.db",
-        perfil_path=memoria / "perfil_conductual.json", persona_dir=base / "persona",
+        perfil_path=memoria / "perfil_conductual.json", perfil_takeout_path=memoria / "perfil_takeout.json",
+        persona_dir=base / "persona",
         log_dir=data / "logs", flywire_dir=data / "flywire", offline=offline,
         escritorio_token_file=_ruta_token_escritorio(os.environ.get, data),
         google_cliente_path=data / "google_cliente.json", google_token_path=data / "google_token.json",
@@ -1207,6 +1212,7 @@ def _cargar_settings(
     memoria_dir = data_dir / "john"
     db_path = lector.ruta("RAMS_DB_PATH", memoria_dir / "rams_memory.db")
     perfil_path = lector.ruta("RAMS_PERFIL_PATH", memoria_dir / "perfil_conductual.json")
+    perfil_takeout_path = lector.ruta("RAMS_PERFIL_TAKEOUT_PATH", memoria_dir / "perfil_takeout.json")
     persona_dir = lector.ruta("RAMS_PERSONA_DIR", base / "persona")
     log_dir = data_dir / "logs"
     flywire_dir = lector.ruta("RAMS_FLYWIRE_DIR", data_dir / "flywire")
@@ -1266,6 +1272,7 @@ def _cargar_settings(
         memoria_dir=memoria_dir,
         db_path=db_path,
         perfil_path=perfil_path,
+        perfil_takeout_path=perfil_takeout_path,
         persona_dir=persona_dir,
         log_dir=log_dir,
         nombre_ia=lector.texto("RAMS_AI_NAME", "Amadeus", largo=(1, 40)),
@@ -1348,6 +1355,7 @@ def _cargar_settings(
                                             maximo=10_000.0, minimo_exclusivo=True),
         flywire_dir=flywire_dir,
         perfil_en_prompt=lector.booleano("RAMS_PERFIL_EN_PROMPT", True),
+        perfil_takeout_en_prompt=lector.booleano("RAMS_PERFIL_TAKEOUT_EN_PROMPT", True),
         max_proactivos_dia=lector.entero("RAMS_MAX_PROACTIVE", 3, minimo=0),
         max_interrupciones_hora=lector.entero("RAMS_MAX_INTERRUPCIONES_HORA", 4, minimo=0),
         silencio_inicio=silencio_inicio,
